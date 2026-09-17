@@ -66,7 +66,15 @@ RSpec.describe 'cogworkerswarm end-to-end', :swarm do
   def spawn_swarm(count:, phased: false, concurrency: 2)
     env = { 'COGWORKER_COUNT' => count.to_s, 'PHASED_RESTART' => phased.to_s }
     @log_path = File.join(Dir.tmpdir, "cogworker_swarm_log_#{::Process.pid}_#{rand(1_000_000)}.log")
-    @pid = ::Process.spawn(env, RbConfig.ruby, '-I', lib, exe, '-r', @init_path, '-c', concurrency.to_s,
+    # `-e '$stdout.sync = true; load ARGV.shift'` forces unbuffered output
+    # before the supervisor's own long life begins — without it, stdout
+    # redirected to a file (not a tty) is fully block-buffered, so a
+    # long-running process like this may never flush anything until it
+    # exits, making the log dump above useless for diagnosing a hang. Forked
+    # children inherit the same synced $stdout via copy-on-write, so their
+    # output is unbuffered too, with no change needed on their side.
+    @pid = ::Process.spawn(env, RbConfig.ruby, '-I', lib, '-e', '$stdout.sync = true; load ARGV.shift',
+                           exe, '-r', @init_path, '-c', concurrency.to_s,
                            out: @log_path, err: [:child, :out], pgroup: true)
   end
 
