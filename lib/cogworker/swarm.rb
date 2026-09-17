@@ -34,7 +34,16 @@ module Cogworker
       pid = ::Process.fork do
         Cogworker.reset_identity!
         CLI.new.run(@argv.dup)
-        exit(0)
+        # `exit!`, not plain `exit`: `Launcher#run` only returns once
+        # `Manager#stop!` has had its bounded (default 25s) chance to join
+        # every processor thread — but per that method's own doc, a thread
+        # stuck past its deadline (mid a hung Redis call, say) is left
+        # running, not killed. A non-daemon thread still alive there would
+        # make plain `exit`'s normal interpreter shutdown wait for it
+        # indefinitely, so this OS process would never actually go away —
+        # and `Swarm#initiate_restart`'s own `Process.waitpid(pid)` for this
+        # exact child would then block forever right along with it.
+        ::Process.exit!(true)
       end
       @children[pid] = slot
       Cogworker.logger.info { "swarm: started child pid=#{pid} slot=#{slot}" }
@@ -60,7 +69,9 @@ module Cogworker
         case @signal_queue.pop
         when :quiet then relay(Signals::QUIET)
         when :stop then initiate_stop
-        when :restart then initiate_restart
+        when :restart
+          Cogworker.logger.info { "swarm: restart signal received, phased=#{@phased}" }
+          initiate_restart
         else Cogworker.logger.warn { "Unknown signal: #{signal}" }
         end
       end
@@ -88,8 +99,10 @@ module Cogworker
         next unless @children.key?(pid)
 
         slot = @children.delete(pid)
+        Cogworker.logger.info { "swarm: phased restart stopping child pid=#{pid} slot=#{slot}" }
         safe_kill(pid, Signals::STOP)
         ::Process.waitpid(pid)
+        Cogworker.logger.info { "swarm: phased restart child pid=#{pid} slot=#{slot} exited, respawning" }
         fork_child(slot)
       end
     end
