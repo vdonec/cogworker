@@ -13,6 +13,16 @@ module Cogworker
   # nothing in Heartbeat/Scheduled/the periodic Ticker ever starts a
   # background thread in the parent that would silently vanish in a child.
   class Swarm
+    # How long a phased-restart replacement waits for the outgoing child to
+    # exit on its own before giving up and force-killing it. Graceful
+    # shutdown (Manager#stop! draining in-flight jobs) can legitimately take
+    # a while, but this loop is single-threaded and blocking — one child
+    # that never exits (a hung Redis call outliving even Manager#stop!'s
+    # own 25s join, or anything else) must not be able to wedge the whole
+    # restart cycle, and the supervisor's entire signal-handling loop with
+    # it, forever.
+    GRACEFUL_STOP_TIMEOUT = 20
+
     def initialize(argv, count: ENV.fetch('COGWORKER_COUNT', 1).to_i, phased: ENV['PHASED_RESTART'] == 'true')
       @argv = argv
       @count = [count, 1].max
@@ -101,10 +111,34 @@ module Cogworker
         slot = @children.delete(pid)
         Cogworker.logger.info { "swarm: phased restart stopping child pid=#{pid} slot=#{slot}" }
         safe_kill(pid, Signals::STOP)
-        ::Process.waitpid(pid)
+        wait_for_exit(pid)
         Cogworker.logger.info { "swarm: phased restart child pid=#{pid} slot=#{slot} exited, respawning" }
         fork_child(slot)
       end
+    end
+
+    # Polls instead of a plain blocking `Process.waitpid(pid)`, specifically
+    # so a child that never exits can't block this forever: past
+    # GRACEFUL_STOP_TIMEOUT it's force-killed and reaped instead of leaving
+    # `initiate_restart` (and every other signal this single-threaded
+    # supervisor needs to handle) stuck behind it indefinitely.
+    def wait_for_exit(pid)
+      deadline = monotonic_now + GRACEFUL_STOP_TIMEOUT
+      until ::Process.waitpid(pid, ::Process::WNOHANG)
+        if monotonic_now > deadline
+          Cogworker.logger.warn { "swarm: child pid=#{pid} didn't stop within #{GRACEFUL_STOP_TIMEOUT}s, killing" }
+          safe_kill(pid, 'KILL')
+          ::Process.waitpid(pid)
+          return
+        end
+        sleep 0.1
+      end
+    rescue Errno::ECHILD
+      nil
+    end
+
+    def monotonic_now
+      ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
     end
 
     def reap_children

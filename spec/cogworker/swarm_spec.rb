@@ -112,11 +112,12 @@ RSpec.describe 'cogworkerswarm end-to-end', :swarm do
     # for N seconds" window followed by a separately-guessed "wait up to M
     # seconds for completion" — those two arbitrary windows could either
     # miss a real dip (window too short) or fail a healthy restart that's
-    # just running slow on a loaded CI box (window too long). The 30s bound
-    # here is a single honest backstop for "this is actually stuck", not a
-    # timing guess about how long a phased restart normally takes.
+    # just running slow on a loaded CI box (window too long). The timeout
+    # here is a single honest backstop for "this is actually stuck": worst
+    # case is both children individually hitting Swarm::GRACEFUL_STOP_TIMEOUT
+    # (20s each) before being force-killed, sequentially, plus headroom.
     min_seen = 2
-    wait_for(timeout: 30) do
+    wait_for(timeout: 2 * Cogworker::Swarm::GRACEFUL_STOP_TIMEOUT + 10) do
       min_seen = [min_seen, child_pids.size].min
       child_pids.size == 2 && child_pids.to_set != original.to_set
     end
