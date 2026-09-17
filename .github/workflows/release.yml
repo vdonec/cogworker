@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   release:
@@ -22,11 +23,7 @@ jobs:
       - name: Build gem
         run: gem build cogworker.gemspec
 
+      - uses: rubygems/configure-rubygems-credentials@v1
+
       - name: Publish to RubyGems
-        env:
-          RUBYGEMS_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
-        run: |
-          mkdir -p ~/.gem
-          printf -- '---\n:rubygems_api_key: %s\n' "$RUBYGEMS_API_KEY" > ~/.gem/credentials
-          chmod 0600 ~/.gem/credentials
-          gem push cogworker-*.gem
+        run: gem push cogworker-*.gem
