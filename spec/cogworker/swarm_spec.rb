@@ -99,15 +99,20 @@ RSpec.describe 'cogworkerswarm end-to-end', :swarm do
 
     ::Process.kill('USR2', @pid)
 
+    # One continuous poll from signal to completion, tracking the lowest
+    # capacity seen along the way, instead of a separately-guessed "watch
+    # for N seconds" window followed by a separately-guessed "wait up to M
+    # seconds for completion" — those two arbitrary windows could either
+    # miss a real dip (window too short) or fail a healthy restart that's
+    # just running slow on a loaded CI box (window too long). The 30s bound
+    # here is a single honest backstop for "this is actually stuck", not a
+    # timing guess about how long a phased restart normally takes.
     min_seen = 2
-    deadline = Time.now + 10
-    while Time.now < deadline
+    wait_for(timeout: 30) do
       min_seen = [min_seen, child_pids.size].min
-      sleep 0.1
+      child_pids.size == 2 && child_pids.to_set != original.to_set
     end
 
     expect(min_seen).to be >= 1
-    wait_for(timeout: 25) { child_pids.size == 2 && child_pids.to_set != original.to_set }
-    expect(child_pids.to_set).not_to eq(original.to_set)
   end
 end
