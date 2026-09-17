@@ -30,7 +30,14 @@ RSpec.describe 'cogworkerswarm end-to-end', :swarm do
     end
   end
 
-  after { kill_swarm }
+  after do |example|
+    if example.exception && @log_path && File.exist?(@log_path)
+      warn "--- swarm log (#{@log_path}) ---"
+      warn File.read(@log_path)
+      warn '--- end swarm log ---'
+    end
+    kill_swarm
+  end
 
   # Signals the whole process group (`-@pid`), not just the swarm supervisor
   # itself: the supervisor's own worker children live in that same group
@@ -58,8 +65,9 @@ RSpec.describe 'cogworkerswarm end-to-end', :swarm do
 
   def spawn_swarm(count:, phased: false, concurrency: 2)
     env = { 'COGWORKER_COUNT' => count.to_s, 'PHASED_RESTART' => phased.to_s }
+    @log_path = File.join(Dir.tmpdir, "cogworker_swarm_log_#{::Process.pid}_#{rand(1_000_000)}.log")
     @pid = ::Process.spawn(env, RbConfig.ruby, '-I', lib, exe, '-r', @init_path, '-c', concurrency.to_s,
-                           out: File::NULL, err: File::NULL, pgroup: true)
+                           out: @log_path, err: [:child, :out], pgroup: true)
   end
 
   def child_pids
