@@ -1,0 +1,11 @@
+# IDEs
+.vscode/
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# RVM (per-machine, not portable)
+.ruby-gemset
+.ruby-version
