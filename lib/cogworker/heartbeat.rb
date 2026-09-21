@@ -5,8 +5,9 @@ require 'redis'
 
 module Cogworker
   # Publishes this process's presence (for ProcessSet) and listens for
-  # remote quiet!/stop! requests (for Process#quiet!/#stop! issued by another
-  # process, e.g. a self-targeting WorkerKiller or the Web UI). Both the
+  # remote quiet!/resume!/stop! requests (for Process#quiet!/#resume!/#stop!
+  # issued by another process, e.g. a self-targeting WorkerKiller or the Web
+  # UI). Both the
   # heartbeat loop and the pub/sub subscriber must only start *after* a
   # cogworkerswarm fork, never before, in the parent — otherwise the thread
   # simply doesn't exist in the child, and a lock that thread held could
@@ -119,6 +120,7 @@ module Cogworker
     def dispatch(message)
       case message
       when 'quiet' then @manager.quiet!
+      when 'resume' then @manager.unquiet!
       when 'stop' then remote_stop!
       else Cogworker.logger.warn { "Unknown signal message: #{message}" }
       end

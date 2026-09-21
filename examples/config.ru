@@ -24,8 +24,8 @@ Cogworker::Web
 Cogworker::Web.time_format = '%d.%m.%Y %H:%M:%S'
 
 # How often (seconds) every auto-refreshing tab polls while the global
-# "Live" toggle in the header is on — shared by the htmx-polled Busy/Stats/
-# Queues tabs and History's own AG Grid refresh.
+# "Live" toggle in the header is on — shared by the htmx-polled Workers/
+# Overview tabs and History's own AG Grid refresh.
 Cogworker::Web.live_update_interval = 5
 
 # A toy stand-in for a real SSO auth middleware, showing `Web.use` wrapping

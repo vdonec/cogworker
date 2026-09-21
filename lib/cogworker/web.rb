@@ -22,13 +22,14 @@ module Cogworker
     # `Cogworker::Web.register(...)` bottom-of-file side effect) — nothing
     # else ever references `Routes::Queues` etc. by name, so without this
     # they would simply never load.
-    BUILT_IN_ROUTE_NAMES = %i[Queues Busy Retries Scheduled Periodic Dead History Stats SaveSession].freeze
+    BUILT_IN_ROUTE_NAMES = %i[Overview Jobs Schedules Workers History SaveSession].freeze
     DEFAULT_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
     DEFAULT_HISTORY_PER_PAGE = 25
     DEFAULT_LIVE_UPDATE_INTERVAL = 3
 
-    # htmx/Tailwind/AG Grid are vendored under here (not fetched from a CDN)
-    # so the Web UI works with no internet access at all — see `Layout`'s
+    # htmx/nocturne/Phosphor/AG Grid/Chart.js are vendored under here (not
+    # fetched from a CDN) so the Web UI works with no internet access at
+    # all — see `Layout`'s
     # `<script>`/`<link>` tags and `Routes::History#ag_grid_head`, all of
     # which build their `src`/`href` as `path(script_name, 'assets/...')`,
     # same as every other in-app link. `root:` is this directory's *parent*

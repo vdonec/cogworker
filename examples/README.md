@@ -38,7 +38,7 @@ COGWORKER_COUNT=3 PHASED_RESTART=true bundle exec exe/cogworkerswarm \
 
 # 3. Web UI, in another terminal
 bundle exec rackup ./examples/config.ru -p 9394
-# -> http://localhost:9394/cogworker  (tabs: Queues/Busy/Retries/Scheduled/Periodic/Dead/History/Stats)
+# -> http://localhost:9394/cogworker  (tabs: Overview/Jobs/Schedules/Workers/History)
 # -> http://localhost:9394/cogworker/metrics  (Prometheus text format)
 
 # 3b. same, but with the Web UI's code hot-reloading on every request —
@@ -47,7 +47,7 @@ bundle exec rackup ./examples/config.ru -p 9394
 COGWORKER_RELOAD=true bundle exec rackup ./examples/config.ru -p 9394
 ```
 
-The Busy/Stats/Queues tabs auto-refresh (htmx polling), and History's own
+The Workers/Overview tabs auto-refresh (htmx polling), and History's own
 AG Grid live-refreshes in place, every `Cogworker::Web.live_update_interval`
 seconds (default 3; set here in `config.ru`) — a single "Live" toggle in the
 header (persisted in your browser) pauses/resumes all of them together. The
@@ -74,7 +74,7 @@ mgr.register(...) }` entry (cron, class, args, unique mode) along with its
 computed next run and its last actual run time — sourced from Redis
 (`periodic:schedule`/`periodic:last_slot:<pjid>`), which only gets written
 once a real worker process's `Periodic::Ticker` has booted at least once;
-running only the Web UI shows an empty state, same as Busy with no worker
+running only the Web UI shows an empty state, same as Workers with no worker
 running.
 
 ## Stress testing

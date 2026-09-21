@@ -22,6 +22,34 @@ RSpec.describe Cogworker::Periodic::Ticker do
     expect(Cogworker.config.redis { |c| c.get("periodic:running:#{entry.pjid}") }).to eq(job['jid'])
   end
 
+  it "skips claim/enqueue entirely for a disabled entry (Routes::Schedules' own \"Disable\") — no job, " \
+     "no running lock, and periodic:last_slot doesn't advance either" do
+    Cogworker.config.redis { |c| c.sadd('periodic:disabled', entry.pjid) }
+    ticker = described_class.new(double(stopping?: false, quiet?: false), [entry])
+
+    ticker.send(:tick)
+
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(0)
+    expect(Cogworker.config.redis { |c| c.get("periodic:running:#{entry.pjid}") }).to be_nil
+    expect(Cogworker.config.redis { |c| c.get("periodic:last_slot:#{entry.pjid}") }).to be_nil
+  end
+
+  it 're-enabling an entry lets it be claimed again — nothing about the disabled window left ' \
+     'periodic:last_slot/the per-slot lock advanced, so a fresh claim attempt for that same slot ' \
+     "still succeeds (a *second* Ticker instance here, matching this spec's own race test just below: " \
+     'the first instance\'s own in-memory @last_checked_slot would otherwise mask this, since — exactly ' \
+     'like a lost claim race already does — it dedups a slot it saw at all, disabled or not, and doesn\'t ' \
+     "re-check it again until the cron rolls over to a new one)" do
+    Cogworker.config.redis { |c| c.sadd('periodic:disabled', entry.pjid) }
+    described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(0)
+
+    Cogworker.config.redis { |c| c.srem('periodic:disabled', entry.pjid) }
+    described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
+
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+  end
+
   it 'does not set a running lock for a non until_executed entry' do
     plain_entry = Cogworker::Periodic::Entry.new(cron: '* * * * *', class_name: 'TickerJob', retry: 0,
                                                  unique: nil, args: [])

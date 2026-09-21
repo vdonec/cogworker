@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'cgi'
 require 'json'
 
 module Cogworker
@@ -22,7 +23,8 @@ module Cogworker
         def registered(app)
           app.get('/history') do
             status = History::STATUSES.include?(params['status']) ? params['status'] : 'all'
-            content = Routes::History.render_content(request.script_name, status)
+            jid = params['jid'].to_s
+            content = Routes::History.render_content(request.script_name, status, jid)
             if hx_request?
               content
             else
@@ -37,7 +39,9 @@ module Cogworker
           # its sort/filter/scroll state) on every tick.
           app.get('/history/data') do
             status = History::STATUSES.include?(params['status']) ? params['status'] : 'all'
+            jid = params['jid'].to_s
             entries, = Cogworker::History::Storage.page(status, 1, Cogworker::History.max_entries)
+            entries = entries.select { |e| e['jid'] == jid } unless jid.empty?
             [200, { 'content-type' => 'application/json' }, [JSON.generate(entries)]]
           end
         end
@@ -57,47 +61,76 @@ module Cogworker
         # from there — retention (`max_entries`) already bounds this to a
         # size AG Grid handles comfortably, so there's no need for the
         # gem's own server-side paging on top of it.
-        def render_content(script_name, status)
+        #
+        # `jid` (optional — empty string means "not filtering") narrows this
+        # down to one job's own run history across every retry attempt (a
+        # retried job keeps its original jid throughout, so this is exactly
+        # "this job's full timeline", unlike the Jobs tab's own Retry
+        # history, which only shows its *failures*, capped to the last few —
+        # see `Routes::Jobs#attempts_section`, which links here).
+        def render_content(script_name, status, jid = '')
           entries, = Cogworker::History::Storage.page(status, 1, Cogworker::History.max_entries)
-          filters(script_name, status) + grid(entries, script_name, status)
-        end
-
-        def filters(script_name, current_status)
-          links = STATUSES.map { |status| filter_link(script_name, status, active: status == current_status) }.join
-          %(<div class="mb-4 flex gap-2">#{links}</div>)
-        end
-
-        def filter_link(script_name, status, active:)
-          classes = if active
-                      'bg-indigo-600 text-white'
-                    else
-                      'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'
-                    end
-          href = Layout.path(script_name, "history?status=#{status}")
-          %(<a href="#{href}" class="px-3 py-1 rounded-md text-sm font-medium #{classes}">#{Layout.h(status.capitalize)}</a>)
-        end
-
-        def grid(entries, script_name, status)
+          entries = entries.select { |e| e['jid'] == jid } unless jid.empty?
           <<~HTML
-            <div id="history-grid" class="ag-theme-alpine" style="height: 70vh; width: 100%;"></div>
-
-            <dialog id="history-backtrace-dialog" class="rounded-lg p-0 max-w-2xl w-[90vw] bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100">
-              <div class="p-4">
-                <div class="flex justify-between items-center mb-3">
-                  <h3 class="font-semibold">Backtrace</h3>
-                  <button type="button" onclick="this.closest('dialog').close()"
-                          class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">✕</button>
-                </div>
-                <pre id="history-backtrace-content" class="text-xs whitespace-pre-wrap max-h-[60vh] overflow-y-auto bg-gray-50 dark:bg-gray-950 p-3 rounded border border-gray-200 dark:border-gray-800"></pre>
-              </div>
-            </dialog>
-
-            #{grid_script(entries, script_name, status)}
+            <div style="display: flex; flex-direction: column; gap: 16px;">
+              #{page_header(script_name, status, jid)}
+              #{grid(entries, script_name, status, jid)}
+            </div>
           HTML
         end
 
-        def grid_script(entries, script_name, status)
-          data_url = Layout.path(script_name, "history/data?status=#{status}")
+        def page_header(script_name, current_status, jid)
+          links = STATUSES.map { |status| filter_link(script_name, status, jid, active: status == current_status) }.join
+          <<~HTML
+            <div style="display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap;">
+              <h2 style="margin: 0;">History</h2>
+              <div class="seg">#{links}</div>
+            </div>
+            #{jid.empty? ? '' : jid_filter_banner(script_name, current_status, jid)}
+          HTML
+        end
+
+        def filter_link(script_name, status, jid, active:)
+          query = "status=#{status}"
+          query += "&jid=#{CGI.escape(jid)}" unless jid.empty?
+          href = Layout.path(script_name, "history?#{query}")
+          %(<label class="seg-opt"><input type="radio" name="status" #{'checked' if active} onchange="location.href='#{href}'">#{Layout.h(status.capitalize)}</label>)
+        end
+
+        # Shown alongside the status filter whenever a `?jid=` narrowed the
+        # grid down to one job — otherwise there'd be no indication *why*
+        # the grid suddenly has far fewer rows, and no way back to the
+        # unfiltered view short of hand-editing the URL.
+        def jid_filter_banner(script_name, status, jid)
+          clear_href = Layout.path(script_name, "history?status=#{status}")
+          <<~HTML
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--color-neutral-400);">
+              <span>Filtered to job <span class="mono">#{Layout.h(jid)}</span></span>
+              <a href="#{clear_href}" class="btn btn-secondary" style="font-size: 12px; padding: 3px 8px;">clear</a>
+            </div>
+          HTML
+        end
+
+        def grid(entries, script_name, status, jid)
+          <<~HTML
+            <div id="history-grid" class="ag-theme-alpine" style="height: 70vh; width: 100%;"></div>
+
+            <dialog id="history-backtrace-dialog" class="dialog" style="width: min(720px, 90vw);">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span class="dialog-title">Backtrace</span>
+                <button type="button" onclick="this.closest('dialog').close()" class="btn btn-icon btn-ghost" aria-label="Close">✕</button>
+              </div>
+              <pre id="history-backtrace-content" class="mono" style="margin: 0; font-size: 12px; line-height: 1.6; white-space: pre-wrap; max-height: 60vh; overflow-y: auto; background: var(--color-bg); border: 1px solid var(--color-divider); border-radius: var(--radius-sm); padding: var(--space-3);"></pre>
+            </dialog>
+
+            #{grid_script(entries, script_name, status, jid)}
+          HTML
+        end
+
+        def grid_script(entries, script_name, status, jid)
+          query = "status=#{status}"
+          query += "&jid=#{CGI.escape(jid)}" unless jid.empty?
+          data_url = Layout.path(script_name, "history/data?#{query}")
           <<~HTML
             <script>
               (function () {
@@ -124,12 +157,31 @@ module Cogworker
                   document.getElementById('history-backtrace-dialog').showModal();
                 };
 
+                // Reads the actual nocturne tokens at render time (not a
+                // hardcoded hex) so this stays in sync with a retuned ramp,
+                // and resolves correctly whichever of the dark/light
+                // `@media` blocks in styles.css is currently active —
+                // matching the same `.tag`/`.tag-success`/`.tag-danger`
+                // look used everywhere else, since AG Grid's own
+                // cellRenderer can't just apply those CSS classes to cells
+                // it builds from a plain string/DOM node.
+                var cssVar = function (name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); };
+
                 function statusCellRenderer(p) {
                   var ok = p.value === 'success';
-                  var classes = ok
-                    ? 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300'
-                    : 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300';
-                  return '<span class="px-2 py-0.5 rounded-full text-xs font-medium ' + classes + '">' + p.value + '</span>';
+                  var bg = cssVar(ok ? '--color-success-800' : '--color-danger-800');
+                  var fg = cssVar(ok ? '--color-success-100' : '--color-danger-100');
+                  // `line-height: 1` resets AG Grid's own row-height-driven
+                  // `.ag-cell { line-height: <rowHeight>px; }` (inherited
+                  // here since this span never set its own) — without it,
+                  // the plain text content's line box takes on the full
+                  // row height (e.g. 41px) before padding is even added,
+                  // ballooning the pill well past the cell's own height and
+                  // getting top/bottom-clipped by the cell's `overflow:
+                  // hidden`, which also clips away its rounded corners.
+                  return '<span style="display:inline-flex;align-items:center;font-size:11px;letter-spacing:0.02em;' +
+                    'line-height:1;padding:3px 10px;border-radius:6px;background:' + bg + ';color:' + fg + ';">' +
+                    p.value + '</span>';
                 }
 
                 function errorValueGetter(p) {
@@ -140,7 +192,9 @@ module Cogworker
                   if (!p.data.backtrace) return p.value || '';
                   var span = document.createElement('span');
                   span.textContent = p.value;
-                  span.className = 'text-red-700 dark:text-red-400 underline cursor-pointer';
+                  span.style.color = cssVar('--color-danger-300');
+                  span.style.textDecoration = 'underline';
+                  span.style.cursor = 'pointer';
                   span.title = 'Click to view backtrace';
                   span.addEventListener('click', function () { window.cogworkerShowHistoryBacktrace(p.data.jid); });
                   return span;
@@ -197,7 +251,7 @@ module Cogworker
                   document.getElementById('history-grid').classList.add('ag-theme-alpine-dark');
                 }
 
-                // AG Grid isn't htmx-swapped (unlike Busy/Stats/Queues), so
+                // AG Grid isn't htmx-swapped (unlike Workers/Stats/Overview), so
                 // it needs its own poll — gated by the same global toggle —
                 // that replaces just `rowData` in place rather than
                 // reloading the fragment and tearing the grid instance down.

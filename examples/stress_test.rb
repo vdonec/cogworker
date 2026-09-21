@@ -230,9 +230,10 @@ WEB_SEED_SOURCE = <<~'RUBY'
 RUBY
 
 WEB_HAMMER_SOURCE = <<~'RUBY'
-  routes = ['/', '/busy', '/queues', '/queues/default', '/queues/low', '/retries', '/scheduled', '/periodic',
-            '/dead', '/history', '/history/data', '/stats', '/stats/bar', '/stats/counters', '/stats/redis',
-            '/stats/chart_data']
+  routes = ['/', '/overview', '/overview?layout=a&period=week', '/overview?layout=b&queue=default',
+            '/overview?layout=b&queue=low', '/jobs', '/jobs?status=Retrying', '/jobs?status=Dead',
+            '/schedules', '/workers', '/history', '/history/data',
+            '/overview/redis', '/overview/throughput_data', '/overview/runs_data?period=week']
   web = Cogworker::Web # captured once, matching how Rack::URLMap holds it in real usage
   stats = Hash.new(0)
   latencies = []

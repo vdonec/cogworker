@@ -69,9 +69,24 @@ module Cogworker
           slot = cron_for(entry).previous_time(now).to_i
           next if @last_checked_slot[entry.pjid] == slot
 
-          enqueue(entry, slot) if claim?(entry, slot)
+          enqueue(entry, slot) if !disabled?(entry) && claim?(entry, slot)
           @last_checked_slot[entry.pjid] = slot
         end
+      end
+
+      # Web UI "Disable" (`Routes::Schedules`) — skips the claim/enqueue
+      # step entirely, short-circuiting before `claim?` even runs, so
+      # neither `periodic:last_slot:<pjid>` nor the per-slot lock advance
+      # while disabled: the Web UI's own "LastRun" column keeps showing the
+      # last time it *actually* ran, not a due-but-skipped slot, and
+      # re-enabling doesn't trigger a catch-up burst for every slot that
+      # was silently skipped in between. `@last_checked_slot` (this one
+      # Ticker instance's own in-memory dedup, unrelated to the Redis-
+      # persisted last_slot) still advances either way, exactly as it
+      # already did before this entry ever had a disabled state — it only
+      # stops this same tick loop from re-evaluating the same slot twice.
+      def disabled?(entry)
+        Cogworker.config.redis { |c| c.sismember(RedisKeys::PERIODIC_DISABLED, entry.pjid) }
       end
 
       def cron_for(entry)

@@ -16,7 +16,7 @@ require 'digest/sha1'
 
 # ---- Queues: real jobs actually waiting to be picked up — two different
 #      queues (`default` and `low`, both listed in cogworker.yml), so the
-#      Queues tab shows more than a single one right away ----
+#      Overview tab shows more than a single one right away ----
 5.times { |i| GreetingJob.perform_async("queued visitor #{i}") }
 3.times { |i| LowPriorityJob.perform_async("background task #{i}") } # queue: 'low'
 
@@ -48,7 +48,7 @@ Cogworker.config.redis do |c|
   end
 end
 
-# ---- Busy: a couple of processes that look like they're mid-job (no real
+# ---- Workers: a couple of processes that look like they're mid-job (no real
 #      process behind them — just enough state for ProcessSet/WorkSet to
 #      render something without needing a worker running *right now*) ----
 fake_identities = Array.new(2) { |i| "demo-host:#{1234 + i}:#{SecureRandom.hex(6)}" }
@@ -144,7 +144,7 @@ puts <<~SUMMARY
     Queues:    5 GreetingJob on "default", 3 LowPriorityJob on "low"
     Scheduled: 4 jobs at various future times
     Periodic:  #{periodic_entries.size} registered cron schedules
-    Busy:      2 fake in-flight workers (no real process behind them)
+    Workers:   2 fake in-flight workers (no real process behind them)
     Retries:   #{retry_errors.size} jobs mid-retry
     Dead:      #{dead_jobs.size} exhausted jobs
     History:   #{history_count} past runs, ~25% failed — spans multiple pages

@@ -9,42 +9,30 @@ module Cogworker
     # extension contract (an extension is free to build its own HTML, or
     # use `erb`/`Views` the same way these do).
     module Layout
-      BUILT_IN_TABS = { 'Queues' => 'queues', 'Busy' => 'busy', 'Retries' => 'retries',
-                        'Scheduled' => 'scheduled', 'Periodic' => 'periodic', 'Dead' => 'dead',
-                        'History' => 'history', 'Stats' => 'stats' }.freeze
+      BUILT_IN_TABS = { 'Overview' => 'overview', 'Jobs' => 'jobs', 'Schedules' => 'schedules',
+                        'Workers' => 'workers', 'History' => 'history' }.freeze
       # Vendored under lib/cogworker/web/assets/ (served locally by
       # `Rack::Static`, wired up in `Web.build_app`) rather than fetched
-      # from a CDN, so the Web UI works fully offline. `TAILWIND_HREF`
-      # points at a pre-built, purged stylesheet (via the Tailwind CLI
-      # against this app's own template files) rather than the Play CDN's
-      # in-browser JIT script, since that script itself requires network
-      # access to run at all.
+      # from a CDN, so the Web UI works fully offline. `NOCTURNE_CSS_HREF`/
+      # `PHOSPHOR_CSS_HREF` are the "Relay" concept's design system
+      # (tokens + component classes) and its icon font — both self-hosted,
+      # same policy as htmx/AG Grid/Chart.js.
+      #
+      # No Tailwind stylesheet here any more — every built-in tab (Overview/
+      # Jobs/Schedules/Workers, then History/Stats last, since both leaned
+      # on hand-written Tailwind utility classes for their AG Grid/Chart.js
+      # layout) has been migrated onto these nocturne classes/tokens, and
+      # the vendored `assets/tailwind.css` file itself was removed with it —
+      # nothing in this gem references it any more.
       HTMX_SRC = 'assets/htmx.min.js'
-      TAILWIND_HREF = 'assets/tailwind.css'
+      NOCTURNE_CSS_HREF = 'assets/nocturne/styles.css'
+      PHOSPHOR_CSS_HREF = 'assets/phosphor/style.css'
 
-      BUTTON_VARIANTS = {
-        default: 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-200 dark:hover:bg-gray-600',
-        primary: 'bg-indigo-600 text-white hover:bg-indigo-500',
-        warning: 'bg-amber-100 text-amber-800 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-300 dark:hover:bg-amber-900/70',
-        danger: 'bg-red-50 text-red-700 hover:bg-red-100 dark:bg-red-900/30 dark:text-red-300 dark:hover:bg-red-900/60'
-      }.freeze
+      BUTTON_VARIANTS = { default: 'btn-secondary', primary: 'btn-primary', warning: 'btn-warning',
+                          danger: 'btn-danger', success: 'btn-success' }.freeze
 
-      BADGE_VARIANTS = {
-        success: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300',
-        warning: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
-        danger: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300',
-        default: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'
-      }.freeze
-
-      # Shared with `Routes::Stats::CARD_ACCENTS` (its big card grid on the
-      # actual Stats tab) — a single source of truth for which color each of
-      # the 6 job counters gets, whether rendered as a big card there or as
-      # a compact chip in `stats_bar` everywhere else.
-      JOB_STAT_ACCENTS = {
-        'Enqueued' => 'text-indigo-600 dark:text-indigo-400', 'Processed' => 'text-green-600 dark:text-green-400',
-        'Failed' => 'text-red-600 dark:text-red-400', 'Retries' => 'text-amber-600 dark:text-amber-400',
-        'Scheduled' => 'text-sky-600 dark:text-sky-400', 'Dead' => 'text-gray-500 dark:text-gray-400'
-      }.freeze
+      BADGE_VARIANTS = { success: 'tag-success', warning: 'tag-warning', danger: 'tag-danger',
+                         default: 'tag-neutral' }.freeze
 
       module_function
 
@@ -52,7 +40,7 @@ module Cogworker
       # every `interval` and swaps the response into this same element's
       # innerHTML. The route behind `path` only needs to answer both "full
       # page" (a normal GET) and "just this fragment" (`Action#hx_request?`
-      # true) — see e.g. Routes::Busy.
+      # true) — see e.g. Routes::Workers.
       # The `[window.cogworkerLiveUpdate]` event filter (htmx polling
       # syntax) makes every self-polling tab respect the global live-update
       # toggle (see `live_update_script`/`live_toggle_button` below) without
@@ -74,29 +62,50 @@ module Cogworker
         "#{script_name}/#{relative}"
       end
 
-      # `show_stats_bar: false` skips the global counter strip entirely —
-      # used only by the Stats tab itself (`Routes::Stats`), which already
-      # shows the same 6 numbers as its own, bigger card grid right below;
-      # repeating them again in the compact bar right above would just be
-      # the exact same figures twice on one page.
-      def wrap(title, body, script_name: '', extra_head: '', show_stats_bar: true)
+      # `body`'s own `min-width: max-content` (not a hand-picked pixel
+      # number) lets the browser compute the page's own minimum width from
+      # whatever's actually inside it — right now that's the header (see
+      # its own comment below), but it's self-adjusting: it'd grow or
+      # shrink again on its own if the header's content ever changes, no
+      # number to update by hand. Real payoff for `main` specifically: as
+      # the other direct child of this `display: flex; flex-direction:
+      # column` body, `main`'s default `align-items: stretch` cross-size
+      # already tracks *whatever width body ends up being* — so once
+      # body's own min-width is driven by the header, `main` stretches to
+      # match it too, rather than independently shrinking to the viewport
+      # while the header overflows past it (a real bug once: the page grew
+      # a horizontal scrollbar for the header, but `main`'s own content
+      # kept getting squeezed narrower against the viewport instead of
+      # riding along at the same width). The other direction of the same
+      # bug also hit once `main` was riding along correctly: `min-width:
+      # max-content` on `body` takes the *max* of every child's own
+      # max-content contribution, so `#cw-main`'s own (a wide table/card
+      # grid, capped at 1480px by its own `max-width`) was *also* feeding
+      # into it — and being bigger than the header's true ~1090px minimum,
+      # it won, flooring the whole page at 1480px instead: the header sat
+      # frozen, not tracking the window at all, for the entire 1090–1480px
+      # range, only reacting once you crossed below 1480. `.cw-main`'s own
+      # `contain: inline-size` (styles.css) is what excludes it from that
+      # calculation, leaving the header as the only real contributor.
+      def wrap(title, body, script_name: '', extra_head: '')
         <<~HTML
           <!doctype html>
-          <html class="h-full">
+          <html>
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <title>#{h(title)} · Cogworker</title>
-            <link rel="stylesheet" href="#{path(script_name, TAILWIND_HREF)}">
+            <link rel="stylesheet" href="#{path(script_name, NOCTURNE_CSS_HREF)}">
+            <link rel="stylesheet" href="#{path(script_name, PHOSPHOR_CSS_HREF)}">
             <script src="#{path(script_name, HTMX_SRC)}"></script>
             #{time_script}
             #{live_update_script}
+            #{wide_layout_script}
             #{extra_head}
           </head>
-          <body class="h-full bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100 antialiased">
+          <body style="min-height: 100vh; display: flex; flex-direction: column; min-width: max-content;">
             #{header(title, script_name)}
-            #{stats_bar_strip(script_name) if show_stats_bar}
-            <main class="w-full px-4 sm:px-6 lg:px-8 py-8">
+            <main id="cw-main" class="cw-main" style="flex: 1; padding: 22px; display: flex; flex-direction: column; gap: 20px;">
               #{body}
             </main>
           </body>
@@ -104,51 +113,123 @@ module Cogworker
         HTML
       end
 
-      def stats_bar_strip(script_name)
+      # Behaves like a desktop app's toolbar: never wraps onto a second
+      # line, no matter how narrow the window — below its natural content
+      # width, the *page* scrolls horizontally instead (`wrap` above's
+      # `min-width: max-content` on `body` is what turns this row's own
+      # unshrinkable width into the *page's* scrollable minimum, `main`
+      # included). What needs to be explicit here is `flex-wrap: nowrap` at
+      # every level that could otherwise wrap (this row, `.nav`, the
+      # right-hand action group), and — the easy-to-miss half of it —
+      # `white-space: nowrap` on every label that could otherwise
+      # line-break internally (`.btn` in styles.css covers the buttons;
+      # nav links already get it from `nav_link` below). Without the
+      # latter, flexbox's own "never shrink a row below its content's
+      # minimum size" protection still holds, but that minimum is computed
+      # from the *longest word*, not the whole label, once wrapping is
+      # allowed — so a button like "Pause intake" still gets squeezed down
+      # and its label splits into two lines ("Pause"/"intake") instead of
+      # the row ever overflowing. This was caught by hand — a fixed pixel
+      # `min-width` was tried first as a shortcut for both this and body's
+      # own min-width above, then dropped for the CSS-computed `max-
+      # content`/`white-space: nowrap` combination once the real causes
+      # turned out to make a hardcoded number unnecessary either way.
+      def header(title, script_name)
+        links = BUILT_IN_TABS.merge(Web.tabs).map do |label, p|
+          nav_link(label, p, script_name, active: label == title)
+        end.join
         <<~HTML
-          <div class="border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-950">
-            <div class="w-full px-4 sm:px-6 lg:px-8 py-2">
-              #{stats_bar(script_name)}
+          <header style="display: flex; align-items: center; gap: 14px; padding: 12px 22px; background: linear-gradient(180deg, color-mix(in srgb, var(--color-text) 4%, var(--color-bg)), var(--color-bg)); box-shadow: inset 0 -1px 0 var(--color-divider); position: sticky; top: 0; z-index: 5;">
+            <span style="font-family: var(--font-heading); font-weight: var(--font-heading-weight); font-size: 18px; letter-spacing: -0.02em; white-space: nowrap;">Cogworker</span>
+            <nav class="nav" style="padding: 0; gap: 2px; flex-wrap: nowrap;">#{links}</nav>
+            <div style="margin-left: auto; display: flex; align-items: center; gap: 14px; flex-wrap: nowrap;">
+              #{cluster_bar(script_name)}
+              #{pause_intake_button(script_name)}
+              #{resume_intake_button(script_name)}
+              #{wide_layout_toggle_button}
+              #{live_toggle_button}
             </div>
-          </div>
+          </header>
         HTML
       end
 
-      # The 6 job counters (Enqueued/Processed/Failed/Retries/Scheduled/
-      # Dead) as a compact, always-visible strip under the header — same
-      # counters as the big card grid on the Stats tab itself
-      # (`Routes::Stats`), just rendered small enough to sit on every page
-      # without pushing content down much. Self-polling (`poll_div`) via a
-      # tiny dedicated `GET /stats/bar` fragment route (see `Routes::Stats`)
-      # — always just this fragment, never a full page — so it stays live
-      # and respects the same global toggle as everything else, without
-      # every route needing to compute it itself.
-      def stats_bar(script_name)
-        poll_div('global-stats-bar', script_name, 'stats/bar', stats_bar_content)
+      # `production · N workers` in the "Relay" concept mock, minus the
+      # fabricated environment name (Cogworker has no such concept) — just
+      # the real worker count (`ProcessSet`) and a status dot colored by
+      # whether any of them are actually taking work right now, refreshed
+      # via a tiny dedicated fragment route (`Routes::Workers`'s own `GET
+      # /workers/summary`).
+      def cluster_bar(script_name)
+        poll_div('cluster-bar', script_name, 'workers/summary', cluster_bar_content)
       end
 
-      def stats_bar_content
-        stats = Cogworker::Stats.new
-        values = {
-          'Enqueued' => stats.enqueued, 'Processed' => stats.processed, 'Failed' => stats.failed,
-          'Retries' => stats.retry_size, 'Scheduled' => stats.scheduled_size, 'Dead' => stats.dead_size
-        }
-        items = values.map { |label, value| stat_chip(label, value) }.join
-        %(<div class="flex flex-wrap gap-2">#{items}</div>)
-      end
-
-      # Each counter its own bordered pill (not just plain text separated by
-      # a gap) — border-only in dark mode (no fill) so it reads as an
-      # outline against the page background rather than a lighter box
-      # sitting on top of it; a solid `bg-white` still works fine in light
-      # mode, where the surrounding strip is itself already light.
-      def stat_chip(label, value)
+      def cluster_bar_content
+        processes = Cogworker::ProcessSet.new.to_a
+        active = processes.any? { |p| ![true, 'true'].include?(p['quiet']) }
+        dot_glow = active ? ' box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 22%, transparent);' : ''
+        dot_color = active ? 'var(--color-success)' : 'var(--color-neutral-600)'
+        count = processes.size
         <<~HTML.strip
-          <span class="inline-flex items-center gap-1 rounded-md border border-gray-200 dark:border-gray-800 dark:bg-transparent px-2 py-1 text-xs whitespace-nowrap">
-            <span class="text-gray-500 dark:text-gray-400">#{h(label)}</span>
-            <span class="font-semibold #{JOB_STAT_ACCENTS.fetch(label, '')}">#{h(value)}</span>
+          <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--color-neutral-400); white-space: nowrap;">
+            <span style="width: 7px; height: 7px; border-radius: 50%; background: #{dot_color};#{dot_glow}"></span>
+            #{count} #{count == 1 ? 'worker' : 'workers'}
           </span>
         HTML
+      end
+
+      # Cluster-wide "quiet every process" (`Routes::Workers`'s own `POST
+      # /workers/pause_all`) — the mock's "Pause intake" button. Unlike real
+      # Sidekiq OSS (where quiet is a one-way trip back to a fresh process),
+      # `Manager#quiet` here is a plain in-memory flag, so `resume_intake_
+      # button` below is a genuine, symmetric undo rather than a full
+      # process restart.
+      def pause_intake_button(script_name)
+        action = path(script_name, 'workers/pause_all')
+        action_button(action, 'Pause intake', hx_target: '#cluster-bar', icon: 'pause')
+      end
+
+      # The undo for the button above (`POST /workers/resume_all`) — both
+      # buttons are always shown side by side rather than toggling one for
+      # the other, since `#cluster-bar` only reports an aggregate "any
+      # process active?" dot, not enough to know which single action applies
+      # cluster-wide when processes are in a mixed state.
+      def resume_intake_button(script_name)
+        action = path(script_name, 'workers/resume_all')
+        action_button(action, 'Resume intake', hx_target: '#cluster-bar', variant: :success, icon: 'play')
+      end
+
+      # `.nav a`/`.nav a[aria-current='page']` (styles.css) already turn a
+      # link accent-colored on hover or when active — only the active
+      # pill's background tint needs to be added here per-link, so this
+      # stays in sync with the design system's own hover/focus treatment
+      # instead of duplicating it.
+      def nav_link(label, relative_path, script_name, active:)
+        bg = active ? ' background: color-mix(in srgb, var(--color-accent) 14%, transparent);' : ''
+        attrs = active ? ' aria-current="page"' : ''
+        %(<a href="#{path(script_name,
+                          relative_path)}"#{attrs} style="display: inline-block; padding: 6px 11px; border-radius: var(--radius-md); white-space: nowrap;#{bg}">#{h(label)}</a>)
+      end
+
+      # One global on/off switch for every auto-refreshing tab (the
+      # htmx-polled Workers/Overview tabs via `poll_div`'s event filter, and
+      # History's own AG Grid data refresh) — persisted in `localStorage` so
+      # it survives navigating between tabs/reloading the page.
+      def live_toggle_button
+        %(<button type="button" data-cw-live-toggle class="btn btn-secondary" onclick="window.cogworkerSetLiveUpdate(!window.cogworkerLiveUpdate)"
+                  aria-pressed="true" title="Toggle live auto-refresh"
+                  style="flex-shrink: 0; font-size: 13px;">⏸ Live</button>)
+      end
+
+      # Global fixed-width/full-width switch for `<main>` (`#cw-main`, the
+      # `.cw-main`/`.cw-main--wide` pair in styles.css) — same persisted-in-
+      # `localStorage`, applies-on-every-page shape as `live_toggle_button`/
+      # `live_update_script` above, just flipping a layout class instead of
+      # gating polling. Defaults to fixed width (matching the design as
+      # exported) when nothing's stored yet.
+      def wide_layout_toggle_button
+        %(<button type="button" data-cw-wide-toggle class="btn btn-secondary" onclick="window.cogworkerSetWideLayout(!window.cogworkerWideLayout)"
+                  aria-pressed="false" title="Toggle fixed-width/full-width layout"
+                  style="flex-shrink: 0; font-size: 13px;">⛶ Full width</button>)
       end
 
       # Every `time_tag` renders a UTC fallback (readable with JS disabled,
@@ -225,36 +306,10 @@ module Cogworker
         %(<time datetime="#{time.utc.iso8601}" data-cw-time>#{h(time.utc.strftime(Web.time_format))}</time>)
       end
 
-      def header(title, script_name)
-        links = BUILT_IN_TABS.merge(Web.tabs).map do |label, p|
-          nav_link(label, p, script_name, active: label == title)
-        end.join
-        <<~HTML
-          <header class="border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900">
-            <div class="w-full px-4 sm:px-6 lg:px-8">
-              <div class="flex items-center h-14 gap-1">
-                <span class="font-semibold tracking-tight mr-4">⚙️ Cogworker</span>
-                <nav class="flex gap-1 overflow-x-auto">#{links}</nav>
-                #{live_toggle_button}
-              </div>
-            </div>
-          </header>
-        HTML
-      end
-
       # One global on/off switch for every auto-refreshing tab (the
-      # htmx-polled Busy/Stats/Queues tabs via `poll_div`'s event filter, and
+      # htmx-polled Workers/Overview tabs via `poll_div`'s event filter, and
       # History's own AG Grid data refresh) — persisted in `localStorage` so
       # it survives navigating between tabs/reloading the page.
-      def live_toggle_button
-        %(<button type="button" data-cw-live-toggle onclick="window.cogworkerSetLiveUpdate(!window.cogworkerLiveUpdate)"
-                  aria-pressed="true" title="Toggle live auto-refresh"
-                  class="ml-auto flex-shrink-0 px-3 py-1.5 rounded-md text-sm font-medium bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200">⏸ Live</button>)
-      end
-
-      # Runs before the rest of the page so `window.cogworkerLiveUpdate` is
-      # already set by the time htmx evaluates its first `every ... [...]`
-      # poll filter or a route's own refresh script checks it.
       def live_update_script
         <<~HTML
           <script>
@@ -282,56 +337,88 @@ module Cogworker
         HTML
       end
 
-      def nav_link(label, relative_path, script_name, active:)
-        classes = if active
-                    'bg-indigo-600 text-white'
-                  else
-                    'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800'
-                  end
-        %(<a href="#{path(script_name,
-                          relative_path)}" class="px-3 py-1.5 rounded-md text-sm font-medium whitespace-nowrap #{classes}">#{h(label)}</a>)
+      # Companion to `wide_layout_toggle_button` above — same persisted-
+      # in-`localStorage`, apply-on-`DOMContentLoaded`-and-every-toggle
+      # shape as `live_update_script`, just toggling `#cw-main`'s
+      # `cw-main--wide` class (styles.css) instead of a polling flag.
+      # Applied directly here (not deferred to a `poll_div`/htmx swap)
+      # since `#cw-main` itself is never one of those fragments — it's the
+      # element every fragment lives *inside*.
+      def wide_layout_script
+        <<~HTML
+          <script>
+            (function () {
+              function readStored() {
+                try { return localStorage.getItem('cogworkerWideLayout') === 'true'; } catch (e) { return false; }
+              }
+              window.cogworkerWideLayout = readStored();
+              window.cogworkerSetWideLayout = function (on) {
+                window.cogworkerWideLayout = on;
+                try { localStorage.setItem('cogworkerWideLayout', on ? 'true' : 'false'); } catch (e) {}
+                var main = document.getElementById('cw-main');
+                if (main) main.classList.toggle('cw-main--wide', on);
+                document.querySelectorAll('[data-cw-wide-toggle]').forEach(function (btn) {
+                  btn.textContent = on ? '⛶ Fixed width' : '⛶ Full width';
+                  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+                });
+              };
+              document.addEventListener('DOMContentLoaded', function () {
+                window.cogworkerSetWideLayout(window.cogworkerWideLayout);
+              });
+            })();
+          </script>
+        HTML
       end
 
       def h(str)
         CGI.escapeHTML(str.to_s)
       end
 
-      def table(headers, rows, empty_message: 'Nothing here.')
-        return %(<p class="text-sm text-gray-500 dark:text-gray-400 italic">#{h(empty_message)}</p>) if rows.empty?
+      # `wrapped: false` skips this table's own bordered/shadowed card —
+      # for a caller that's already putting it inside one of its own (e.g.
+      # a `<section>` alongside an `<h4>`, matching Overview's Throughput/
+      # Redis cards), where the default wrapper would just nest one bordered
+      # box inside another.
+      def table(headers, rows, empty_message: 'Nothing here.', wrapped: true)
+        return %(<p class="text-muted" style="font-size: 13px; font-style: italic;">#{h(empty_message)}</p>) if rows.empty?
 
-        head = headers.map do |c|
-          %(<th class="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">#{h(c)}</th>)
-        end.join
+        head = headers.map { |c| %(<th>#{h(c)}</th>) }.join
         body = rows.map do |row|
-          cells = row.map { |cell| %(<td class="px-4 py-2 text-sm align-middle">#{cell}</td>) }.join
-          %(<tr class="hover:bg-gray-50 dark:hover:bg-gray-800/60">#{cells}</tr>)
+          cells = row.map { |cell| %(<td>#{cell}</td>) }.join
+          %(<tr>#{cells}</tr>)
         end.join
-        <<~HTML
-          <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 shadow-sm">
-            <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-800">
-              <thead class="bg-gray-50 dark:bg-gray-800/60"><tr>#{head}</tr></thead>
-              <tbody class="divide-y divide-gray-100 dark:divide-gray-800">#{body}</tbody>
-            </table>
-          </div>
+        inner = <<~HTML
+          <table class="table">
+            <thead><tr>#{head}</tr></thead>
+            <tbody>#{body}</tbody>
+          </table>
         HTML
+        return inner unless wrapped
+
+        %(<div style="background: var(--color-surface); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); padding: 8px 6px 4px; overflow-x: auto;">#{inner}</div>)
       end
 
       def section(heading, body)
-        %(<h2 class="text-lg font-semibold mt-8 mb-3">#{h(heading)}</h2>#{body})
+        %(<h3 style="font-family: var(--font-heading); font-weight: var(--font-heading-weight); font-size: 17px; margin: var(--space-8) 0 var(--space-3);">#{h(heading)}</h3>#{body})
+      end
+
+      def badge(label, variant: :default)
+        %(<span class="tag #{BADGE_VARIANTS.fetch(variant)}">#{h(label)}</span>)
       end
 
       # A one-button `<form>`, wired for both htmx (`hx-post`/`hx-target`)
       # and a plain, JS-less POST fallback to the same `action` URL.
-      def badge(label, variant: :default)
-        %(<span class="px-2 py-0.5 rounded-full text-xs font-medium #{BADGE_VARIANTS.fetch(variant)}">#{h(label)}</span>)
-      end
-
-      def form_button(action, hidden_name, hidden_value, label, hx_target:, variant: :default)
-        classes = "px-2.5 py-1 rounded-md text-xs font-medium #{BUTTON_VARIANTS.fetch(variant)}"
+      # `icon:` (a Phosphor icon name, e.g. `'arrow-clockwise'`) is optional
+      # — the "Relay" concept mock only puts icons on a page's few
+      # prominent/standalone actions (a detail panel's own buttons, the
+      # header's "Pause intake"), never on the small, repeated actions
+      # packed into a dense table row, so most call sites omit it.
+      def form_button(action, hidden_name, hidden_value, label, hx_target:, variant: :default, icon: nil)
+        classes = "btn #{BUTTON_VARIANTS.fetch(variant)}"
         <<~HTML
-          <form class="inline" hx-post="#{action}" hx-target="#{hx_target}" hx-swap="innerHTML" method="post" action="#{action}">
+          <form style="display: inline;" hx-post="#{action}" hx-target="#{hx_target}" hx-swap="innerHTML" method="post" action="#{action}">
             <input type="hidden" name="#{hidden_name}" value="#{h(hidden_value)}">
-            <button type="submit" class="#{classes}">#{h(label)}</button>
+            <button type="submit" class="#{classes}" style="font-size: 13px; padding: 4px 10px;">#{icon_tag(icon)}#{h(label)}</button>
           </form>
         HTML
       end
@@ -339,13 +426,17 @@ module Cogworker
       # Same wiring as `form_button`, minus the hidden identifying field —
       # for a whole-collection action (e.g. "delete all") that doesn't
       # target one particular row.
-      def action_button(action, label, hx_target:, variant: :default)
-        classes = "px-2.5 py-1 rounded-md text-xs font-medium #{BUTTON_VARIANTS.fetch(variant)}"
+      def action_button(action, label, hx_target:, variant: :default, icon: nil)
+        classes = "btn #{BUTTON_VARIANTS.fetch(variant)}"
         <<~HTML
-          <form class="inline" hx-post="#{action}" hx-target="#{hx_target}" hx-swap="innerHTML" method="post" action="#{action}">
-            <button type="submit" class="#{classes}">#{h(label)}</button>
+          <form style="display: inline;" hx-post="#{action}" hx-target="#{hx_target}" hx-swap="innerHTML" method="post" action="#{action}">
+            <button type="submit" class="#{classes}" style="font-size: 13px; padding: 4px 10px;">#{icon_tag(icon)}#{h(label)}</button>
           </form>
         HTML
+      end
+
+      def icon_tag(name)
+        name ? %(<i class="ph ph-#{name}"></i>) : ''
       end
     end
   end

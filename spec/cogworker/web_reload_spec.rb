@@ -15,7 +15,7 @@ RSpec.describe 'Cogworker::Web reload (COGWORKER_RELOAD=true)' do
       Cogworker::Web # bare reference, not `require 'cogworker/web'` — see CLAUDE.md's Zeitwerk section
 
       3.times do |i|
-        env = Rack::MockRequest.env_for('/busy')
+        env = Rack::MockRequest.env_for('/workers')
         status, _headers, body = Cogworker::Web.call(env)
         raise "request \#{i} failed: \#{status}\\n\#{body.reduce(:+)}" unless status == 200
       end
@@ -59,7 +59,7 @@ RSpec.describe 'Cogworker::Web reload (COGWORKER_RELOAD=true)' do
       threads = 8.times.map do
         Thread.new do
           20.times do
-            env = Rack::MockRequest.env_for('/busy')
+            env = Rack::MockRequest.env_for('/workers')
             status, _headers, body = web.call(env)
             errors << "status \#{status}: \#{body.reduce(:+)}" unless status == 200
           rescue StandardError => e

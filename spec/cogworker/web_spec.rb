@@ -84,12 +84,12 @@ RSpec.describe Cogworker::Web do
     end
 
     it 'blocks a cross-site POST by default (no Sec-Fetch-Site: same-origin)' do
-      resp = mock.post('/busy/quiet', params: { 'identity' => 'x' })
+      resp = mock.post('/workers/quiet', params: { 'identity' => 'x' })
       expect(resp.status).to eq(403)
     end
 
     it 'allows a POST carrying Sec-Fetch-Site: same-origin' do
-      resp = mock.post('/busy/quiet', 'HTTP_SEC_FETCH_SITE' => 'same-origin', params: { 'identity' => 'x' })
+      resp = mock.post('/workers/quiet', 'HTTP_SEC_FETCH_SITE' => 'same-origin', params: { 'identity' => 'x' })
       expect(resp.status).to eq(302)
     end
 
@@ -122,7 +122,7 @@ RSpec.describe Cogworker::Web do
       raw = JSON.generate('jid' => 'x', 'class' => 'X', 'args' => [], 'queue' => 'default')
       Cogworker.config.redis { |c| c.zadd('cogworker:schedule', Time.utc(2026, 1, 2, 3, 4, 5).to_f, raw) }
 
-      body = mock.get('/scheduled').body
+      body = mock.get('/jobs?status=Scheduled').body
       expect(body).to include('datetime="2026-01-02T03:04:05Z"')
       expect(body).to include('data-cw-time')
       expect(body).to include('>2026-01-02 03:04:05<')
@@ -133,7 +133,7 @@ RSpec.describe Cogworker::Web do
       raw = JSON.generate('jid' => 'y', 'class' => 'X', 'args' => [], 'queue' => 'default')
       Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.utc(2026, 1, 2, 3, 4, 5).to_f, raw) }
 
-      body = mock.get('/dead').body
+      body = mock.get('/jobs?status=Dead').body
       expect(body).to include('>02.01.2026<')
     end
 
@@ -230,6 +230,16 @@ RSpec.describe Cogworker::Web do
       expect(body).to include('setInterval(refreshRows, 7000);')
     end
 
+    it 'renders a page header with a title, and the All/Success/Failed filter pushed to the right of it' do
+      body = mock.get('/history').body
+      expect(body).to include('<h2 style="margin: 0;">History</h2>')
+      expect(body).to include('justify-content: space-between')
+      # The heading comes first in source order, matching its position on
+      # the left — the filter (right-aligned via the row's own space-
+      # between) comes after it, not before.
+      expect(body.index('<h2 style="margin: 0;">History</h2>')).to be < body.index('class="seg"')
+    end
+
     describe 'GET /history/data (JSON, polled by the grid for live updates)' do
       it 'returns the full entry list as JSON, honoring the status filter, without the HTML chrome' do
         seed_entry('success', jid: 'ok1')
@@ -247,17 +257,8 @@ RSpec.describe Cogworker::Web do
   end
 
   describe 'built-in tabs' do
-    it 'Stats renders enqueued/processed/failed counters' do
-      stub_const('WebStatsJob', Class.new { include Cogworker::Worker })
-      WebStatsJob.perform_async
-
-      resp = mock.get('/stats')
-      expect(resp.status).to eq(200)
-      expect(resp.body).to include('Enqueued')
-    end
-
-    it 'Stats renders a Redis section (version, uptime, connections, memory usage) from a real INFO call' do
-      resp = mock.get('/stats')
+    it 'Overview renders a Redis section (version, uptime, connections, memory usage) from a real INFO call' do
+      resp = mock.get('/overview')
       expect(resp.status).to eq(200)
       expect(resp.body).to include('Redis')
       expect(resp.body).to include('Version')
@@ -271,7 +272,42 @@ RSpec.describe Cogworker::Web do
       expect(resp.body).to include(real_version)
     end
 
-    it 'Stats renders a per-day success/failed runs chart, using real History entries' do
+    it 'Overview renders the Redis section at the very bottom of the page, below both charts, in its own ' \
+       'self-polling fragment (not inside the main CONTENT_ID poll_div, and not inside the charts)' do
+      body = mock.get('/overview').body
+      content_start = body.index("id=\"#{Cogworker::Web::Routes::Overview::CONTENT_ID}\"")
+      redis_content_start = body.index("id=\"#{Cogworker::Web::Routes::Overview::REDIS_CONTENT_ID}\"")
+      runs_start = body.index('overview-runs-canvas')
+      expect(content_start).to be < redis_content_start
+      expect(runs_start).to be < redis_content_start
+    end
+
+    it 'GET /overview/redis returns just the Redis fragment (no page chrome), polled independently of ' \
+       "CONTENT_ID's own poll_div" do
+      resp = mock.get('/overview/redis')
+      expect(resp.status).to eq(200)
+      expect(resp.body).not_to include('<html>')
+      expect(resp.body).to include('Redis')
+      expect(resp.body).to include('Version')
+    end
+
+    it "Cogworker::Stats#redis_info exposes the full INFO reply, and missing fields render as 'n/a' on Overview" do
+      stats = Cogworker::Stats.new
+      expect(stats.redis_info).to be_a(Hash)
+      expect(stats.redis_info['redis_version']).to be_a(String)
+
+      allow(Cogworker::Stats).to receive(:new).and_wrap_original do |orig, *args|
+        orig.call(*args).tap { |s| allow(s).to receive(:redis_info).and_return({}) }
+      end
+      expect(mock.get('/overview').body).to include('n/a')
+    end
+
+    it 'bare / is an alias for /overview — the old Stats tab used to own that landing-page role' do
+      expect(mock.get('/').body).to include('Overview')
+      expect(mock.get('/').body).to include('Redis')
+    end
+
+    it 'Overview renders a per-day success/failed Runs-per-day chart, using real History entries' do
       raw_ok = JSON.generate('jid' => 'chartok', 'class' => 'ChartOkJob', 'queue' => 'default', 'args' => [],
                              'status' => 'success', 'started_at' => Time.now.to_f, 'finished_at' => Time.now.to_f)
       raw_bad = JSON.generate('jid' => 'chartbad', 'class' => 'ChartBadJob', 'queue' => 'default', 'args' => [],
@@ -283,7 +319,7 @@ RSpec.describe Cogworker::Web do
         c.zadd('cogworker:history:failed', Time.now.to_f, raw_bad)
       end
 
-      body = mock.get('/stats').body
+      body = mock.get('/overview').body
       expect(body).to include('Runs per day')
       today_str = Time.now.utc.strftime('%Y-%m-%d')
       expect(body).to include(today_str) # embedded in the chart's `fullDates` tooltip-title array
@@ -292,33 +328,34 @@ RSpec.describe Cogworker::Web do
       expect(body).to include((Array.new(29, 0) + [1]).to_json)
     end
 
-    it 'Stats renders the chart via the vendored Chart.js (not a CDN), inside its own bordered card' do
-      body = mock.get('/stats').body
+    it 'Overview renders the Runs-per-day chart via the vendored Chart.js (not a CDN), inside its own ' \
+       'bordered card, in addition to its own Throughput chart' do
+      body = mock.get('/overview').body
       expect(body).to include('src="/assets/chart.umd.min.js"')
-      expect(body).to match(%r{rounded-lg border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 shadow-sm p-4">\s*<div style="position: relative;.*<canvas id="runs-chart-canvas"></canvas>}m)
-      expect(body).to include('new Chart(')
+      expect(body).to match(%r{background: var\(--color-surface\);.*>Runs per day<.*<div style="position: relative;.*<canvas id="overview-runs-canvas"></canvas>}m)
+      expect(body.scan('new Chart(').size).to eq(2) # Throughput + Runs per day, two independent instances
       expect(body).not_to match(%r{https?://}) # vendored, not fetched from jsdelivr/unpkg/etc
     end
 
-    it "Stats' chart is NOT inside any htmx-polled fragment — regression test for a real leak: an " \
-       'earlier version re-rendered the whole chart (canvas included) on every htmx poll, creating a ' \
-       'new, never-destroyed Chart.js instance each tick (confirmed via Chart.instances in a live ' \
-       'browser tab), eventually breaking the chart under live updates' do
-      body = mock.get('/stats').body
-      expect(body).to include("id=\"#{Cogworker::Web::Routes::Stats::COUNTERS_CONTENT_ID}\"")
-      expect(body).to include("id=\"#{Cogworker::Web::Routes::Stats::REDIS_CONTENT_ID}\"")
-      expect(body).to include('<canvas id="runs-chart-canvas">')
-      # The chart keeps itself live by re-fetching its own small JSON
+    it "neither of Overview's two charts sits inside its own self-polling container — regression test " \
+       'for a real leak: an earlier version re-rendered a chart (canvas included) on every htmx poll, ' \
+       'creating a new, never-destroyed Chart.js instance each tick, eventually breaking it under live ' \
+       'updates (the fix that was already applied to the old Stats tab, carried over here)' do
+      body = mock.get('/overview').body
+      content_start = body.index("id=\"#{Cogworker::Web::Routes::Overview::CONTENT_ID}\"")
+      throughput_start = body.index('overview-throughput-canvas')
+      runs_start = body.index('overview-runs-canvas')
+      expect(content_start).to be < throughput_start
+      expect(content_start).to be < runs_start
+      # Both keep themselves live by re-fetching their own small JSON
       # endpoint and patching the *existing* instance's data in place —
-      # never recreating it, so there's nothing to leak. (The companion
-      # test below proves the counters/Redis poll fragments — the only
-      # things an htmx tick actually swaps — never contain a `<canvas>`.)
-      expect(body).to include('fetch(dataUrl')
-      expect(body).to include('chart.update()')
-      expect(body).not_to include('window.cogworkerRunsChart') # the old destroy-and-recreate workaround is gone
+      # never recreating it, so there's nothing to leak.
+      expect(body).to include('fetch(dataUrl') # Throughput's own poll
+      expect(body).to include('fetch(dataBaseUrl') # Runs-per-day's own poll/period-switch fetch
+      expect(body.scan('chart.update()').size).to eq(2)
     end
 
-    it 'GET /stats/chart_data returns just the plotted numbers as JSON, honoring ?period=' do
+    it 'GET /overview/runs_data returns just the plotted numbers as JSON, honoring ?period=' do
       raw_ok = JSON.generate('jid' => 'apiok', 'class' => 'ApiOkJob', 'queue' => 'default', 'args' => [],
                              'status' => 'success', 'started_at' => Time.now.to_f, 'finished_at' => Time.now.to_f)
       Cogworker.config.redis do |c|
@@ -326,7 +363,7 @@ RSpec.describe Cogworker::Web do
         c.zadd('cogworker:history:success', Time.now.to_f, raw_ok)
       end
 
-      resp = mock.get('/stats/chart_data?period=week')
+      resp = mock.get('/overview/runs_data?period=week')
       expect(resp.headers['content-type']).to eq('application/json')
       payload = JSON.parse(resp.body)
       expect(payload['labels'].size).to eq(7)
@@ -335,40 +372,40 @@ RSpec.describe Cogworker::Web do
       expect(payload['failed'].last).to eq(0)
     end
 
-    it 'GET /stats/counters and GET /stats/redis each return just their own fragment (no page chrome, no chart)' do
-      counters = mock.get('/stats/counters').body
-      expect(counters).to include('Enqueued')
-      expect(counters).not_to include('<html')
-      expect(counters).not_to include('<canvas')
+    describe 'Overview Runs-per-day period switcher (week/month/3 months/6 months)' do
+      # A `.seg` segmented control of real radio inputs (so it gets
+      # nocturne's own `:has(input:checked)` active styling for free — see
+      # the layout A/B switcher, the same pattern), each calling
+      # `window.cogworkerChangeRunsPeriod` on `onchange` rather than
+      # navigating (`location.href=`) — switching periods only needs to
+      # patch the Runs-per-day chart's own data in place; a full page
+      # reload would needlessly tear down and rebuild the unrelated
+      # Throughput chart's Chart.js instance too. "Which one is active" is
+      # the `checked` attribute, not a CSS class on the link.
+      def period_option(body, key)
+        body[/<label class="seg-opt"><input type="radio" name="period"[^>]*onchange="window\.cogworkerChangeRunsPeriod\('#{key}'\)"[^>]*>/]
+      end
 
-      redis = mock.get('/stats/redis').body
-      expect(redis).to include('Version')
-      expect(redis).not_to include('<html')
-      expect(redis).not_to include('<canvas')
-    end
-
-    describe 'Stats period switcher (week/month/3 months/6 months)' do
-      it 'renders all 4 options as links, defaulting to Month' do
-        body = mock.get('/stats').body
+      it 'renders all 4 options as radio labels, defaulting to Month' do
+        body = mock.get('/overview').body
         %w[Week Month].each { |label| expect(body).to include(">#{label}<") }
         expect(body).to include('>3 Months<')
         expect(body).to include('>6 Months<')
-        expect(body).to include('href="/stats?period=week"')
-        expect(body).to include('href="/stats?period=month"')
-        expect(body).to include('href="/stats?period=3months"')
-        expect(body).to include('href="/stats?period=6months"')
-        expect(body).to match(%r{href="/stats\?period=month" class="[^"]*bg-indigo-600})
+        expect(period_option(body, 'week')).not_to be_nil
+        expect(period_option(body, 'month')).to include('checked')
+        expect(period_option(body, '3months')).not_to be_nil
+        expect(period_option(body, '6months')).not_to be_nil
       end
 
       it 'highlights whichever period is selected via ?period=' do
-        body = mock.get('/stats?period=6months').body
-        expect(body).to match(%r{href="/stats\?period=6months" class="[^"]*bg-indigo-600})
-        expect(body).not_to match(%r{href="/stats\?period=month" class="[^"]*bg-indigo-600})
+        body = mock.get('/overview?period=6months').body
+        expect(period_option(body, '6months')).to include('checked')
+        expect(period_option(body, 'month')).not_to include('checked')
       end
 
       it 'falls back to the default period for an unrecognized ?period value' do
-        body = mock.get('/stats?period=bogus').body
-        expect(body).to match(%r{href="/stats\?period=month" class="[^"]*bg-indigo-600})
+        body = mock.get('/overview?period=bogus').body
+        expect(period_option(body, 'month')).to include('checked')
       end
 
       it 'a shorter period drops entries outside its window, a longer one still includes them' do
@@ -381,43 +418,85 @@ RSpec.describe Cogworker::Web do
         end
         old_day_str = old_day.strftime('%Y-%m-%d')
 
-        expect(mock.get('/stats?period=month').body).to include(old_day_str) # in fullDates for a 30-day window
-        expect(mock.get('/stats?period=week').body).not_to include(old_day_str) # outside a 7-day window
+        expect(mock.get('/overview?period=month').body).to include(old_day_str) # in fullDates for a 30-day window
+        expect(mock.get('/overview?period=week').body).not_to include(old_day_str) # outside a 7-day window
       end
 
-      it "the selected period sticks across the chart's own live-update poll (its dataUrl carries ?period=)" do
-        # The counters/Redis poll_divs don't need `?period=` at all anymore
-        # (see `page_body`) — the chart isn't htmx-polled, so it carries the
-        # period itself, baked into the `dataUrl` its own `fetch` re-uses on
-        # every tick.
-        body = mock.get('/stats?period=week').body
-        expect(body).to include('var dataUrl = "\\/stats\\/chart_data?period=week"') # '/' escaped per Layout.json_for_script
+      it 'the initial period is baked in as a plain JS variable the chart\'s own poll and the period-switch ' \
+         'handler both read/update, not into the data URL itself (which never carries ?period= — the ' \
+         'period is always sent as a fetch param instead, so switching periods never has to touch the URL ' \
+         'string the periodic poll re-uses)' do
+        body = mock.get('/overview?period=week').body
+        expect(body).to include('var dataBaseUrl = "\\/overview\\/runs_data"') # '/' escaped per Layout.json_for_script
+        expect(body).to include('var currentPeriod = "week"')
       end
     end
 
-    it "Cogworker::Stats#redis_info exposes the full INFO reply, and missing fields render as 'n/a'" do
-      stats = Cogworker::Stats.new
-      expect(stats.redis_info).to be_a(Hash)
-      expect(stats.redis_info['redis_version']).to be_a(String)
-
-      allow(Cogworker::Stats).to receive(:new).and_wrap_original do |orig, *args|
-        orig.call(*args).tap { |s| allow(s).to receive(:redis_info).and_return({}) }
-      end
-      expect(mock.get('/stats').body).to include('n/a')
-    end
-
-    it 'Queues lists a queue and its jobs' do
+    it 'Overview lists a queue (layout A) and its jobs (layout B)' do
       stub_const('WebQueueJob', Class.new { include Cogworker::Worker })
       WebQueueJob.perform_async(1, 2)
 
-      list = mock.get('/queues')
+      list = mock.get('/overview')
       expect(list.body).to include('default')
 
-      detail = mock.get('/queues/default')
+      detail = mock.get('/overview?layout=b&queue=default')
       expect(detail.body).to include('WebQueueJob')
     end
 
-    it 'Dead lists entries newest DiedAt first' do
+    it "Overview's queue table renders latency as a value plus its own mini-bar, no separate " \
+       '"Latency by queue" section (folded in, rather than showing the same number twice on the page)' do
+      stub_const('WebLatencyJob', Class.new { include Cogworker::Worker })
+      WebLatencyJob.perform_async
+
+      body = mock.get('/overview').body
+      expect(body).not_to include('Latency by queue')
+      expect(body).to include('>Queues<') # the table's own heading — merging the section didn't drop it
+      expect(body).to include('>Latency<') # still a table column header
+      # The bar itself — same small accent-filled-bar markup the old
+      # standalone section used, just now inside the table's Latency cell.
+      expect(body).to match(%r{background: var\(--color-accent\); width: \d+%;"></div>})
+    end
+
+    it 'Overview layout A renders the Throughput chart (vendored Chart.js, not a CDN); layout B has none' do
+      body = mock.get('/overview').body
+      expect(body).to include('src="/assets/chart.umd.min.js"')
+      expect(body).to include('id="overview-throughput-canvas"')
+      expect(body).to include('new Chart(')
+      expect(body).not_to match(%r{https?://}) # vendored, not fetched from a CDN
+
+      body_b = mock.get('/overview?layout=b').body
+      expect(body_b).not_to include('overview-throughput-canvas')
+      expect(body_b).not_to include('chart.umd.min.js')
+    end
+
+    it "the Throughput chart sits outside Overview's own self-polling container — regression test for " \
+       'the same Chart.js-instance-leak class of bug already fixed on Stats: an htmx innerHTML swap would ' \
+       'destroy the <canvas> DOM node on every tick without ever freeing the old Chart.js instance' do
+      resp = mock.get('/overview', 'HTTP_HX_REQUEST' => 'true')
+      expect(resp.body).not_to include('overview-throughput-canvas')
+
+      full_page = mock.get('/overview').body
+      expect(full_page).to include('id="overview-content"')
+      # The chart section must render *after* the poll_div wrapper starts,
+      # as a sibling following it — not nested inside the fragment that
+      # gets replaced wholesale on every tick (confirmed above).
+      poll_div_start = full_page.index('id="overview-content"')
+      chart_start = full_page.index('overview-throughput-canvas')
+      expect(chart_start).to be > poll_div_start
+    end
+
+    it 'GET /overview/throughput_data returns the same 24-hour series Cogworker::Throughput.series computes' do
+      Cogworker::Throughput.record('processed')
+
+      resp = mock.get('/overview/throughput_data')
+      expect(resp.headers['content-type']).to eq('application/json')
+      payload = JSON.parse(resp.body)
+      expect(payload['labels'].size).to eq(24)
+      expect(payload['processed'].last).to eq(1)
+      expect(payload['failed'].last).to eq(0)
+    end
+
+    it 'Jobs lists Dead entries newest DiedAt first' do
       older = JSON.generate('jid' => 'older', 'class' => 'OlderDeadJob', 'args' => [], 'queue' => 'default')
       newer = JSON.generate('jid' => 'newer', 'class' => 'NewerDeadJob', 'args' => [], 'queue' => 'default')
       Cogworker.config.redis do |c|
@@ -425,25 +504,98 @@ RSpec.describe Cogworker::Web do
         c.zadd('cogworker:dead', Time.now.to_f, newer)
       end
 
-      body = mock.get('/dead').body
+      body = mock.get('/jobs?status=Dead').body
       expect(body.index('NewerDeadJob')).to be < body.index('OlderDeadJob')
+    end
+
+    it "Jobs' retry now/retry/delete actions carry a Phosphor icon (row actions double as the detail " \
+       "panel's own, so both get one — the mock only skips icons on plain per-row buttons)" do
+      raw = JSON.generate('jid' => 'iconjid', 'class' => 'IconRetryJob', 'args' => [], 'queue' => 'default',
+                          'error_class' => 'RuntimeError', 'error_message' => 'boom')
+      Cogworker.config.redis { |c| c.zadd('cogworker:retry', Time.now.to_f, raw) }
+
+      body = mock.get('/jobs?status=Retrying').body
+      expect(body).to include('<i class="ph ph-arrow-clockwise"></i>retry now')
+      expect(body).to include('<i class="ph ph-trash"></i>delete')
+    end
+
+    it "Jobs' detail panel offers Reschedule for a Retrying entry, not for a Dead one" do
+      raw = JSON.generate('jid' => 'reschedjid', 'class' => 'ReschedJob', 'args' => [], 'queue' => 'default')
+      Cogworker.config.redis { |c| c.zadd('cogworker:retry', Time.now.to_f + 60, raw) }
+      raw_dead = JSON.generate('jid' => 'deadjid2', 'class' => 'DeadJob2', 'args' => [], 'queue' => 'default')
+      Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, raw_dead) }
+
+      body = mock.get('/jobs?status=Retrying&selected=reschedjid').body
+      expect(body).to include('Reschedule')
+      expect(body).to include('name="minutes"')
+
+      body = mock.get('/jobs?status=Dead&selected=deadjid2').body
+      expect(body).not_to include('Reschedule')
+    end
+
+    it "Jobs' detail panel caps its Retry history, linking to History for the rest — not the full, " \
+       'possibly much longer, stored trail' do
+      limit = Cogworker::Web::Routes::Jobs::ATTEMPTS_DISPLAY_LIMIT
+      raw = JSON.generate('jid' => 'manyretryjid', 'class' => 'ManyRetryJob', 'args' => [], 'queue' => 'default')
+      Cogworker.config.redis { |c| c.zadd('cogworker:retry', Time.now.to_f + 60, raw) }
+      total_attempts = limit + 3
+      total_attempts.times do |i|
+        Cogworker::Attempts.record('manyretryjid', attempt: i + 1,
+                                                   error: RuntimeError.new("boom #{i}"), outcome: 'retrying')
+      end
+
+      body = mock.get('/jobs?status=Retrying&selected=manyretryjid').body
+      expect(body.scan('Attempt ').size).to eq(limit)
+      expect(body).to include("last #{limit} of #{total_attempts}")
+      # The newest attempts, not the oldest — `Attempts.for` is oldest-first,
+      # reversed for display, so the last `shown` by attempt number should
+      # be what's actually on the page.
+      expect(body).to include("boom #{total_attempts - 1}") # newest attempt's error
+      expect(body).not_to include('boom 0') # oldest attempt's error, trimmed from view
+      expect(body).to include('>view in History</a>')
+      expect(body).to include('href="/history?jid=manyretryjid"')
+    end
+
+    it "History's ?jid= filter narrows the grid to just that job's own runs (success included), across " \
+       'every retry attempt, and offers a link back to the unfiltered view' do
+      raw_ok = JSON.generate('jid' => 'trackedjid', 'class' => 'TrackedJob', 'queue' => 'default', 'args' => [],
+                             'status' => 'success', 'started_at' => 1.0, 'finished_at' => 2.0)
+      raw_other = JSON.generate('jid' => 'otherjid', 'class' => 'OtherJob', 'queue' => 'default', 'args' => [],
+                                'status' => 'success', 'started_at' => 1.0, 'finished_at' => 2.0)
+      Cogworker.config.redis do |c|
+        c.zadd('cogworker:history:all', 2.0, raw_ok)
+        c.zadd('cogworker:history:success', 2.0, raw_ok)
+        c.zadd('cogworker:history:all', 2.0, raw_other)
+        c.zadd('cogworker:history:success', 2.0, raw_other)
+      end
+
+      body = mock.get('/history?jid=trackedjid').body
+      expect(body).to include('TrackedJob')
+      expect(body).not_to include('OtherJob')
+      expect(body).to include('Filtered to job')
+      expect(body).to include('trackedjid')
+      expect(body).to include('href="/history?status=all"') # clears the filter, keeps the status
+
+      resp = mock.get('/history/data?jid=trackedjid')
+      parsed = JSON.parse(resp.body)
+      expect(parsed.map { |e| e['jid'] }).to eq(['trackedjid'])
     end
 
     it 'generates nav links and form actions prefixed with the actual mount point, not root-absolute' do
       stub_const('WebMountJob', Class.new { include Cogworker::Worker })
       WebMountJob.perform_async
 
-      env = Rack::MockRequest.env_for('/queues', 'SCRIPT_NAME' => '/cogworker', 'PATH_INFO' => '/queues')
+      env = Rack::MockRequest.env_for('/overview', 'SCRIPT_NAME' => '/cogworker', 'PATH_INFO' => '/overview')
       status, _headers, body = Cogworker::Web.call(env)
       html = body.reduce(:+)
 
       expect(status).to eq(200)
-      expect(html).to include('href="/cogworker/busy"')
-      expect(html).to include('href="/cogworker/queues/default"')
-      expect(html).not_to include('href="/busy"')
+      expect(html).to include('href="/cogworker/workers"')
+      expect(html).to include('href="/cogworker/overview?layout=b&queue=default"')
+      expect(html).not_to include('href="/workers"')
     end
 
-    it 'Busy quiet!/stop! actions publish to the process signal channel' do
+    it 'Workers quiet!/resume!/stop! actions publish to the process signal channel' do
       manager = Cogworker::Manager.new
       heartbeat = Cogworker::Heartbeat.new(manager)
       heartbeat.send(:beat)
@@ -457,24 +609,58 @@ RSpec.describe Cogworker::Web do
         end[1].to_i.positive?
       end
 
-      resp = mock.post('/busy/quiet', 'HTTP_SEC_FETCH_SITE' => 'same-origin',
-                                      params: { 'identity' => Cogworker.identity })
+      resp = mock.post('/workers/quiet', 'HTTP_SEC_FETCH_SITE' => 'same-origin',
+                                         params: { 'identity' => Cogworker.identity })
       expect(resp.status).to eq(302)
       wait_for { manager.quiet? }
+
+      # Unlike stop!, this is a genuine round-trip — `Manager#quiet` is a
+      # plain in-memory flag, not a one-way state transition.
+      resp = mock.post('/workers/resume', 'HTTP_SEC_FETCH_SITE' => 'same-origin',
+                                          params: { 'identity' => Cogworker.identity })
+      expect(resp.status).to eq(302)
+      wait_for { !manager.quiet? }
 
       heartbeat.stop!
     end
 
-    it 'Busy renders each process\'s start time, memory usage, and served queues' do
+    it "renders a process's card as Quiet (not Active) once its heartbeat reports quiet: true — a real bug " \
+       "once: ProcessSet already converts the raw Redis 'true'/'false' string into an actual boolean, so " \
+       "the Web route re-comparing it to the string 'true' again always evaluated false, and every card " \
+       'silently showed Active regardless of the process\'s real state' do
+      manager = Cogworker::Manager.new
+      Cogworker::Heartbeat.new(manager).send(:beat)
+      Cogworker.config.redis { |c| c.hset(Cogworker::RedisKeys.process(Cogworker.identity), 'quiet', 'true') }
+
+      body = mock.get('/workers').body
+      expect(body).to include('tag-warning">Quiet<')
+      expect(body).not_to include('tag-success">Active<')
+    end
+
+    it "shows a card's own action button as resume once quiet (not quiet again), and as quiet while still " \
+       'active (not resume) — never both at once' do
+      manager = Cogworker::Manager.new
+      Cogworker::Heartbeat.new(manager).send(:beat)
+
+      active_body = mock.get('/workers').body
+      expect(active_body).to include('hx-post="/workers/quiet"')
+      expect(active_body).not_to include('hx-post="/workers/resume"')
+
+      Cogworker.config.redis { |c| c.hset(Cogworker::RedisKeys.process(Cogworker.identity), 'quiet', 'true') }
+
+      quiet_body = mock.get('/workers').body
+      expect(quiet_body).to include('hx-post="/workers/resume"')
+      expect(quiet_body).not_to include('hx-post="/workers/quiet"')
+    end
+
+    it "Workers renders each process's card with its start time, memory usage, and served queues" do
       Cogworker.config.queues = %w[default low]
       manager = Cogworker::Manager.new
       heartbeat = Cogworker::Heartbeat.new(manager)
       heartbeat.send(:beat) # real Heartbeat#beat — exercises the actual current_rss_kb measurement
 
-      body = mock.get('/busy').body
-      expect(body).to include('StartedAt')
-      expect(body).to include('Memory')
-      expect(body).to include('Queues')
+      body = mock.get('/workers').body
+      expect(body).to include('started <time')
       expect(body).to include('default, low')
       # Either a real "n.nM" reading (the common case on any platform with
       # /proc or `ps`) or the graceful "n/a" fallback — never a raw "0M" or
@@ -484,7 +670,30 @@ RSpec.describe Cogworker::Web do
       heartbeat.stop!
     end
 
-    it "Busy's Workers section renders each in-flight job's JID, not just its class/queue/thread" do
+    it 'Workers renders a page header with real process/thread counts and the real heartbeat interval ' \
+       "— the mock's own fixed \"12 processes · 96 threads\" replaced with live data" do
+      # Two fake processes written directly to Redis (same shape
+      # `ProcessSet#each` reads: a `PROCESSES` set membership plus each
+      # identity's own hash, `info` holding the JSON heartbeat payload) —
+      # simpler and more direct than juggling two real `Heartbeat`
+      # background threads just to get a second identity into the set.
+      Cogworker.config.redis do |c|
+        %w[proc-a proc-b].each do |identity|
+          c.sadd(Cogworker::RedisKeys::PROCESSES, identity)
+          c.hset(Cogworker::RedisKeys.process(identity),
+                 'info', JSON.generate('concurrency' => 3, 'queues' => ['default'], 'started_at' => Time.now.to_f),
+                 'busy', '0', 'quiet', 'false')
+        end
+      end
+
+      body = mock.get('/workers').body
+      expect(body).to include('<h2 style="margin: 0 0 4px;">Workers</h2>')
+      expect(body).to include('2 processes')
+      expect(body).to include('6 threads') # 2 processes × concurrency 3 each
+      expect(body).to include("heartbeat every #{Cogworker::Heartbeat::INTERVAL}s")
+    end
+
+    it "Workers' in-flight jobs table renders each job's JID, not just its class/queue/thread" do
       gate = Queue.new
       stub_const('SlowBusyJob', Class.new do
         include Cogworker::Worker
@@ -504,7 +713,7 @@ RSpec.describe Cogworker::Web do
 
       wait_for { Cogworker::WorkSet.new.size == 1 }
 
-      body = mock.get('/busy').body
+      body = mock.get('/workers').body
       expect(body).to include('JID')
       expect(body).to include(jid)
 
@@ -512,9 +721,9 @@ RSpec.describe Cogworker::Web do
       manager.stop!(timeout: 5)
     end
 
-    it "Busy's own Busy count always matches its Workers table (both come from the same real-time " \
-       'WorkSet snapshot) — the count used to come from the last heartbeat instead, which lags behind ' \
-       'real-time WorkSet by up to Heartbeat::INTERVAL seconds and could visibly disagree with it' do
+    it "Workers' own busy count on each card always matches its in-flight jobs table (both come from the " \
+       'same real-time WorkSet snapshot) — the count used to come from the last heartbeat instead, which ' \
+       'lags behind real-time WorkSet by up to Heartbeat::INTERVAL seconds and could visibly disagree with it' do
       manager = Cogworker::Manager.new
       Cogworker::Heartbeat.new(manager).send(:beat) # publishes busy=0 — no processor has run anything yet
 
@@ -529,26 +738,23 @@ RSpec.describe Cogworker::Web do
         Cogworker.config.redis { |c| c.hset("cogworker:workers:#{identity}", "tid-#{i}", payload) }
       end
 
-      body = mock.get('/busy').body
-      # The process row's own Busy count …
-      expect(body).to include('>3<')
-      # … matches how many rows the Workers table actually shows for it —
-      # not the stale "0" the heartbeat published a moment ago.
+      body = mock.get('/workers').body
+      # The card's own busy/concurrency figure …
+      expect(body).to include("3 / #{Cogworker.config.concurrency} busy")
+      # … matches how many rows the in-flight jobs table actually shows for
+      # it — not the stale "0" the heartbeat published a moment ago.
       expect(body.scan('realtime-jid').size).to eq(3)
     end
 
-    it 'Dead/Retries/Scheduled each self-poll, respecting the global live-update toggle — a gap fixed after ' \
-       'shipping (they predate the live-update feature and were never retrofitted, unlike Busy/Stats/Queues)' do
-      { '/dead' => 'dead-content', '/retries' => 'retries-content',
-        '/scheduled' => 'scheduled-content' }.each do |path, id|
-        body = mock.get(path).body
-        expect(body).to include(%(id="#{id}" hx-get="/#{path.delete_prefix('/')}"))
-        expect(body).to include('hx-trigger="every 3s [window.cogworkerLiveUpdate]"')
-      end
+    it 'Jobs (covering what used to be the separate Dead/Retries/Scheduled tabs) self-polls, respecting the ' \
+       'global live-update toggle' do
+      body = mock.get('/jobs').body
+      expect(body).to include('id="jobs-content" hx-get="/jobs"')
+      expect(body).to include('hx-trigger="every 3s [window.cogworkerLiveUpdate]"')
     end
   end
 
-  describe 'Periodic tab' do
+  describe 'Schedules tab (was Periodic)' do
     def seed_periodic_entry(pjid, cron:, klass:, args: [], unique: nil, last_slot: nil)
       raw = JSON.generate('cron' => cron, 'class' => klass, 'retry' => 0, 'unique' => unique, 'args' => args)
       Cogworker.config.redis do |c|
@@ -558,7 +764,7 @@ RSpec.describe Cogworker::Web do
     end
 
     it 'shows the empty state when no worker has ever published a periodic schedule' do
-      body = mock.get('/periodic').body
+      body = mock.get('/schedules').body
       expect(body).to include('Nothing registered yet')
     end
 
@@ -566,7 +772,7 @@ RSpec.describe Cogworker::Web do
       seed_periodic_entry('pjid1', cron: '*/5 * * * *', klass: 'PeriodicReportJob', args: [{ 'section' => 'daily' }],
                                    unique: 'until_executed', last_slot: (Time.now - 300).to_i)
 
-      body = mock.get('/periodic').body
+      body = mock.get('/schedules').body
       expect(body).to include('PeriodicReportJob')
       expect(body).to include('*/5 * * * *')
       expect(body).to include('{&quot;section&quot;:&quot;daily&quot;}')
@@ -577,64 +783,218 @@ RSpec.describe Cogworker::Web do
     it 'shows "never" for an entry that has not fired yet (no periodic:last_slot key)' do
       seed_periodic_entry('pjid2', cron: '0 * * * *', klass: 'NeverRunYetJob')
 
-      body = mock.get('/periodic').body
+      body = mock.get('/schedules').body
       expect(body).to include('NeverRunYetJob')
       expect(body).to include('never')
     end
 
-    it 'includes the self-polling container, respecting the same live-update toggle as Busy/Stats/Queues' do
-      resp = mock.get('/periodic')
-      expect(resp.body).to include('id="periodic-content"')
+    it 'includes the self-polling container, respecting the same live-update toggle as Workers/Stats/Overview' do
+      resp = mock.get('/schedules')
+      expect(resp.body).to include('id="schedules-content"')
       expect(resp.body).to include('hx-trigger="every 3s [window.cogworkerLiveUpdate]"')
     end
+
+    it 'shows Enabled by default, and every entry offers run now/disable' do
+      seed_periodic_entry('pjid3', cron: '0 * * * *', klass: 'EnabledJob')
+
+      body = mock.get('/schedules').body
+      expect(body).to include(Cogworker::Web::Layout.badge('Enabled', variant: :success))
+      expect(body).to include('>run now<')
+      expect(body).to include('>disable<')
+    end
+
+    it 'POST .../run_now pushes the entry\'s class/args as an ordinary job, untied to any periodic slot' do
+      seed_periodic_entry('pjid4', cron: '0 * * * *', klass: 'RunNowJob', args: [{ 'x' => 1 }])
+      stub_const('RunNowJob', Class.new { include Cogworker::Worker })
+
+      resp = mock.post('/schedules/pjid4/run_now', 'HTTP_HX_REQUEST' => 'true', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+
+      expect(resp.status).to eq(200)
+      raw = Cogworker.config.redis { |c| c.lpop('cogworker:queue:default') }
+      job = JSON.parse(raw)
+      expect(job['class']).to eq('RunNowJob')
+      expect(job['args']).to eq([{ 'x' => 1 }])
+      expect(job).not_to have_key('periodic_pjid') # a manual run, not tied to the cron claim/lock bookkeeping
+    end
+
+    it 'POST .../disable then .../enable toggles the State tag, the NextRun column, and Ticker#disabled?' do
+      seed_periodic_entry('pjid5', cron: '0 * * * *', klass: 'ToggleJob')
+      pjid = 'pjid5'
+
+      resp = mock.post("/schedules/#{pjid}/disable", 'HTTP_HX_REQUEST' => 'true',
+                                                     'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(200)
+      expect(resp.body).to include(Cogworker::Web::Layout.badge('Disabled', variant: :warning))
+      expect(resp.body).to include('>disabled<') # NextRun column, not a computed time
+      expect(resp.body).to include('>enable<')
+      expect(Cogworker.config.redis { |c| c.sismember('periodic:disabled', pjid) }).to be(true)
+
+      resp = mock.post("/schedules/#{pjid}/enable", 'HTTP_HX_REQUEST' => 'true',
+                                                    'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(200)
+      expect(resp.body).to include(Cogworker::Web::Layout.badge('Enabled', variant: :success))
+      expect(Cogworker.config.redis { |c| c.sismember('periodic:disabled', pjid) }).to be(false)
+    end
+
+    it 'a plain (non-hx) disable POST still redirects, for JS-less clients' do
+      seed_periodic_entry('pjid6', cron: '0 * * * *', klass: 'RedirectJob')
+      resp = mock.post('/schedules/pjid6/disable', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(302)
+    end
+
+    it 'renders a page header with a title and a shown/total count' do
+      seed_periodic_entry('pjid7', cron: '0 * * * *', klass: 'HeaderJob')
+
+      body = mock.get('/schedules').body
+      expect(body).to include('<h2 style="margin: 0 0 4px;">Schedules</h2>')
+      expect(body).to include('1 of 1 shown')
+    end
+
+    it '?q= searches class, cron, and args, narrowing the table and the shown/total count' do
+      seed_periodic_entry('pjidmatch', cron: '*/5 * * * *', klass: 'MatchingReportJob', args: [{ 'x' => 1 }])
+      seed_periodic_entry('pjidother', cron: '0 0 * * *', klass: 'OtherJob')
+
+      body = mock.get('/schedules?q=Matching').body
+      expect(body).to include('MatchingReportJob')
+      expect(body).not_to include('OtherJob')
+      expect(body).to include('1 of 2 shown')
+
+      # Matches the cron expression too, not just the class name.
+      body = mock.get('/schedules?q=0+0+*+*+*').body
+      expect(body).to include('OtherJob')
+      expect(body).not_to include('MatchingReportJob')
+    end
+
+    it 'shows a search-specific empty message when a query matches nothing, distinct from the ' \
+       "'nothing registered at all' state" do
+      seed_periodic_entry('pjidreal', cron: '0 * * * *', klass: 'RealJob')
+
+      body = mock.get('/schedules?q=NoSuchClass').body
+      expect(body).to include('No schedules match that search.')
+      expect(body).not_to include('Nothing registered yet')
+    end
+
+    it 'a row action (disable) started from an active search carries the search through via a hidden ' \
+       'field, so the hx-swapped re-render does not silently clear it' do
+      seed_periodic_entry('pjidsearch', cron: '0 * * * *', klass: 'SearchedJob')
+
+      body = mock.get('/schedules?q=Searched').body
+      expect(body).to include('<input type="hidden" name="q" value="Searched">')
+
+      resp = mock.post('/schedules/pjidsearch/disable', 'HTTP_HX_REQUEST' => 'true',
+                                                        'HTTP_SEC_FETCH_SITE' => 'same-origin',
+                                                        params: { 'q' => 'Searched' })
+      expect(resp.body).to include('SearchedJob')
+      expect(resp.body).to include('value="Searched"') # the search box itself still shows the term
+    end
+
+    it 'a plain (non-hx) row action redirects back with ?q= preserved' do
+      seed_periodic_entry('pjidredirect2', cron: '0 * * * *', klass: 'RedirectSearchJob')
+      resp = mock.post('/schedules/pjidredirect2/disable', 'HTTP_SEC_FETCH_SITE' => 'same-origin',
+                                                           params: { 'q' => 'RedirectSearch' })
+      expect(resp.status).to eq(302)
+      expect(resp.location).to end_with('/schedules?q=RedirectSearch')
+    end
   end
 
-  describe 'global stats bar (job counters visible on every page, except Stats itself)' do
-    it 'appears, self-polling, on every built-in tab other than /stats' do
-      %w[/busy /queues /retries /scheduled /periodic /dead /history].each do |path|
-        body = mock.get(path).body
-        expect(body).to include('id="global-stats-bar"')
-        expect(body).to include('hx-get="/stats/bar"')
-        expect(body).to include('Enqueued')
-        expect(body).to include('Dead')
-      end
+  describe 'cluster bar (header status pill + "Pause intake", on every page)' do
+    it 'shows a muted dot and "0 workers" when nothing is reporting in' do
+      body = mock.get('/overview').body
+      expect(body).to include('id="cluster-bar" hx-get="/workers/summary"')
+      expect(body).to include('0 workers')
+      expect(body).to include('background: var(--color-neutral-600);')
     end
 
-    it 'is suppressed on /stats itself — its own card grid already shows the same 6 numbers, larger' do
-      body = mock.get('/stats').body
-      expect(body).not_to include('id="global-stats-bar"')
-      expect(body).not_to include('hx-get="/stats/bar"')
-      # The page's own content still renders the job counters — just once,
-      # via its bigger card grid, not the compact bar too.
-      expect(body).to include('Enqueued')
-      expect(body).to include('Dead')
+    it 'shows a lit, glowing dot and the real process count once a process has beaten' do
+      Cogworker::Heartbeat.new(Cogworker::Manager.new).send(:beat)
+
+      body = mock.get('/overview').body
+      expect(body).to include('1 worker')
+      expect(body).to include('background: var(--color-success);')
+      expect(body).to include('box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 22%, transparent);')
     end
 
-    it 'GET /stats/bar returns just the compact fragment (no page chrome) with real counter values' do
-      stub_const('BarCountJob', Class.new { include Cogworker::Worker })
-      BarCountJob.perform_async
-      raw = JSON.generate('jid' => 'x', 'class' => 'BarDeadJob', 'args' => [], 'queue' => 'default')
-      Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, raw) }
+    it 'goes back to the muted dot once every process is quiet' do
+      manager = Cogworker::Manager.new
+      Cogworker::Heartbeat.new(manager).send(:beat)
+      manager.quiet!
+      Cogworker::Heartbeat.new(manager).send(:beat) # publishes the now-quiet state
 
-      resp = mock.get('/stats/bar')
+      body = mock.get('/overview').body
+      expect(body).to include('1 worker')
+      expect(body).to include('background: var(--color-neutral-600);')
+    end
+
+    it 'GET /workers/summary returns just the bare fragment (no page chrome)' do
+      resp = mock.get('/workers/summary')
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('<html>')
-      expect(resp.body).not_to include('id="global-stats-bar"') # the bare fragment, not the polling wrapper
-      expect(resp.body).to include('Enqueued')
-      expect(resp.body).to include('>1<') # the one enqueued BarCountJob
-      expect(resp.body).to include('Dead')
-      expect(resp.body).to include('>1<') # the one dead entry just added
+      expect(resp.body).not_to include('id="cluster-bar"') # the bare fragment, not the polling wrapper
+      expect(resp.body).to include('workers')
     end
 
-    it 'Layout::JOB_STAT_ACCENTS and Routes::Stats::CARD_ACCENTS share the same 6 job-counter colors' do
-      Cogworker::Web::Layout::JOB_STAT_ACCENTS.each do |label, color|
-        expect(Cogworker::Web::Routes::Stats::CARD_ACCENTS[label]).to eq(color)
+    it 'POST /workers/pause_all quiets every live process, via the same signal pub/sub a single quiet! uses' do
+      manager = Cogworker::Manager.new
+      heartbeat = Cogworker::Heartbeat.new(manager)
+      heartbeat.send(:beat)
+      heartbeat.start!
+      # Same wait as the single-process quiet test: the pub/sub SUBSCRIBE
+      # has to actually be established before pause_all's PUBLISH, or it's
+      # simply lost (Redis pub/sub isn't durable).
+      wait_for do
+        Cogworker.config.redis do |c|
+          c.pubsub('numsub', "cogworker:signal:#{Cogworker.identity}")
+        end[1].to_i.positive?
       end
+
+      resp = mock.post('/workers/pause_all', 'HTTP_HX_REQUEST' => 'true', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+
+      expect(resp.status).to eq(200)
+      wait_for { manager.quiet? }
+
+      heartbeat.stop!
+    end
+
+    it 'a plain (non-hx) POST to pause_all still redirects, for JS-less clients' do
+      resp = mock.post('/workers/pause_all', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(302)
+    end
+
+    it 'POST /workers/resume_all resumes every live process, the symmetric undo for pause_all' do
+      manager = Cogworker::Manager.new
+      heartbeat = Cogworker::Heartbeat.new(manager)
+      heartbeat.send(:beat)
+      heartbeat.start!
+      wait_for do
+        Cogworker.config.redis do |c|
+          c.pubsub('numsub', "cogworker:signal:#{Cogworker.identity}")
+        end[1].to_i.positive?
+      end
+
+      mock.post('/workers/pause_all', 'HTTP_HX_REQUEST' => 'true', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      wait_for { manager.quiet? }
+
+      resp = mock.post('/workers/resume_all', 'HTTP_HX_REQUEST' => 'true', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(200)
+      wait_for { !manager.quiet? }
+
+      heartbeat.stop!
+    end
+
+    it 'a plain (non-hx) POST to resume_all still redirects, for JS-less clients' do
+      resp = mock.post('/workers/resume_all', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(302)
+    end
+
+    it 'the header renders both Pause intake and Resume intake buttons side by side, not a single toggle' do
+      body = mock.get('/workers').body
+      expect(body).to include('hx-post="/workers/pause_all"')
+      expect(body).to include('hx-post="/workers/resume_all"')
     end
   end
 
-  describe 'offline assets (htmx/Tailwind/AG Grid vendored, served via Rack::Static)' do
-    it 'serves the vendored htmx/Tailwind/AG Grid files locally, at a mount-point-prefixed path' do
+  describe 'offline assets (htmx/nocturne/AG Grid vendored, served via Rack::Static)' do
+    it 'serves the vendored htmx/nocturne/AG Grid files locally, at a mount-point-prefixed path' do
       env = Rack::MockRequest.env_for('/assets/htmx.min.js', 'SCRIPT_NAME' => '/cogworker',
                                                              'PATH_INFO' => '/assets/htmx.min.js')
       status, headers, body = Cogworker::Web.call(env)
@@ -644,10 +1004,10 @@ RSpec.describe Cogworker::Web do
       body.each { |chunk| chunks << chunk }
       expect(chunks.join).to include('htmx')
 
-      resp = mock.get('/assets/tailwind.css')
+      resp = mock.get('/assets/nocturne/styles.css')
       expect(resp.status).to eq(200)
       expect(resp.headers['content-type']).to eq('text/css')
-      expect(resp.body).to include('.bg-indigo-600')
+      expect(resp.body).to include('--color-accent')
 
       resp = mock.get('/assets/ag-grid/ag-grid-community.min.js')
       expect(resp.status).to eq(200)
@@ -660,18 +1020,42 @@ RSpec.describe Cogworker::Web do
     end
 
     it 'never references an external CDN host anywhere in a rendered page' do
-      %w[/busy /history /stats /queues /periodic].each do |path|
+      %w[/workers /history /stats /overview /schedules].each do |path|
         body = mock.get(path).body
         expect(body).not_to match(%r{https?://})
       end
     end
 
-    it "doesn't mark vendored assets immutable/long-cached — they DO change (a Tailwind rebuild, a gem " \
-       'upgrade), and an immutable/long max-age previously left a browser serving a stale copy of ' \
-       'tailwind.css under the same URL with no revalidation at all until a hard reload' do
-      resp = mock.get('/assets/tailwind.css')
+    it "doesn't mark vendored assets immutable/long-cached — they DO change (a styles.css rebuild, a gem " \
+       'upgrade), and an immutable/long max-age previously left a browser serving a stale copy of a ' \
+       'vendored asset under the same URL with no revalidation at all until a hard reload' do
+      resp = mock.get('/assets/nocturne/styles.css')
       expect(resp.headers['cache-control']).not_to match(/immutable/)
       expect(resp.headers['last-modified']).not_to be_nil # so a normal conditional GET still revalidates cheaply
+    end
+
+    it 'serves the vendored nocturne stylesheet/font and Phosphor icon font locally, with no external ' \
+       'references — linked on every page (Layout.wrap) since the nocturne migration finished, this ' \
+       'proves the assets themselves are in place and offline' do
+      resp = mock.get('/assets/nocturne/styles.css')
+      expect(resp.status).to eq(200)
+      expect(resp.headers['content-type']).to eq('text/css')
+      expect(resp.body).not_to match(%r{https?://})
+      expect(resp.body).to include('--color-accent')
+
+      resp = mock.get('/assets/nocturne/fonts/inter-latin.woff2')
+      expect(resp.status).to eq(200)
+      expect(resp.body.bytesize).to be > 10_000
+
+      resp = mock.get('/assets/phosphor/style.css')
+      expect(resp.status).to eq(200)
+      expect(resp.headers['content-type']).to eq('text/css')
+      expect(resp.body).not_to match(%r{https?://})
+      expect(resp.body).to include('.ph {')
+
+      resp = mock.get('/assets/phosphor/Phosphor.woff2')
+      expect(resp.status).to eq(200)
+      expect(resp.body.bytesize).to be > 10_000
     end
   end
 
@@ -685,16 +1069,17 @@ RSpec.describe Cogworker::Web do
     end
 
     it 'includes the htmx script and a self-polling container on a plain (non-hx) page load' do
-      resp = mock.get('/busy')
+      resp = mock.get('/workers')
       expect(resp.body).to include('src="/assets/htmx.min.js"') # vendored locally, not fetched from a CDN
-      expect(resp.body).to include('id="busy-content"')
+      expect(resp.body).to include('id="workers-content"')
       expect(resp.body).to include('hx-trigger="every 3s [window.cogworkerLiveUpdate]"') # default Web.live_update_interval
     end
 
-    it 'Queue detail page (/queues/:name) is also a self-polling container, not just the Queues list' do
-      resp = mock.get('/queues/default')
-      expect(resp.body).to include('id="queue-content"')
-      expect(resp.body).to include('hx-get="/queues/default"')
+    it 'Overview layout B (/overview?layout=b&queue=:name) is also a self-polling container, carrying the ' \
+       'same query params so a refresh keeps the selected layout/queue' do
+      resp = mock.get('/overview?layout=b&queue=default')
+      expect(resp.body).to include('id="overview-content"')
+      expect(resp.body).to include('hx-get="/overview?layout=b&queue=default"')
       expect(resp.body).to include('hx-trigger="every 3s [window.cogworkerLiveUpdate]"')
     end
 
@@ -702,28 +1087,36 @@ RSpec.describe Cogworker::Web do
       original = Cogworker::Web.live_update_interval
       Cogworker::Web.live_update_interval = 15
 
-      expect(mock.get('/busy').body).to include('hx-trigger="every 15s [window.cogworkerLiveUpdate]"')
-      expect(mock.get('/queues').body).to include('hx-trigger="every 15s [window.cogworkerLiveUpdate]"')
-      expect(mock.get('/stats').body).to include('hx-trigger="every 15s [window.cogworkerLiveUpdate]"')
+      expect(mock.get('/workers').body).to include('hx-trigger="every 15s [window.cogworkerLiveUpdate]"')
+      expect(mock.get('/overview').body).to include('hx-trigger="every 15s [window.cogworkerLiveUpdate]"')
+      expect(mock.get('/schedules').body).to include('hx-trigger="every 15s [window.cogworkerLiveUpdate]"')
     ensure
       Cogworker::Web.live_update_interval = original
     end
 
     it 'includes the global live-update toggle button, gating the poll behind window.cogworkerLiveUpdate' do
-      resp = mock.get('/busy')
+      resp = mock.get('/workers')
       expect(resp.body).to include('data-cw-live-toggle')
       expect(resp.body).to include('window.cogworkerSetLiveUpdate(!window.cogworkerLiveUpdate)')
       expect(resp.body).to include('window.cogworkerLiveUpdate = readStored();')
     end
 
-    it 'returns just the fragment (no <html>/<nav> chrome) for an hx-request, not a full page' do
-      Cogworker::Heartbeat.new(Cogworker::Manager.new).send(:beat) # so the fragment has an actual table, not the empty-state message
+    it 'includes the global fixed-width/full-width toggle, wrapping page content in #cw-main' do
+      resp = mock.get('/workers')
+      expect(resp.body).to include('id="cw-main" class="cw-main"')
+      expect(resp.body).to include('data-cw-wide-toggle')
+      expect(resp.body).to include('window.cogworkerSetWideLayout(!window.cogworkerWideLayout)')
+      expect(resp.body).to include("main.classList.toggle('cw-main--wide', on)")
+    end
 
-      resp = hx_get('/busy')
+    it 'returns just the fragment (no <html>/<nav> chrome) for an hx-request, not a full page' do
+      Cogworker::Heartbeat.new(Cogworker::Manager.new).send(:beat) # so the fragment has an actual process card, not the empty-state message
+
+      resp = hx_get('/workers')
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('<html>')
       expect(resp.body).not_to include('<nav>')
-      expect(resp.body).to include('<table')
+      expect(resp.body).to include('class="card')
     end
 
     it 'an hx-post action (quiet) returns the refreshed fragment instead of redirecting' do
@@ -737,67 +1130,117 @@ RSpec.describe Cogworker::Web do
         end[1].to_i.positive?
       end
 
-      resp = hx_post('/busy/quiet', 'identity' => Cogworker.identity)
+      resp = hx_post('/workers/quiet', 'identity' => Cogworker.identity)
 
       expect(resp.status).to eq(200)
-      expect(resp.body).to include('<table')
+      expect(resp.body).to include('class="card')
       wait_for { manager.quiet? }
 
       heartbeat.stop!
     end
 
     it 'a plain (non-hx) POST to the same action still redirects, for JS-less clients' do
-      resp = mock.post('/busy/quiet', 'HTTP_SEC_FETCH_SITE' => 'same-origin', params: { 'identity' => 'nobody' })
+      resp = mock.post('/workers/quiet', 'HTTP_SEC_FETCH_SITE' => 'same-origin', params: { 'identity' => 'nobody' })
       expect(resp.status).to eq(302)
     end
 
-    it 'Retries delete via hx-post returns the updated (now-empty) fragment' do
+    it 'Jobs retrying-delete via hx-post returns the updated (now-empty) fragment and clears its attempt log' do
       stub_const('HxRetryJob', Class.new { include Cogworker::Worker })
       raw = JSON.generate('jid' => 'hx1', 'class' => 'HxRetryJob', 'args' => [], 'queue' => 'default',
                           'error_class' => 'RuntimeError', 'error_message' => 'boom')
       Cogworker.config.redis { |c| c.zadd('cogworker:retry', Time.now.to_f, raw) }
+      Cogworker::Attempts.record('hx1', attempt: 1, error: RuntimeError.new('boom'), outcome: 'retrying')
 
-      resp = hx_post('/retries/delete', 'raw' => raw)
+      resp = hx_post('/jobs/retrying/delete', 'raw' => raw)
 
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('HxRetryJob')
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(0)
+      expect(Cogworker::Attempts.for('hx1')).to eq([])
     end
 
-    it 'Retries retry_now via hx-post moves the job off cogworker:retry and onto its queue immediately' do
+    it 'Jobs retrying retry_now via hx-post moves the job off cogworker:retry and onto its queue immediately' do
       raw = JSON.generate('jid' => 'hxretry2', 'class' => 'HxRetryNowJob', 'args' => [1], 'queue' => 'default',
                           'error_class' => 'RuntimeError', 'error_message' => 'boom')
       Cogworker.config.redis { |c| c.zadd('cogworker:retry', Time.now.to_f + 60, raw) }
 
-      resp = hx_post('/retries/retry_now', 'raw' => raw)
+      resp = hx_post('/jobs/retrying/retry_now', 'raw' => raw, 'status' => 'Retrying')
 
       expect(resp.status).to eq(200)
-      expect(resp.body).not_to include('HxRetryNowJob') # gone from the Retries fragment
+      expect(resp.body).not_to include('HxRetryNowJob') # gone from the Retrying-filtered view
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(0)
       expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw])
     end
 
-    it 'Dead delete via hx-post returns the updated (now-empty) fragment' do
+    it 'Jobs retrying/reschedule moves the entry to a new score, in-place — same raw payload/attempt count' do
+      raw = JSON.generate('jid' => 'reschedjid2', 'class' => 'ReschedJob2', 'args' => [], 'queue' => 'default',
+                          'retry_count' => 2)
+      Cogworker.config.redis { |c| c.zadd('cogworker:retry', Time.now.to_f + 60, raw) }
+
+      resp = hx_post('/jobs/retrying/reschedule', 'raw' => raw, 'minutes' => '30')
+
+      expect(resp.status).to eq(200)
+      score = Cogworker.config.redis { |c| c.zscore('cogworker:retry', raw) }
+      expect(score).to be_within(2).of(Time.now.to_f + (30 * 60))
+      expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(1) # not duplicated
+    end
+
+    it 'Jobs scheduled/reschedule works the same way on cogworker:schedule' do
+      raw = JSON.generate('jid' => 'reschedjid3', 'class' => 'ReschedJob3', 'args' => [], 'queue' => 'default')
+      Cogworker.config.redis { |c| c.zadd('cogworker:schedule', Time.now.to_f + 60, raw) }
+
+      resp = hx_post('/jobs/scheduled/reschedule', 'raw' => raw, 'minutes' => '10')
+
+      expect(resp.status).to eq(200)
+      score = Cogworker.config.redis { |c| c.zscore('cogworker:schedule', raw) }
+      expect(score).to be_within(2).of(Time.now.to_f + (10 * 60))
+    end
+
+    it 'reschedule clamps an out-of-range minutes value instead of accepting garbage' do
+      raw = JSON.generate('jid' => 'reschedjid4', 'class' => 'ReschedJob4', 'args' => [], 'queue' => 'default')
+      Cogworker.config.redis { |c| c.zadd('cogworker:retry', Time.now.to_f + 60, raw) }
+
+      hx_post('/jobs/retrying/reschedule', 'raw' => raw, 'minutes' => '999999999')
+
+      score = Cogworker.config.redis { |c| c.zscore('cogworker:retry', raw) }
+      max_expected = Time.now.to_f + (Cogworker::Web::Routes::Jobs::RESCHEDULE_MAX_MINUTES * 60)
+      expect(score).to be_within(2).of(max_expected)
+    end
+
+    it 'reschedule silently no-ops if the entry was already deleted/retried by another tab — zrem losing ' \
+       "means there's nothing left to move" do
+      raw = JSON.generate('jid' => 'goneraw', 'class' => 'GoneJob', 'args' => [], 'queue' => 'default')
+      # never added to cogworker:retry — simulates it having already been removed
+
+      resp = hx_post('/jobs/retrying/reschedule', 'raw' => raw, 'minutes' => '5')
+
+      expect(resp.status).to eq(200)
+      expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(0)
+    end
+
+    it 'Jobs Dead-delete via hx-post returns the updated (now-empty) fragment and clears its attempt log' do
       raw = JSON.generate('jid' => 'hxdead1', 'class' => 'HxDeadJob', 'args' => [], 'queue' => 'default',
                           'error_class' => 'RuntimeError', 'error_message' => 'boom')
       Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, raw) }
+      Cogworker::Attempts.record('hxdead1', attempt: 1, error: RuntimeError.new('boom'), outcome: 'dead')
 
-      resp = hx_post('/dead/delete', 'raw' => raw)
+      resp = hx_post('/jobs/dead/delete', 'raw' => raw)
 
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('HxDeadJob')
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(0)
+      expect(Cogworker::Attempts.for('hxdead1')).to eq([])
     end
 
-    it 'Dead retry via hx-post moves the job off cogworker:dead and onto its queue for another attempt' do
+    it 'Jobs Dead-retry via hx-post moves the job off cogworker:dead and onto its queue for another attempt' do
       raw = JSON.generate('jid' => 'hxdead2', 'class' => 'HxDeadRetryJob', 'args' => [1], 'queue' => 'default',
                           'error_class' => 'RuntimeError', 'error_message' => 'boom')
       Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, raw) }
 
-      resp = hx_post('/dead/retry', 'raw' => raw)
+      resp = hx_post('/jobs/dead/retry', 'raw' => raw, 'status' => 'Dead')
 
       expect(resp.status).to eq(200)
-      expect(resp.body).not_to include('HxDeadRetryJob') # gone from the Dead fragment
+      expect(resp.body).not_to include('HxDeadRetryJob') # gone from the Dead-filtered view
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(0)
       expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw])
     end
@@ -806,27 +1249,30 @@ RSpec.describe Cogworker::Web do
       raw = JSON.generate('jid' => 'hxdead3', 'class' => 'HxDeadRetryOnceJob', 'args' => [], 'queue' => 'default')
       Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, raw) }
 
-      2.times { hx_post('/dead/retry', 'raw' => raw) }
+      2.times { hx_post('/jobs/dead/retry', 'raw' => raw) }
 
       expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw])
     end
 
-    it 'Dead delete all via hx-post clears every dead entry at once' do
+    it 'Jobs Dead-delete-all via hx-post clears every dead entry (and its attempt log) at once' do
       %w[one two].each do |jid|
         raw = JSON.generate('jid' => jid, 'class' => "HxDeadAll#{jid.capitalize}Job", 'args' => [],
                             'queue' => 'default')
         Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, raw) }
+        Cogworker::Attempts.record(jid, attempt: 1, error: RuntimeError.new('boom'), outcome: 'dead')
       end
 
-      resp = hx_post('/dead/delete_all', {})
+      resp = hx_post('/jobs/dead/delete_all', {})
 
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('HxDeadAllOneJob')
       expect(resp.body).not_to include('HxDeadAllTwoJob')
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(0)
+      expect(Cogworker::Attempts.for('one')).to eq([])
+      expect(Cogworker::Attempts.for('two')).to eq([])
     end
 
-    it 'Queues delete via hx-post removes a single job and returns the updated fragment' do
+    it 'Overview delete via hx-post removes a single job and returns the updated fragment' do
       raw_one = JSON.generate('jid' => 'hxq1', 'class' => 'HxQueueOneJob', 'args' => [], 'queue' => 'default')
       raw_two = JSON.generate('jid' => 'hxq2', 'class' => 'HxQueueTwoJob', 'args' => [], 'queue' => 'default')
       Cogworker.config.redis do |c|
@@ -834,7 +1280,7 @@ RSpec.describe Cogworker::Web do
         c.lpush('cogworker:queue:default', raw_two)
       end
 
-      resp = hx_post('/queues/default/delete', 'raw' => raw_one)
+      resp = hx_post('/overview/default/delete', 'raw' => raw_one)
 
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('HxQueueOneJob')
@@ -842,14 +1288,14 @@ RSpec.describe Cogworker::Web do
       expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw_two])
     end
 
-    it 'Queues delete all via hx-post clears every job on that queue at once' do
+    it 'Overview delete all via hx-post clears every job on that queue at once' do
       %w[one two].each do |jid|
         raw = JSON.generate('jid' => jid, 'class' => "HxQueueAll#{jid.capitalize}Job", 'args' => [],
                             'queue' => 'default')
         Cogworker.config.redis { |c| c.lpush('cogworker:queue:default', raw) }
       end
 
-      resp = hx_post('/queues/default/delete_all', {})
+      resp = hx_post('/overview/default/delete_all', {})
 
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('HxQueueAllOneJob')
@@ -857,15 +1303,83 @@ RSpec.describe Cogworker::Web do
       expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(0)
     end
 
-    it "Queues hides the 'delete all' button once the queue has nothing left to delete" do
+    it "Overview hides the 'delete all' button once the queue has nothing left to delete" do
       raw = JSON.generate('jid' => 'hxqlast', 'class' => 'HxQueueLastJob', 'args' => [], 'queue' => 'default')
       Cogworker.config.redis { |c| c.lpush('cogworker:queue:default', raw) }
 
-      expect(mock.get('/queues/default').body).to include('delete all')
+      expect(mock.get('/overview?layout=b&queue=default').body).to include('delete all')
 
-      resp = hx_post('/queues/default/delete_all', {})
+      resp = hx_post('/overview/default/delete_all', {})
 
       expect(resp.body).not_to include('delete all')
+    end
+
+    it 'Overview pause/resume via hx-post toggle Queue#paused? and the rendered tag/button' do
+      resp = hx_post('/overview/default/pause', 'layout' => 'b')
+      expect(resp.status).to eq(200)
+      expect(Cogworker::Queue.new('default').paused?).to be(true)
+      expect(resp.body).to include(Cogworker::Web::Layout.badge('paused', variant: :warning))
+      expect(resp.body).to include('>resume<')
+
+      resp = hx_post('/overview/default/resume', 'layout' => 'b')
+      expect(resp.status).to eq(200)
+      expect(Cogworker::Queue.new('default').paused?).to be(false)
+      expect(resp.body).not_to include(Cogworker::Web::Layout.badge('paused', variant: :warning))
+      expect(resp.body).to include('>pause<')
+    end
+
+    it 'Overview pause from layout A (the queue table) stays on layout A, not layout B, after the hx-post' do
+      resp = hx_post('/overview/default/pause', 'layout' => 'a')
+      expect(resp.status).to eq(200)
+      # Layout A's own page header ("Overview" + the A/B segmented switch),
+      # not layout B's per-queue detail pane (which has no page header of
+      # its own inside the polled fragment).
+      expect(resp.body).to include('>Overview<')
+      expect(resp.body).to include('Metrics first')
+    end
+
+    it 'a plain (non-hx) pause POST still redirects, for JS-less clients' do
+      resp = mock.post('/overview/default/pause', 'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(302)
+    end
+
+    it "Overview's queue table shows a pause button by default, and a resume button plus a paused tag " \
+       'once the queue is actually paused' do
+      stub_const('OverviewPauseJob', Class.new { include Cogworker::Worker })
+      OverviewPauseJob.perform_async
+
+      body = mock.get('/overview').body
+      expect(body).to include('>pause<')
+      expect(body).not_to include('paused')
+
+      Cogworker::Queue.new('default').pause!
+      body = mock.get('/overview').body
+      expect(body).to include('>resume<')
+      expect(body).to include('paused')
+    end
+
+    it "Overview's retry-all button is hidden with nothing retrying, and moves every matching retry " \
+       "entry for that queue back onto it — leaving a different queue's own retry entry untouched" do
+      raw_default = JSON.generate('jid' => 'retryall1', 'class' => 'RetryAllDefaultJob', 'args' => [],
+                                  'queue' => 'default', 'error_class' => 'RuntimeError', 'error_message' => 'boom')
+      raw_low = JSON.generate('jid' => 'retryall2', 'class' => 'RetryAllLowJob', 'args' => [], 'queue' => 'low',
+                              'error_class' => 'RuntimeError', 'error_message' => 'boom')
+      Cogworker.config.redis do |c|
+        c.zadd('cogworker:retry', Time.now.to_f + 60, raw_default)
+        c.zadd('cogworker:retry', Time.now.to_f + 60, raw_low)
+      end
+
+      expect(mock.get('/overview?layout=b&queue=default').body).to include('>retry all<')
+      expect(mock.get('/overview?layout=b&queue=low').body).to include('>retry all<')
+
+      resp = hx_post('/overview/default/retry_all', 'layout' => 'b')
+
+      expect(resp.status).to eq(200)
+      expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(1) # only the "low" entry remains
+      expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw_default])
+      expect(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, -1) }).to eq([raw_low])
+      # Nothing left retrying on "default" any more — the button disappears.
+      expect(resp.body).not_to include('>retry all<')
     end
   end
 

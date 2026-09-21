@@ -14,13 +14,16 @@ module Cogworker
     RETRY = 'cogworker:retry'
     DEAD = 'cogworker:dead'
     PROCESSES = 'cogworker:processes'
+    PAUSED_QUEUES = 'cogworker:paused_queues'
     STATS_PROCESSED = 'cogworker:stats:processed'
     STATS_FAILED = 'cogworker:stats:failed'
     PERIODIC_SCHEDULE = 'periodic:schedule'
+    PERIODIC_DISABLED = 'periodic:disabled'
 
     module_function
 
     def queue(name) = "#{QUEUE_PREFIX}#{name}"
+    def job_attempts(jid) = "cogworker:job_attempts:#{jid}"
     def process(identity) = "cogworker:process:#{identity}"
     def workers(identity) = "cogworker:workers:#{identity}"
     def signal(identity) = "cogworker:signal:#{identity}"
@@ -28,5 +31,6 @@ module Cogworker
     def periodic_last_slot(pjid) = "periodic:last_slot:#{pjid}"
     def periodic_lock(pjid, slot) = "periodic:lock:#{pjid}:#{slot}"
     def unique_lock(digest) = "cogworker:unique:#{digest}"
+    def throughput_bucket(hour) = "cogworker:throughput:#{hour}"
   end
 end

@@ -12,7 +12,7 @@ Gem::Specification.new do |spec|
   spec.metadata['source_code_uri'] = spec.homepage
   spec.required_ruby_version = '>= 3.1'
 
-  spec.files = Dir['lib/**/*.rb', 'lib/**/*.lua', 'lib/**/*.js', 'lib/**/*.css', 'exe/*']
+  spec.files = Dir['lib/**/*.rb', 'lib/**/*.lua', 'lib/**/*.js', 'lib/**/*.css', 'lib/**/*.woff2', 'exe/*']
   spec.bindir = 'exe'
   spec.executables = Dir['exe/*'].map { |f| File.basename(f) }
   spec.require_paths = ['lib']

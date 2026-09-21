@@ -25,6 +25,10 @@ module Cogworker
       @quiet = true
     end
 
+    def unquiet!
+      @quiet = false
+    end
+
     def quiet?
       @quiet
     end

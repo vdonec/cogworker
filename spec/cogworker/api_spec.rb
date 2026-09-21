@@ -17,6 +17,20 @@ RSpec.describe 'Introspection API' do
       expect(record&.args).to eq([1])
       expect(record&.item&.[]('class')).to eq('QJob')
     end
+
+    it 'pause!/resume! toggle paused?, independently per queue name' do
+      default_queue = described_class.new('default')
+      low_queue = described_class.new('low')
+
+      expect(default_queue.paused?).to be(false)
+
+      default_queue.pause!
+      expect(default_queue.paused?).to be(true)
+      expect(low_queue.paused?).to be(false) # pausing one queue doesn't pause another
+
+      default_queue.resume!
+      expect(default_queue.paused?).to be(false)
+    end
   end
 
   describe Cogworker::ProcessSet do
@@ -30,6 +44,25 @@ RSpec.describe 'Introspection API' do
 
       heartbeat.stop!
       expect(described_class.new.to_a).to be_empty
+    end
+
+    it "quiet!/resume! toggle a live process's Manager#quiet? via pub/sub — unlike stop!, this round-trips" do
+      manager = Cogworker::Manager.new
+      heartbeat = Cogworker::Heartbeat.new(manager)
+      heartbeat.start!
+      wait_for do
+        Cogworker.config.redis { |c| c.pubsub('numsub', "cogworker:signal:#{Cogworker.identity}") }[1].to_i.positive?
+      end
+
+      process = wait_for { described_class.new.find { |p| p.identity == Cogworker.identity } }
+
+      process.quiet!
+      wait_for { manager.quiet? }
+
+      process.resume!
+      wait_for { !manager.quiet? }
+    ensure
+      heartbeat&.stop!
     end
   end
 end

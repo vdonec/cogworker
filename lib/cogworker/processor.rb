@@ -77,9 +77,11 @@ module Cogworker
           worker.perform(*job['args'])
         end
         Cogworker.config.redis { |c| c.incr(RedisKeys::STATS_PROCESSED) }
+        Throughput.record('processed')
         Cogworker.logger.info { "done: #{job['class']} jid=#{job['jid']}" }
       rescue Exception => e # rubocop:disable Lint/RescueException
         Cogworker.config.redis { |c| c.incr(RedisKeys::STATS_FAILED) }
+        Throughput.record('failed')
         route_failure(job, e)
         Cogworker.logger.warn { "fail: #{job['class']} jid=#{job['jid']}: #{e.class}: #{e&.message}" }
       end
@@ -106,8 +108,10 @@ module Cogworker
       if new_count <= max_retries
         delay = retry_delay(new_count)
         Cogworker.config.redis { |c| c.zadd(RedisKeys::RETRY, Time.now.to_f + delay, JSON.generate(job)) }
+        Attempts.record(job['jid'], attempt: new_count, error: error, outcome: 'retrying')
       else
         Cogworker.config.redis { |c| c.zadd(RedisKeys::DEAD, Time.now.to_f, JSON.generate(job)) }
+        Attempts.record(job['jid'], attempt: new_count, error: error, outcome: 'dead')
       end
     end
 

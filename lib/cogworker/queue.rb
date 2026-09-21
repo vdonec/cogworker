@@ -43,6 +43,23 @@ module Cogworker
       Cogworker.config.redis { |c| c.del(@key) }
     end
 
+    # Paused queues are skipped by every processor's own weighted fetch
+    # (`BasicFetch#retrieve_work`, re-read fresh every fetch cycle, not
+    # cached at process start) — jobs already sitting in this queue's list
+    # are untouched and keep arriving via `Client.push`, they just stop
+    # being picked up until `resume!`.
+    def pause!
+      Cogworker.config.redis { |c| c.sadd(RedisKeys::PAUSED_QUEUES, name) }
+    end
+
+    def resume!
+      Cogworker.config.redis { |c| c.srem(RedisKeys::PAUSED_QUEUES, name) }
+    end
+
+    def paused?
+      Cogworker.config.redis { |c| c.sismember(RedisKeys::PAUSED_QUEUES, name) }
+    end
+
     def each
       page = 0
       per = 50

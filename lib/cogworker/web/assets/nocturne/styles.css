@@ -1,0 +1,582 @@
+/* Nocturne — design-system tokens and component classes. This file is the source of truth for the system's look; retune it here and see readme.md. */
+/* Self-hosted Inter (latin subset, weights 400/500/600/700 in one variable
+   woff2 — Google serves the same file for each weight, so one @font-face
+   per weight is correct, not a duplicate download) instead of the
+   upstream fonts.googleapis.com @import: this gem's Web UI ships with zero
+   external network dependency (see "Fully offline" in CLAUDE.md), same
+   policy as htmx/Tailwind/AG Grid/Chart.js. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('fonts/inter-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('fonts/inter-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('fonts/inter-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('fonts/inter-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  --color-bg: #161826;
+  --color-surface: #232532;
+  --color-text: #e9e9ed;
+  --color-accent: #9184d9; /* review round 7 (Barron): the accent moves to
+     the product's blurple — OKLCH hue 289.2, the hue of the app's own Pro
+     accent (#9a8fe0, --om-accent-pro) — at the same lightness the steel
+     accent held (L 0.660, so the documented ratios survive) and chroma
+     in the product blurple's own range (its token sits at C 0.118; the
+     accent takes 0.125, from the old steel's 0.030):
+     the accent now reads as an accent rather than another neutral. */
+  --color-accent-2: #a7a1db; /* the machine-derived stand-in follows: same
+     hue, same L 0.734, chroma at the same 2:3 proportion it held */
+  --color-divider: color-mix(in srgb, #e9e9ed 16%, transparent);
+
+  /* Tonal ramps — generated in OKLCH on one shared lightness scale, so the
+     same step of any role matches the others in visual value. */
+  --color-neutral-100: #f3f5fe;
+  --color-neutral-200: #e4e7f5;
+  --color-neutral-300: #cfd3e5;
+  --color-neutral-400: #b2b6ca;
+  --color-neutral-500: #9397ab;
+  --color-neutral-600: #75798c;
+  --color-neutral-700: #595d6c;
+  --color-neutral-800: #3f424d;
+  --color-neutral-900: #292b31;
+
+  --color-accent-100: #f5f4ff;
+  --color-accent-200: #e7e5fe;
+  --color-accent-300: #d2cefd;
+  --color-accent-400: #b5abfc;
+  --color-accent-500: #968ae0;
+  --color-accent-600: #796cbf;
+  --color-accent-700: #5d5294;
+  --color-accent-800: #423a6a;
+  --color-accent-900: #2b2741;
+
+  --color-accent-2-100: #f5f4ff;
+  --color-accent-2-200: #e7e5fe;
+  --color-accent-2-300: #d2cefd;
+  --color-accent-2-400: #b5afe8;
+  --color-accent-2-500: #9690c9;
+  --color-accent-2-600: #7972a9;
+  --color-accent-2-700: #5c5783;
+  --color-accent-2-800: #423e5d;
+  --color-accent-2-900: #2b293a;
+
+  /* Semantic (warning/danger/success) ramps — nocturne's own token set is
+     mono (neutral + one accent, see readme's Color section); the three
+     hues below were picked ad hoc in the "Relay" concept mock for
+     retrying/failed-dead/healthy status (amber/rose/mint, chosen there as
+     literal hex, not tokens) and are formalized here as full ramps so
+     usage sites reference a role, not a hardcoded hex. Built the same way
+     as the accent-2 stand-in: each ramp keeps the mock's hue, is anchored
+     at the ramp's shared step-500 lightness, and reuses the accent ramp's
+     own chroma taper (proportional to its C at each step) scaled to that
+     hue's measured chroma — so a semantic ramp carries the same "vivid,
+     tapering at the extremes" character as the brand accent, unlike the
+     low-chroma neutral ramp. --color-warning/-danger/-success (the bare,
+     unindexed role, parallel to --color-accent) keep the mock's original
+     hex exactly, so nothing that already matched the concept shifts. */
+  --color-warning: #d9b884;
+  --color-warning-100: #f9f5ef;
+  --color-warning-200: #f0e7d9;
+  --color-warning-300: #e3d2b7;
+  --color-warning-400: #d0b283;
+  --color-warning-500: #b29360;
+  --color-warning-600: #937543;
+  --color-warning-700: #725931;
+  --color-warning-800: #513f22;
+  --color-warning-900: #332a1a;
+
+  --color-danger: #d98494;
+  --color-danger-100: #fef2f4;
+  --color-danger-200: #fae1e4;
+  --color-danger-300: #f5c6cd;
+  --color-danger-400: #ed9dab;
+  --color-danger-500: #d07c8c;
+  --color-danger-600: #af5e6e;
+  --color-danger-700: #874754;
+  --color-danger-800: #61323c;
+  --color-danger-900: #3c2327;
+
+  --color-success: #7fc0a0;
+  --color-success-100: #f0f8f3;
+  --color-success-200: #dcede4;
+  --color-success-300: #bdddcc;
+  --color-success-400: #8cc7a9;
+  --color-success-500: #68a889;
+  --color-success-600: #4a896c;
+  --color-success-700: #376a52;
+  --color-success-800: #274b3a;
+  --color-success-900: #1d3027;
+
+  /* Deck section-divider ground — review round 3: saturation as presence.
+     Dividers take a saturated deep indigo (hue 277, the neutral ramp's own
+     family; C 0.094 — written when the accent held C 0.030, before the
+     round-7 blurple raised it past the ground's) with a lighter bloom and
+     a ghost tint of the same hue, while the slide grounds stay
+     desaturated. Deck-scale fills only — not interface colors. */
+  --color-section: #262a60;
+  --color-section-glow: #353b80;
+  --color-section-ghost: #4c5397;
+
+  --font-heading: "Inter", system-ui, sans-serif;
+  --font-heading-weight: 500;
+  --font-body: "Inter", system-ui, sans-serif;
+
+  --space-1: 2.8px;
+  --space-2: 5.6px;
+  --space-3: 8.4px;
+  --space-4: 11.2px;
+  --space-6: 16.8px;
+  --space-8: 22.4px;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+
+  /* Elevation — derived from the ground: soft ink-tinted shadows on a
+     light theme, a hairline edge + ambient darkness on a dark one. */
+  --shadow-sm: 0 0 0 1px #3f424d;
+  --shadow-md: 0 0 0 1px #595d6c, 0 6px 18px rgba(0,0,0,0.55);
+  --shadow-lg: 0 0 0 1px #9397ab, 0 16px 40px rgba(0,0,0,0.65);
+}
+
+/* Light variant — not part of the exported design system (nocturne's own
+   readme describes a dark-only "ground"); authored here so Cogworker's Web
+   UI can keep following the OS's `prefers-color-scheme`, same as it did
+   under the previous Tailwind theme, instead of dropping light mode.
+   Every *ramp* step keeps its shared, role-independent lightness schedule
+   (100 lightest … 900 darkest) but is reassigned to the mirror-image step
+   of its dark-theme value (light's 100 = dark's 900, light's 200 = dark's
+   800, … light's 500 stays put). This way every component rule in this
+   file that reaches for a specific step — written with a dark ground in
+   mind, e.g. "800 for a subtle tinted border" — keeps producing the
+   equivalently subtle result on a light ground too, with no component CSS
+   duplicated or forked per theme; only these token values change. The
+   four *role* tokens (bg/surface/text/divider) and the two brand-accent
+   anchors aren't ramp steps, so they're set directly below, not mirrored:
+   bg/surface stay near-white rather than literally inverting to mid-grey,
+   text goes near-black, and --color-accent/--color-accent-2 anchor at
+   what was the dark ramp's own 600 step — a darker point on the same hue,
+   needed for the ~3:1 contrast readme's Color section calls for once the
+   ground is light instead of dark (the untouched, lighter #9184d9 reads
+   fine on #161826 but washes out against a near-white surface). Nothing
+   here (never pure black/white, low chroma outside the accent, no bolded
+   headings) breaks the system's own Do/Don't rules. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-bg: #f5f6fe;
+    --color-surface: #fdfdff;
+    --color-text: #1a1a1f;
+    --color-accent: #796cbf;
+    --color-accent-2: #7972a9;
+    --color-divider: color-mix(in srgb, #1a1a1f 12%, transparent);
+
+    --color-neutral-100: #292b31;
+    --color-neutral-200: #3f424d;
+    --color-neutral-300: #595d6c;
+    --color-neutral-400: #75798c;
+    --color-neutral-500: #9397ab;
+    --color-neutral-600: #b2b6ca;
+    --color-neutral-700: #cfd3e5;
+    --color-neutral-800: #e4e7f5;
+    --color-neutral-900: #f3f5fe;
+
+    --color-accent-100: #2b2741;
+    --color-accent-200: #423a6a;
+    --color-accent-300: #5d5294;
+    --color-accent-400: #796cbf;
+    --color-accent-500: #968ae0;
+    --color-accent-600: #b5abfc;
+    --color-accent-700: #d2cefd;
+    --color-accent-800: #e7e5fe;
+    --color-accent-900: #f5f4ff;
+
+    --color-accent-2-100: #2b293a;
+    --color-accent-2-200: #423e5d;
+    --color-accent-2-300: #5c5783;
+    --color-accent-2-400: #7972a9;
+    --color-accent-2-500: #9690c9;
+    --color-accent-2-600: #b5afe8;
+    --color-accent-2-700: #d2cefd;
+    --color-accent-2-800: #e7e5fe;
+    --color-accent-2-900: #f5f4ff;
+
+    --color-warning: #937543;
+    --color-warning-100: #332a1a;
+    --color-warning-200: #513f22;
+    --color-warning-300: #725931;
+    --color-warning-400: #937543;
+    --color-warning-500: #b29360;
+    --color-warning-600: #d0b283;
+    --color-warning-700: #e3d2b7;
+    --color-warning-800: #f0e7d9;
+    --color-warning-900: #f9f5ef;
+
+    --color-danger: #af5e6e;
+    --color-danger-100: #3c2327;
+    --color-danger-200: #61323c;
+    --color-danger-300: #874754;
+    --color-danger-400: #af5e6e;
+    --color-danger-500: #d07c8c;
+    --color-danger-600: #ed9dab;
+    --color-danger-700: #f5c6cd;
+    --color-danger-800: #fae1e4;
+    --color-danger-900: #fef2f4;
+
+    --color-success: #4a896c;
+    --color-success-100: #1d3027;
+    --color-success-200: #274b3a;
+    --color-success-300: #376a52;
+    --color-success-400: #4a896c;
+    --color-success-500: #68a889;
+    --color-success-600: #8cc7a9;
+    --color-success-700: #bdddcc;
+    --color-success-800: #dcede4;
+    --color-success-900: #f0f8f3;
+
+    --shadow-sm: 0 0 0 1px #e4e7f5;
+    --shadow-md: 0 0 0 1px #cfd3e5, 0 6px 18px rgba(0,0,0,0.12);
+    --shadow-lg: 0 0 0 1px #9397ab, 0 16px 40px rgba(0,0,0,0.18);
+  }
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+}
+h1, h2, h3, h4 { font-family: var(--font-heading); font-weight: var(--font-heading-weight); }
+
+.lighten{mix-blend-mode:lighten;background-color:transparent}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Components — built with the tokens above. Plain CSS
+   on plain HTML: no JavaScript, no build step. Each class is documented in
+   readme.md and demonstrated in foundations/ and components/.
+   ══════════════════════════════════════════════════════════════════════ */
+
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; font-size: 15px; line-height: 1.55; font-weight: 400; }
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  line-height: 1.12; letter-spacing: -0.015em; margin: 0 0 var(--space-2);
+}
+h1 { font-size: 42px; }
+h2 { font-size: 32px; }
+h3 { font-size: 25px; }
+h4 { font-size: 20px; }
+h5 { font-size: 16px; }
+h6 { font-size: 13px; }
+h6 { letter-spacing: 0.08em; text-transform: uppercase; }
+p { margin: 0 0 var(--space-3); }
+a { color: var(--color-accent); text-underline-offset: 3px; }
+img { display: block; max-width: 100%; }
+figure { margin: 0; }
+figcaption {
+  font-size: 11px; margin-top: var(--space-1);
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+.text-muted { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+/* Not part of the exported system — the "Relay" concept mock defined this
+   inline in its own <style> block for JIDs/class names; formalized here so
+   every consuming page shares one definition instead of repeating it. */
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+::selection { background: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+
+/* — rules — */
+/* Rules fade to transparent at both ends instead of stopping cleanly — a
+   Nocturne signature. The ramp is 48px an end (one deck baseline unit),
+   painted from the same divider token. Freestanding rules fade; box
+   outlines, in-control separators, and short accent marks stay solid. */
+.hr {
+  height: 1px; border: 0; margin: var(--space-4) 0;
+  background: linear-gradient(to right,
+    transparent, var(--color-divider) 48px,
+    var(--color-divider) calc(100% - 48px), transparent);
+}
+
+/* — buttons — */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  cursor: pointer; text-decoration: none; white-space: nowrap;
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 14px; line-height: 1.2; color: var(--color-text); /* matches the .input's 14px —
+     the pair sits side by side in sign-up rows */
+  background: transparent; border: 1px solid transparent;
+  padding: var(--space-2) calc(var(--space-3) * 1.2);
+  border-radius: var(--radius-md);
+}
+.btn svg { display: block; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary { color: var(--color-accent); border-color: var(--color-accent); }
+.btn-primary:hover { background: color-mix(in srgb, var(--color-accent) 12%, transparent); }
+.btn-primary:active { background: color-mix(in srgb, var(--color-accent) 22%, transparent); }
+.btn-secondary { border-color: var(--color-divider); }
+.btn-secondary:hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.btn-secondary:active { background: color-mix(in srgb, var(--color-text) 14%, transparent); }
+.btn-ghost { color: var(--color-accent); padding-inline: var(--space-1); }
+.btn-ghost:hover { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
+.btn-ghost:active { background: color-mix(in srgb, var(--color-accent) 18%, transparent); }
+.btn-icon { width: 36px; height: 36px; padding: 0; }
+.btn-block { width: 100%; margin-top: var(--space-2); }
+/* Not part of the exported system (only .btn-primary/-secondary/-ghost/-icon/
+   -block are documented) — added for actions that are specifically a warning,
+   a destructive/danger action, or a positive/resume action (Cogworker's
+   Busy/Retries/Dead/Overview/Workers tabs have these), following the exact
+   same outline-only shape as .btn-primary, just anchored on the warning/
+   danger/success ramps instead of the accent. */
+.btn-warning { color: var(--color-warning); border-color: var(--color-warning); }
+.btn-warning:hover { background: color-mix(in srgb, var(--color-warning) 12%, transparent); }
+.btn-warning:active { background: color-mix(in srgb, var(--color-warning) 22%, transparent); }
+.btn-danger { color: var(--color-danger); border-color: var(--color-danger); }
+.btn-danger:hover { background: color-mix(in srgb, var(--color-danger) 12%, transparent); }
+.btn-danger:active { background: color-mix(in srgb, var(--color-danger) 22%, transparent); }
+.btn-success { color: var(--color-success); border-color: var(--color-success); }
+.btn-success:hover { background: color-mix(in srgb, var(--color-success) 12%, transparent); }
+.btn-success:active { background: color-mix(in srgb, var(--color-success) 22%, transparent); }
+
+/* — forms — */
+.field > label {
+  display: block; font-size: 12px; margin-bottom: 5px;
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+}
+.input {
+  width: 100%; min-height: 36px; padding: 6px 10px; font: inherit;
+  font-size: 14px; color: var(--color-text); caret-color: var(--color-accent);
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
+}
+.input:hover { border-color: color-mix(in srgb, var(--color-text) 45%, transparent); }
+.input:focus-visible { border-color: var(--color-accent); outline-offset: 0; }
+textarea.input { min-height: 90px; resize: vertical; }
+.radio { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 14px; }
+.radio input, .seg-opt input {
+  position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none;
+}
+.radio .dot {
+  width: 16px; height: 16px; flex: none; border-radius: 50%;
+  border: 1.5px solid var(--color-divider);
+}
+.radio:hover .dot { border-color: var(--color-accent); }
+.radio input:checked + .dot {
+  border-color: var(--color-accent); background: var(--color-accent);
+  box-shadow: inset 0 0 0 4px var(--color-bg);
+}
+.radio input:focus-visible + .dot { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+/* `align-self: flex-start` guards against a real bug: when a `.seg` ends
+   up a *direct* child of a `display: flex; flex-direction: column` ancestor
+   (e.g. History's status filter, a direct child of `<main>` — unlike every
+   other `.seg` usage, nested a level or two deeper inside its own
+   `page_header` div) the flex spec "blockifies" its `inline-flex` to plain
+   `flex`, and the ancestor's default `align-items: stretch` then stretches
+   it to the ancestor's full width — a mostly-empty, oddly wide bordered box
+   with the actual segment labels bunched at the left. `align-self` opts
+   this element back out of stretching on the cross axis regardless of
+   where it ends up, and is a no-op everywhere `.seg` isn't a flex item at
+   all (nested usages), so it's safe to set unconditionally. */
+.seg {
+  display: inline-flex; overflow: hidden; align-self: flex-start;
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
+}
+.seg-opt {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; font-size: 13px; cursor: pointer;
+}
+.seg-opt + .seg-opt { border-left: 1px solid var(--color-divider); }
+/* `.seg` clips its children to its own rounded corner via `overflow:
+   hidden` — a checked end segment's own corner is otherwise square, so its
+   `box-shadow: inset` ring gets cut off right at the parent's curve instead
+   of following it, a visible break in the ring exactly at the rounded
+   corner. Matching the end segment's own radius to the parent's (minus the
+   1px border) keeps the ring's corner following the same curve as the clip. */
+.seg-opt:first-child { border-radius: calc(var(--radius-md) - 1px) 0 0 calc(var(--radius-md) - 1px); }
+.seg-opt:last-child { border-radius: 0 calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px) 0; }
+.seg-opt:only-child { border-radius: calc(var(--radius-md) - 1px); }
+.seg-opt:has(input:checked) { color: var(--color-accent); box-shadow: inset 0 0 0 1px var(--color-accent); }
+.seg-opt:not(:has(input:checked)):hover { background: color-mix(in srgb, var(--color-text) 7%, transparent); }
+.seg-opt:has(input:focus-visible) { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+
+/* — cards — */
+.card {
+  display: flex; flex-direction: column; gap: var(--space-2);
+  padding: var(--space-3); border-radius: var(--radius-md); background: var(--color-surface);
+}
+.card-kicker { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--color-accent); }
+.card-title {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 17px; line-height: 1.2;
+}
+.card-body { margin: 0; font-size: 13px; opacity: 0.8; flex: 1; }
+.card-meta {
+  display: flex; align-items: center; gap: 6px; font-size: 11px;
+  color: color-mix(in srgb, var(--color-text) 50%, transparent);
+}
+.elev-sm { box-shadow: var(--shadow-sm); }
+.elev-md { box-shadow: var(--shadow-md); }
+.elev-lg { box-shadow: var(--shadow-lg); }
+
+/* — tags — */
+.tag {
+  display: inline-flex; align-items: center; font-size: 11px;
+  letter-spacing: 0.02em; padding: 3px 10px;
+  border-radius: calc(var(--radius-md) * 0.75);
+}
+.tag-accent { background: var(--color-accent-800); color: var(--color-accent-100); }
+.tag-accent-2 { background: var(--color-accent-2-800); color: var(--color-accent-2-100); }
+.tag-neutral { background: var(--color-neutral-800); color: var(--color-neutral-100); }
+.tag-outline { border: 1px solid var(--color-accent); color: var(--color-accent); }
+/* Same addition as .btn-warning/-danger above, mirroring .tag-accent's own
+   shape (dark-ramp-800 fill, light-ramp-100 text) for the three semantic
+   ramps instead of the brand accent. */
+.tag-warning { background: var(--color-warning-800); color: var(--color-warning-100); }
+.tag-danger { background: var(--color-danger-800); color: var(--color-danger-100); }
+.tag-success { background: var(--color-success-800); color: var(--color-success-100); }
+
+/* — navigation — */
+.nav {
+  display: flex; align-items: center; gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: none;
+}
+.nav-brand {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 18px; margin-right: auto;
+}
+.nav a { color: inherit; text-decoration: none; font-size: 14px; }
+.nav a:hover, .nav a[aria-current='page'] { color: var(--color-accent); }
+
+/* — layout — */
+/* Not part of the exported design system — the mock's own canvas has no
+   equivalent of a real app's page content ever needing to run edge to edge.
+   `.cw-main--wide` (toggled by `Layout.wide_layout_toggle_button`/
+   `wide_layout_script`) lifts the cap for anyone working with wide tables
+   (History's AG Grid, the Overview queue-first layout) on a large monitor.
+   `contain: inline-size` fixes a real bug: `body`'s own `min-width: max-
+   content` (see `Layout.wrap`'s comment) is meant to be driven purely by
+   the header — but without this, `.cw-main`'s *own* max-content
+   contribution (a wide table/card grid, capped at 1480px by the max-width
+   above) also factors into that same calculation, and since 1480px is
+   bigger than the header's own true minimum (~1090px), `body` ends up
+   floored at 1480 instead — the header (and `main` riding along with it)
+   then sit frozen at 1480px for the *entire* practical resize range
+   instead of continuously tracking the window down to their real minimum,
+   caught by hand: dragging the window narrower did nothing at all until
+   crossing below 1480px, only then jumping straight to the scrollbar.
+   `contain: inline-size` tells the browser this element's own width
+   sizing doesn't depend on (and its content-based size shouldn't leak
+   into) its container's — main still gets its width entirely normally,
+   from the flex `align-items: stretch` cross-size body ends up resolving
+   to (via the header) and its own `max-width` above; it just stops being
+   counted as a contributor to what that resolved size floors out at. */
+.cw-main { max-width: 1480px; width: 100%; margin: 0 auto; box-sizing: border-box; contain: inline-size; }
+.cw-main.cw-main--wide { max-width: none; }
+
+/* — tables — */
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th {
+  text-align: left; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  padding: var(--space-2); border-bottom: 1px solid transparent; /* keeps layout; the row paints the fading rule */
+}
+.table td {
+  padding: var(--space-2);
+  border-bottom: 1px solid transparent;
+}
+/* Row rules as row-level strips so the end-fade spans the row, not each cell. */
+.table thead tr {
+  background: linear-gradient(to right,
+    transparent, var(--color-divider) 48px,
+    var(--color-divider) calc(100% - 48px), transparent) no-repeat bottom / 100% 1px;
+}
+.table tbody tr {
+  background: linear-gradient(to right,
+    transparent, color-mix(in srgb, var(--color-text) 8%, transparent) 48px,
+    color-mix(in srgb, var(--color-text) 8%, transparent) calc(100% - 48px), transparent) no-repeat bottom / 100% 1px;
+}
+.table tbody tr:hover {
+  /* the hover tint layers over the row rule, which keeps painting */
+  background:
+    linear-gradient(color-mix(in srgb, var(--color-text) 4%, transparent),
+                    color-mix(in srgb, var(--color-text) 4%, transparent)) no-repeat 0 0 / 100% 100%,
+    linear-gradient(to right,
+      transparent, color-mix(in srgb, var(--color-text) 8%, transparent) 48px,
+      color-mix(in srgb, var(--color-text) 8%, transparent) calc(100% - 48px), transparent) no-repeat bottom / 100% 1px;
+}
+
+/* — dialog — */
+.dialog-backdrop {
+  position: fixed; inset: 0; display: grid; place-items: center;
+  padding: var(--space-4);
+  background: color-mix(in srgb, var(--color-neutral-900) 50%, transparent);
+}
+/* `color: var(--color-text)` here is as load-bearing as `border: none`
+   below: a native `<dialog>`'s UA stylesheet also sets `color: CanvasText`
+   directly on the element, and since that's a declared value (not merely
+   inherited), it wins over the light `--color-text` that would otherwise
+   flow down from `body` — without overriding it here, every descendant
+   that doesn't set its own `color` (the title, the `<pre>` backtrace body)
+   renders near-black text on `--color-surface`'s dark background, unreadable. */
+.dialog {
+  width: min(440px, 100%); display: flex; flex-direction: column; gap: var(--space-3);
+  padding: var(--space-4); border-radius: var(--radius-lg); border: none;
+  background: var(--color-surface); color: var(--color-text); box-shadow: var(--shadow-lg);
+}
+.dialog-title {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 20px;
+}
+.dialog-body { font-size: 14px; opacity: 0.85; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-2); }
+/* Not part of the exported system — the native <dialog>/showModal() a
+   consuming page reaches for (e.g. History's backtrace viewer) paints its
+   own browser-default ::backdrop, not the .dialog-backdrop div above (that
+   one's for a JS-managed overlay <div>). Same tint, so either path looks
+   like the same system. .dialog itself needs one explicit override to work
+   as a native <dialog>'s own box styling, not just "unmodified" — see the
+   `border: none` above: `<dialog>` ships a UA-default `border-style: solid`
+   that neither `.dialog`'s `border-radius` nor `box-shadow` overrides on
+   their own, so without resetting it a real browser paints its own default
+   border (often a stark, unthemed gray/silver rectangle, square-cornered
+   on top of the rounded card underneath) around every native dialog on the
+   page — a real bug, caught by hand on History's backtrace viewer. */
+dialog.dialog::backdrop {
+  background: color-mix(in srgb, var(--color-neutral-900) 50%, transparent);
+}
+/* `.dialog`'s own `display: flex` (needed for the JS-managed
+   `.dialog-backdrop` div pattern above) has the same specificity as the
+   browser's built-in `dialog:not([open]) { display: none }` — and author
+   styles win a same-specificity tie over user-agent ones, so without this,
+   `.dialog` applied straight to a native `<dialog>` element defeats its
+   own native hide-until-`showModal()` behavior and renders permanently
+   open. Element-qualifying restores it without touching `.dialog`'s
+   existing div-overlay behavior elsewhere. */
+dialog.dialog:not([open]) {
+  display: none;
+}
+

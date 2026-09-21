@@ -40,6 +40,10 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
 
     expect(Cogworker::Stats.new.processed).to eq(1)
     expect(Cogworker::Stats.new.failed).to eq(0)
+
+    series = Cogworker::Throughput.series(hours: 1)
+    expect(series.first['processed']).to eq(1)
+    expect(series.first['failed']).to eq(0)
   end
 
   it 'routes a failing job with retry: false straight to the dead set' do
@@ -52,7 +56,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
       end
     end)
 
-    BoomJob.perform_async
+    jid = BoomJob.perform_async
 
     @manager = Cogworker::Manager.new
     @manager.start!
@@ -60,6 +64,15 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     wait_for { Cogworker::Stats.new.dead_size == 1 }
     expect(Cogworker::Stats.new.retry_size).to eq(0)
     expect(Cogworker::Stats.new.failed).to eq(1)
+
+    attempts = Cogworker::Attempts.for(jid)
+    expect(attempts.size).to eq(1)
+    expect(attempts.first).to include('attempt' => 1, 'outcome' => 'dead', 'error_class' => 'RuntimeError',
+                                      'error_message' => 'kaboom')
+
+    series = Cogworker::Throughput.series(hours: 1)
+    expect(series.first['failed']).to eq(1)
+    expect(series.first['processed']).to eq(0)
   end
 
   it 'routes a failing job with retries remaining to the retry set with error info' do
@@ -82,6 +95,11 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     job = JSON.parse(raw)
     expect(job['error_class']).to eq('ArgumentError')
     expect(job['retry_count']).to eq(1)
+
+    attempts = Cogworker::Attempts.for(job['jid'])
+    expect(attempts.size).to eq(1)
+    expect(attempts.first).to include('attempt' => 1, 'outcome' => 'retrying', 'error_class' => 'ArgumentError',
+                                      'error_message' => 'nope')
   end
 
   it 'runs a job whose class was never defined through the same middleware chain as any other ' \
