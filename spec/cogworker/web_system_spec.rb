@@ -164,8 +164,10 @@ RSpec.describe 'Web UI (real browser)' do
     # also avoids a transient false-positive mid-swap, when htmx has
     # cleared the target's innerHTML but not yet inserted the fresh table.
     expect(page).to have_xpath(processed_cell, text: '1', wait: 6)
-
-    manager.stop!(timeout: 2)
+  ensure
+    # see the `ensure` comment in status_spec.rb — a `have_xpath` timeout
+    # above must not skip this and leak a live Manager into later examples.
+    manager&.stop!(timeout: 2)
   end
 
   it 'deleting a retry entry removes its row in place' do

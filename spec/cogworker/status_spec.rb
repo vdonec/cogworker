@@ -36,8 +36,15 @@ RSpec.describe 'Cogworker::Status' do
     wait_for { Cogworker::Status.status(jid) == 'working' }
     gate << :go
     wait_for { Cogworker::Status.status(jid) == 'complete' }
-
-    manager.stop!(timeout: 2)
+  ensure
+    # Not just a trailing statement: a `wait_for` above timing out (real,
+    # more likely on a loaded CI runner) would otherwise raise past it,
+    # leaking a live Manager with real Processor threads still `BRPOP`ing
+    # the default queue for the rest of the suite run — silently stealing
+    # jobs pushed by later, unrelated examples. `ensure` (a plain `do...
+    # ensure...end` block, no `begin` needed since Ruby 2.6) guarantees
+    # this runs regardless of what failed above.
+    manager&.stop!(timeout: 2)
   end
 
   it 'goes to retrying (not failed) while retries remain, then failed once exhausted' do
@@ -66,8 +73,8 @@ RSpec.describe 'Cogworker::Status' do
     end
 
     wait_for { Cogworker::Status.status(jid) == 'failed' }
-
-    manager.stop!(timeout: 2)
+  ensure
+    manager&.stop!(timeout: 2) # see the `ensure` comment in the example above
   end
 
   describe Cogworker::Status::Worker do

@@ -18,7 +18,6 @@ RSpec.describe 'Cogworker::History' do
       manager = Cogworker::Manager.new
       manager.start!
       wait_for { Cogworker::History::Storage.page('all', 1, 10).last == 1 }
-      manager.stop!(timeout: 2)
 
       entries, total = Cogworker::History::Storage.page('all', 1, 10)
       expect(total).to eq(1)
@@ -29,6 +28,13 @@ RSpec.describe 'Cogworker::History' do
       expect(entry['status']).to eq('success')
       expect(entry['finished_at']).to be >= entry['started_at']
       expect(entry).not_to have_key('backtrace')
+    ensure
+      # Not just a trailing statement: the `wait_for` above timing out
+      # (real, more likely on a loaded CI runner) would otherwise raise
+      # past it, leaking a live Manager with real Processor threads still
+      # `BRPOP`ing the default queue for the rest of the suite run —
+      # silently stealing jobs pushed by later, unrelated examples.
+      manager&.stop!(timeout: 2)
     end
 
     it 'records the error class/message/backtrace for a failing run, and still routes it to retry/dead' do
@@ -45,7 +51,6 @@ RSpec.describe 'Cogworker::History' do
       manager = Cogworker::Manager.new
       manager.start!
       wait_for { Cogworker::History::Storage.page('failed', 1, 10).last == 1 }
-      manager.stop!(timeout: 2)
 
       entries, = Cogworker::History::Storage.page('failed', 1, 10)
       entry = entries.first
@@ -57,6 +62,8 @@ RSpec.describe 'Cogworker::History' do
 
       # the History middleware re-raises — the job still ends up dead (retry: false)
       expect(Cogworker::Stats.new.dead_size).to eq(1)
+    ensure
+      manager&.stop!(timeout: 2) # see the `ensure` comment in the example above
     end
 
     it 'keeps success and failure in separate lists, both reachable via "all"' do
@@ -75,11 +82,12 @@ RSpec.describe 'Cogworker::History' do
       manager = Cogworker::Manager.new
       manager.start!
       wait_for { Cogworker::History::Storage.page('all', 1, 10).last == 2 }
-      manager.stop!(timeout: 2)
 
       expect(Cogworker::History::Storage.page('success', 1, 10).last).to eq(1)
       expect(Cogworker::History::Storage.page('failed', 1, 10).last).to eq(1)
       expect(Cogworker::History::Storage.page('all', 1, 10).last).to eq(2)
+    ensure
+      manager&.stop!(timeout: 2) # see the `ensure` comment in the example above
     end
   end
 

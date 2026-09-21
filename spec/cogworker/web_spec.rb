@@ -718,7 +718,16 @@ RSpec.describe Cogworker::Web do
       expect(body).to include(jid)
 
       gate << :go
-      manager.stop!(timeout: 5)
+    ensure
+      # Push unconditionally before stopping: if an earlier expectation/wait_for
+      # above raised, the job thread may still be blocked on `gate.pop`, and
+      # `Manager#stop!` joins that thread — without unblocking it first, `stop!`
+      # would hang forever instead of cleaning up (an extra push here is
+      # harmless if the job already consumed the first one). Also guards
+      # against the same test-isolation leak described in the `ensure` comment
+      # in `status_spec.rb`.
+      gate << :go
+      manager&.stop!(timeout: 5)
     end
 
     it "Workers' own busy count on each card always matches its in-flight jobs table (both come from the " \
