@@ -3,7 +3,11 @@
 require 'spec_helper'
 
 RSpec.describe 'Cogworker::History' do
-  before { Cogworker::History.max_entries = Cogworker::History::DEFAULT_MAX_ENTRIES }
+  before do
+    Cogworker::History.retention_days = Cogworker::History::DEFAULT_RETENTION_DAYS
+    Cogworker::History.max_entries = Cogworker::History::DEFAULT_MAX_ENTRIES
+    Cogworker::History.daily_stats_retention_days = Cogworker::History::DEFAULT_DAILY_STATS_RETENTION_DAYS
+  end
 
   describe Cogworker::History::Middleware do
     before { Cogworker.config.server_middleware { |chain| chain.add(described_class) } }
@@ -93,8 +97,14 @@ RSpec.describe 'Cogworker::History' do
 
   describe Cogworker::History::Storage do
     it 'paginates newest-first' do
+      # Real, near-`Time.now` timestamps — not `0, 1, 2, ...` — because
+      # `write_and_trim` now also trims by age (`History.retention_days`):
+      # a `finished_at` from the Unix epoch would be trimmed by that same
+      # write, before the test ever gets to page through it.
+      now = Time.now.to_f
       3.times do |i|
-        described_class.record({ 'jid' => "j#{i}", 'class' => 'X', 'args' => [] }, 'default', i, i + 1, 'success')
+        described_class.record({ 'jid' => "j#{i}", 'class' => 'X', 'args' => [] }, 'default', now + i, now + i + 1,
+                               'success')
       end
 
       page1, total = described_class.page('all', 1, 2)
@@ -107,14 +117,32 @@ RSpec.describe 'Cogworker::History' do
 
     it 'trims each list independently to History.max_entries, oldest first' do
       Cogworker::History.max_entries = 3
+      now = Time.now.to_f
       5.times do |i|
-        described_class.record({ 'jid' => "j#{i}", 'class' => 'X', 'args' => [] }, 'default', i, i + 1, 'success')
+        described_class.record({ 'jid' => "j#{i}", 'class' => 'X', 'args' => [] }, 'default', now + i, now + i + 1,
+                               'success')
       end
 
       _entries, total = described_class.page('all', 1, 10)
       expect(total).to eq(3)
       entries, = described_class.page('all', 1, 10)
       expect(entries.map { |e| e['jid'] }).to eq(%w[j4 j3 j2]) # the 2 oldest (j0, j1) were trimmed
+    end
+
+    it 'trims entries older than History.retention_days, regardless of max_entries — the primary, ' \
+       'expected trim, not just the count-based safety ceiling' do
+      Cogworker::History.retention_days = 7
+      Cogworker::History.max_entries = 1000 # far above what this example writes — isolates the age trim alone
+      old = Time.now.to_f - (10 * 86_400) # older than the 7-day window
+      recent = Time.now.to_f - 86_400 # within it
+
+      described_class.record({ 'jid' => 'stale', 'class' => 'X', 'args' => [] }, 'default', old, old, 'success')
+      described_class.record({ 'jid' => 'fresh', 'class' => 'X', 'args' => [] }, 'default', recent, recent,
+                             'success')
+
+      entries, total = described_class.page('all', 1, 10)
+      expect(total).to eq(1)
+      expect(entries.map { |e| e['jid'] }).to eq(%w[fresh])
     end
 
     describe '.daily_counts' do
@@ -142,13 +170,38 @@ RSpec.describe 'Cogworker::History' do
 
         expect(counts[old.strftime('%Y-%m-%d')]).to be_nil
       end
+
+      it "keeps counting a day's runs even once `max_entries` has trimmed those individual entries out of the " \
+         '`all`/`success`/`failed` lists — regression test for the whole reason the daily counters exist ' \
+         "separately from those lists: a busy queue used to silently make the chart's older days go blank" do
+        Cogworker::History.max_entries = 2
+        yesterday = Time.now.utc - 86_400
+
+        3.times do |i|
+          described_class.record({ 'jid' => "old#{i}", 'class' => 'X', 'args' => [] }, 'default', 0,
+                                 yesterday.to_f, 'success')
+        end
+        # Trims `all`/`success` down to the 2 most recent entries — none of
+        # which are "old0" any more.
+        entries, total = described_class.page('success', 1, 10)
+        expect(total).to eq(2)
+        expect(entries.map { |e| e['jid'] }).not_to include('old0')
+
+        counts = described_class.daily_counts(14)
+
+        expect(counts[yesterday.strftime('%Y-%m-%d')]).to eq('success' => 3, 'failed' => 0)
+      end
     end
   end
 
   describe 'Cogworker::History.configure_server_middleware' do
-    it 'adds the middleware to the server chain and applies max_entries' do
-      Cogworker::History.configure_server_middleware(Cogworker.config, max_entries: 42)
+    it 'adds the middleware to the server chain and applies retention_days, max_entries, and ' \
+       'daily_stats_retention_days' do
+      Cogworker::History.configure_server_middleware(Cogworker.config, retention_days: 14, max_entries: 42,
+                                                                       daily_stats_retention_days: 7)
+      expect(Cogworker::History.retention_days).to eq(14)
       expect(Cogworker::History.max_entries).to eq(42)
+      expect(Cogworker::History.daily_stats_retention_days).to eq(7)
       expect(Cogworker.config.server_chain.map(&:klass)).to include(Cogworker::History::Middleware)
     end
   end

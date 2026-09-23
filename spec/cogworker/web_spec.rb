@@ -308,16 +308,14 @@ RSpec.describe Cogworker::Web do
     end
 
     it 'Overview renders a per-day success/failed Runs-per-day chart, using real History entries' do
-      raw_ok = JSON.generate('jid' => 'chartok', 'class' => 'ChartOkJob', 'queue' => 'default', 'args' => [],
-                             'status' => 'success', 'started_at' => Time.now.to_f, 'finished_at' => Time.now.to_f)
-      raw_bad = JSON.generate('jid' => 'chartbad', 'class' => 'ChartBadJob', 'queue' => 'default', 'args' => [],
-                              'status' => 'failed', 'started_at' => Time.now.to_f, 'finished_at' => Time.now.to_f)
-      Cogworker.config.redis do |c|
-        c.zadd('cogworker:history:all', Time.now.to_f, raw_ok)
-        c.zadd('cogworker:history:success', Time.now.to_f, raw_ok)
-        c.zadd('cogworker:history:all', Time.now.to_f, raw_bad)
-        c.zadd('cogworker:history:failed', Time.now.to_f, raw_bad)
-      end
+      # Via `Storage.record` (not a raw `zadd`) — "Runs per day" reads its
+      # own daily counter (see `Storage.daily_counts`'s comment), which only
+      # `record` itself keeps updated, not a direct write to the
+      # `cogworker:history:*` ZSETs.
+      Cogworker::History::Storage.record({ 'jid' => 'chartok', 'class' => 'ChartOkJob', 'args' => [] }, 'default',
+                                         Time.now.to_f, Time.now.to_f, 'success')
+      Cogworker::History::Storage.record({ 'jid' => 'chartbad', 'class' => 'ChartBadJob', 'args' => [] }, 'default',
+                                         Time.now.to_f, Time.now.to_f, 'failed')
 
       body = mock.get('/overview').body
       expect(body).to include('Runs per day')
@@ -356,12 +354,8 @@ RSpec.describe Cogworker::Web do
     end
 
     it 'GET /overview/runs_data returns just the plotted numbers as JSON, honoring ?period=' do
-      raw_ok = JSON.generate('jid' => 'apiok', 'class' => 'ApiOkJob', 'queue' => 'default', 'args' => [],
-                             'status' => 'success', 'started_at' => Time.now.to_f, 'finished_at' => Time.now.to_f)
-      Cogworker.config.redis do |c|
-        c.zadd('cogworker:history:all', Time.now.to_f, raw_ok)
-        c.zadd('cogworker:history:success', Time.now.to_f, raw_ok)
-      end
+      Cogworker::History::Storage.record({ 'jid' => 'apiok', 'class' => 'ApiOkJob', 'args' => [] }, 'default',
+                                         Time.now.to_f, Time.now.to_f, 'success')
 
       resp = mock.get('/overview/runs_data?period=week')
       expect(resp.headers['content-type']).to eq('application/json')

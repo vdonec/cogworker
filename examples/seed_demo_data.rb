@@ -101,9 +101,34 @@ Cogworker.config.redis do |c|
 end
 
 # ---- History: a generous, pagination-worthy mix of past runs (also
-#      fictional classes where convenient — same reasoning as Dead above) ----
+#      fictional classes where convenient — same reasoning as Dead above).
+#      Recorded via `Cogworker::History::Storage.record` (not a raw `zadd`
+#      straight into the ZSETs, as an earlier version of this script did) so
+#      it also feeds the "Runs per day" daily counter — and, paired with the
+#      matching `Cogworker::Throughput.record` call below, the Overview
+#      "Throughput" chart — exactly the way a real `Processor` run populates
+#      both as a side effect of actually executing a job. The old `zadd`
+#      version populated the History tab just fine but left both charts
+#      silently blank, since neither reads the raw ZSETs directly. ----
 history_classes = %w[GreetingJob FlakyJob DailyReportJob SendWelcomeEmailJob ChargeCardJob SyncInventoryJob
                      GenerateReportJob]
+
+# `Storage.record`'s `error:` needs a real exception instance (it reads
+# `.class.name`/`.message`/`.backtrace` straight off it) — looks up an
+# already-loaded class by name (`RuntimeError`, ...) or, for a fictional one
+# like `Stripe::CardError` that was never actually raised anywhere in this
+# app, defines a minimal stand-in under that same constant path just so the
+# rendered class name matches what `failures` below claims.
+def fake_error_class(full_name)
+  return Object.const_get(full_name) if Object.const_defined?(full_name)
+
+  *mod_names, klass_name = full_name.split('::')
+  mod = mod_names.reduce(Object) do |m, name|
+    m.const_defined?(name, false) ? m.const_get(name) : m.const_set(name, Module.new)
+  end
+  mod.const_set(klass_name, Class.new(StandardError))
+end
+
 failures = [
   ['RuntimeError', 'simulated failure',
    ["examples/jobs/flaky_job.rb:20:in 'perform'", "lib/cogworker/processor.rb:54:in 'block in execute'"]],
@@ -112,24 +137,25 @@ failures = [
   ['Stripe::CardError', 'Your card was declined.', ["app/jobs/charge_card_job.rb:8:in 'perform'"]]
 ]
 history_count = 40
-Cogworker.config.redis do |c|
-  history_count.times do |i|
-    finished_at = Time.now.to_f - (i * 900) # spread 15 minutes apart, going back in time
-    started_at = finished_at - rand(0.01..2.5)
-    failed = (i % 4).zero? # ~25% failure rate
-    entry = {
-      'jid' => SecureRandom.hex(12), 'class' => history_classes.sample, 'queue' => 'default',
-      'args' => [{ 'seed_index' => i }], 'status' => failed ? 'failed' : 'success',
-      'started_at' => started_at, 'finished_at' => finished_at
-    }
-    if failed
-      error_class, message, backtrace = failures.sample
-      entry.merge!('error_class' => error_class, 'error_message' => message, 'backtrace' => backtrace)
-    end
-    raw = JSON.generate(entry)
-    c.zadd('cogworker:history:all', finished_at, raw)
-    c.zadd("cogworker:history:#{entry['status']}", finished_at, raw)
+history_count.times do |i|
+  finished_at = Time.now.to_f - (i * 900) # spread 15 minutes apart, going back in time — all within the last
+  # 10h, comfortably inside Throughput's own 24h window
+  started_at = finished_at - rand(0.01..2.5)
+  failed = (i % 4).zero? # ~25% failure rate
+  status = failed ? 'failed' : 'success'
+  job = { 'jid' => SecureRandom.hex(12), 'class' => history_classes.sample, 'args' => [{ 'seed_index' => i }] }
+
+  error = nil
+  if failed
+    error_class, message, backtrace = failures.sample
+    error = fake_error_class(error_class).exception(message)
+    error.set_backtrace(backtrace)
   end
+
+  Cogworker::History::Storage.record(job, 'default', started_at, finished_at, status, error: error)
+  # Throughput's own outcome vocabulary is 'processed'/'failed', not
+  # History's 'success'/'failed' — see `Cogworker::Processor#execute`.
+  Cogworker::Throughput.record(failed ? 'failed' : 'processed', at: Time.at(finished_at))
 end
 
 # ---- Stats counters (Queue/Retry/Scheduled/Dead sizes are derived live

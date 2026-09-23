@@ -80,12 +80,11 @@ RSpec.describe 'Web UI (real browser)' do
                       '.data.datasets[0].data.slice(-1)[0]'
     expect(page.evaluate_script(todays_success)).to eq(0)
 
-    raw = JSON.generate('jid' => 'chartlive', 'class' => 'ChartLiveJob', 'queue' => 'default', 'args' => [],
-                        'status' => 'success', 'started_at' => Time.now.to_f, 'finished_at' => Time.now.to_f)
-    Cogworker.config.redis do |c|
-      c.zadd('cogworker:history:all', Time.now.to_f, raw)
-      c.zadd('cogworker:history:success', Time.now.to_f, raw)
-    end
+    # Via `Storage.record` (not a raw `zadd`) — the Runs-per-day chart reads
+    # its own daily counter (see `Storage.daily_counts`'s comment), which
+    # only `record` itself keeps updated.
+    Cogworker::History::Storage.record({ 'jid' => 'chartlive', 'class' => 'ChartLiveJob', 'args' => [] }, 'default',
+                                       Time.now.to_f, Time.now.to_f, 'success')
 
     # No `visit`/reload in between — this only passes if the chart's own
     # `fetch` poll (see `Routes::Overview#runs_section`'s `refreshRuns`), not

@@ -32,5 +32,6 @@ module Cogworker
     def periodic_lock(pjid, slot) = "periodic:lock:#{pjid}:#{slot}"
     def unique_lock(digest) = "cogworker:unique:#{digest}"
     def throughput_bucket(hour) = "cogworker:throughput:#{hour}"
+    def history_daily_bucket(day) = "cogworker:history:daily:#{day}"
   end
 end
