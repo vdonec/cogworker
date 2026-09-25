@@ -33,17 +33,33 @@ module Cogworker
             end
           end
 
-          # Polled from the browser (see `grid_script`'s `refreshRows`) to
-          # keep the grid live without a full-page/htmx fragment reload,
-          # which would tear down and rebuild the AG Grid instance (and lose
-          # its sort/filter/scroll state) on every tick.
+          # The grid's Infinite Row Model datasource (`grid_script`'s
+          # `getRows`) — one block of rows per call, sorted/filtered
+          # server-side by `Web::HistoryQuery`, so the page never ships
+          # every retained entry to the browser. Also what live updates
+          # re-hit (`refreshInfiniteCache`), for just the blocks on screen.
           app.get('/history/data') do
             status = History::STATUSES.include?(params['status']) ? params['status'] : 'all'
-            jid = params['jid'].to_s
-            entries, = Cogworker::History::Storage.page(status, 1, Cogworker::History.max_entries)
-            entries = entries.select { |e| e['jid'] == jid } unless jid.empty?
-            [200, { 'content-type' => 'application/json' }, [JSON.generate(entries)]]
+            query = Cogworker::Web::HistoryQuery.new(
+              status: status, jid: params['jid'].to_s,
+              sort: Routes::History.parse_json_param(params['sort'], []),
+              filters: Routes::History.parse_json_param(params['filter'], {})
+            )
+            start = params['start'].to_i
+            rows, total = query.fetch(start, params['end'].to_i - start)
+            [200, { 'content-type' => 'application/json' }, [JSON.generate('rows' => rows, 'total' => total)]]
           end
+        end
+
+        # A malformed/missing `sort`/`filter` param just means "none" rather
+        # than a 500 — it's built by our own script, but still user input.
+        def parse_json_param(raw, fallback)
+          return fallback if raw.nil? || raw.empty?
+
+          parsed = JSON.parse(raw)
+          parsed.is_a?(fallback.class) ? parsed : fallback
+        rescue JSON::ParserError
+          fallback
         end
 
         def ag_grid_head(script_name)
@@ -55,12 +71,11 @@ module Cogworker
           HTML
         end
 
-        # Loads up to `Cogworker::History.max_entries` rows for the chosen
-        # filter in one shot and hands them to AG Grid, which does its own
-        # client-side sorting/per-column filtering/quick-search/pagination
-        # from there — retention (`max_entries`) already bounds this to a
-        # size AG Grid handles comfortably, so there's no need for the
-        # gem's own server-side paging on top of it.
+        # Renders just the grid shell — rows are fetched block by block
+        # from `GET /history/data` (AG Grid's Infinite Row Model), with
+        # sorting, per-column filtering and pagination all done server-side
+        # (`Web::HistoryQuery`), so page weight no longer grows with
+        # `History.max_entries`.
         #
         # `jid` (optional — empty string means "not filtering") narrows this
         # down to one job's own run history across every retry attempt (a
@@ -69,12 +84,10 @@ module Cogworker
         # history, which only shows its *failures*, capped to the last few —
         # see `Routes::Jobs#attempts_section`, which links here).
         def render_content(script_name, status, jid = '')
-          entries, = Cogworker::History::Storage.page(status, 1, Cogworker::History.max_entries)
-          entries = entries.select { |e| e['jid'] == jid } unless jid.empty?
           <<~HTML
             <div style="display: flex; flex-direction: column; gap: 16px;">
               #{page_header(script_name, status, jid)}
-              #{grid(entries, script_name, status, jid)}
+              #{grid(script_name, status, jid)}
             </div>
           HTML
         end
@@ -111,7 +124,7 @@ module Cogworker
           HTML
         end
 
-        def grid(entries, script_name, status, jid)
+        def grid(script_name, status, jid)
           <<~HTML
             <div id="history-grid" class="ag-theme-alpine" style="height: 70vh; width: 100%;"></div>
 
@@ -123,11 +136,11 @@ module Cogworker
               <pre id="history-backtrace-content" class="mono" style="margin: 0; font-size: 12px; line-height: 1.6; white-space: pre-wrap; max-height: 60vh; overflow-y: auto; background: var(--color-bg); border: 1px solid var(--color-divider); border-radius: var(--radius-sm); padding: var(--space-3);"></pre>
             </dialog>
 
-            #{grid_script(entries, script_name, status, jid)}
+            #{grid_script(script_name, status, jid)}
           HTML
         end
 
-        def grid_script(entries, script_name, status, jid)
+        def grid_script(script_name, status, jid)
           query = "status=#{status}"
           query += "&jid=#{CGI.escape(jid)}" unless jid.empty?
           data_url = Layout.path(script_name, "history/data?#{query}")
@@ -135,25 +148,18 @@ module Cogworker
             <script>
               (function () {
                 var dataUrl = #{Layout.json_for_script(data_url)};
-                var rowData = #{Layout.json_for_script(entries)};
-                var backtraces = {};
                 // The dialog leads with the error itself (class + message)
                 // and only then the backtrace — the grid's own Error column
                 // can be too narrow/truncated to read the full message, and
                 // clicking through to "just the backtrace" without it loses
-                // the one thing you're usually trying to look up.
-                function indexBacktraces() {
-                  backtraces = {};
-                  rowData.forEach(function (row) {
-                    if (!row.backtrace) return;
-                    var header = (row.error_class || 'Error') + ': ' + (row.error_message || '');
-                    backtraces[row.jid] = header + '\\n\\n' + row.backtrace.join('\\n');
-                  });
-                }
-                indexBacktraces();
-
-                window.cogworkerShowHistoryBacktrace = function (jid) {
-                  document.getElementById('history-backtrace-content').textContent = backtraces[jid] || '(no backtrace)';
+                // the one thing you're usually trying to look up. Takes the
+                // row itself (not a jid lookup): every retry attempt of one
+                // job shares its jid but has its own backtrace.
+                window.cogworkerShowHistoryBacktrace = function (row) {
+                  var text = row && row.backtrace
+                    ? (row.error_class || 'Error') + ': ' + (row.error_message || '') + '\\n\\n' + row.backtrace.join('\\n')
+                    : '(no backtrace)';
+                  document.getElementById('history-backtrace-content').textContent = text;
                   document.getElementById('history-backtrace-dialog').showModal();
                 };
 
@@ -167,7 +173,10 @@ module Cogworker
                 // it builds from a plain string/DOM node.
                 var cssVar = function (name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); };
 
+                // Infinite Row Model: a row whose block is still loading has
+                // no `data` yet — every getter/renderer below guards for it.
                 function statusCellRenderer(p) {
+                  if (!p.value) return '';
                   var ok = p.value === 'success';
                   var bg = cssVar(ok ? '--color-success-800' : '--color-danger-800');
                   var fg = cssVar(ok ? '--color-success-100' : '--color-danger-100');
@@ -185,18 +194,19 @@ module Cogworker
                 }
 
                 function errorValueGetter(p) {
+                  if (!p.data) return '';
                   return p.data.error_class ? (p.data.error_class + ': ' + p.data.error_message) : '';
                 }
 
                 function errorCellRenderer(p) {
-                  if (!p.data.backtrace) return p.value || '';
+                  if (!p.data || !p.data.backtrace) return p.value || '';
                   var span = document.createElement('span');
                   span.textContent = p.value;
                   span.style.color = cssVar('--color-danger-300');
                   span.style.textDecoration = 'underline';
                   span.style.cursor = 'pointer';
                   span.title = 'Click to view backtrace';
-                  span.addEventListener('click', function () { window.cogworkerShowHistoryBacktrace(p.data.jid); });
+                  span.addEventListener('click', function () { window.cogworkerShowHistoryBacktrace(p.data); });
                   return span;
                 }
 
@@ -218,33 +228,73 @@ module Cogworker
                   return parts.join(' ');
                 }
 
+                // Sorting/filtering run server-side (`Web::HistoryQuery`,
+                // keyed by each column's `colId`), so every `colId` here
+                // must match one of its `COLUMNS` — and compute the same
+                // value there as `valueGetter`/`valueFormatter` show here.
+                // Status has no column filter: the All/Success/Failed
+                // switch above already picks which ZSET is read at all.
+                var textFilter = { filter: 'agTextColumnFilter', filterParams: { buttons: ['reset'], debounceMs: 400 } };
                 var columnDefs = [
-                  { field: 'finished_at', headerName: 'Finished', sort: 'desc', minWidth: 170,
-                    valueFormatter: function (p) { return window.cogworkerFormatTime(new Date(p.value * 1000)); } },
-                  { field: 'class', headerName: 'Class' },
-                  { field: 'queue', headerName: 'Queue' },
-                  { field: 'jid', headerName: 'JID', minWidth: 160 },
-                  { field: 'args', headerName: 'Args', minWidth: 200,
-                    valueFormatter: function (p) { return JSON.stringify(p.value); } },
-                  { field: 'status', headerName: 'Status', cellRenderer: statusCellRenderer, maxWidth: 120 },
-                  { headerName: 'Duration', maxWidth: 160,
-                    // `valueGetter` stays a plain millisecond Integer — AG
-                    // Grid sorts/filters on that raw value, `valueFormatter`
-                    // only changes what's *displayed*, so numeric sort order
-                    // ("23ms" before "1m 5s") stays correct regardless of
-                    // formatting.
-                    valueGetter: function (p) { return Math.round((p.data.finished_at - p.data.started_at) * 1000); },
-                    valueFormatter: function (p) { return formatDuration(p.value); } },
-                  { headerName: 'Error', minWidth: 260, valueGetter: errorValueGetter, cellRenderer: errorCellRenderer }
+                  { colId: 'finished_at', field: 'finished_at', headerName: 'Finished', sort: 'desc', minWidth: 170, filter: false,
+                    valueFormatter: function (p) { return p.value == null ? '' : window.cogworkerFormatTime(new Date(p.value * 1000)); } },
+                  Object.assign({ colId: 'class', field: 'class', headerName: 'Class' }, textFilter),
+                  Object.assign({ colId: 'queue', field: 'queue', headerName: 'Queue' }, textFilter),
+                  Object.assign({ colId: 'jid', field: 'jid', headerName: 'JID', minWidth: 160 }, textFilter),
+                  Object.assign({ colId: 'args', field: 'args', headerName: 'Args', minWidth: 200,
+                    valueFormatter: function (p) { return p.data ? JSON.stringify(p.value) : ''; } }, textFilter),
+                  { colId: 'status', field: 'status', headerName: 'Status', cellRenderer: statusCellRenderer, maxWidth: 120, filter: false },
+                  { colId: 'duration', headerName: 'Duration', maxWidth: 160,
+                    filter: 'agNumberColumnFilter', filterParams: { buttons: ['reset'], debounceMs: 400 },
+                    // `valueGetter` stays a plain millisecond Integer (the
+                    // same unit the number filter compares against server-
+                    // side), `valueFormatter` only changes what's displayed.
+                    valueGetter: function (p) { return p.data ? Math.round((p.data.finished_at - p.data.started_at) * 1000) : null; },
+                    valueFormatter: function (p) { return p.value == null ? '' : formatDuration(p.value); } },
+                  Object.assign({ colId: 'error', headerName: 'Error', minWidth: 260, valueGetter: errorValueGetter,
+                    cellRenderer: errorCellRenderer }, textFilter)
                 ];
+
+                function blockUrl(params) {
+                  return dataUrl +
+                    '&start=' + params.startRow + '&end=' + params.endRow +
+                    '&sort=' + encodeURIComponent(JSON.stringify(params.sortModel || [])) +
+                    '&filter=' + encodeURIComponent(JSON.stringify(params.filterModel || {}));
+                }
+
+                var datasource = {
+                  getRows: function (params) {
+                    fetch(blockUrl(params), { headers: { 'Accept': 'application/json' } })
+                      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+                      .then(function (data) { params.successCallback(data.rows, data.total); })
+                      .catch(function () { params.failCallback(); });
+                  }
+                };
 
                 var gridApi = agGrid.createGrid(document.getElementById('history-grid'), {
                   columnDefs: columnDefs,
-                  rowData: rowData,
-                  defaultColDef: { sortable: true, filter: true, resizable: true, flex: 1 },
+                  rowModelType: 'infinite',
+                  datasource: datasource,
+                  // One block == one page, and only that one block cached:
+                  // `refreshInfiniteCache()` (the live poll below) re-fetches
+                  // *every* cached block, so a bigger cache meant one extra
+                  // request per page visited on every tick. Paging back to an
+                  // earlier page costs a fresh request instead — fine, and
+                  // it's fresher anyway.
+                  cacheBlockSize: #{Cogworker::Web.history_per_page},
+                  maxBlocksInCache: 1,
+                  defaultColDef: { sortable: true, resizable: true, flex: 1 },
                   pagination: true,
                   paginationPageSize: #{Cogworker::Web.history_per_page},
-                  paginationPageSizeSelector: [10, 25, 50, 100]
+                  paginationPageSizeSelector: [10, 25, 50, 100],
+                  // Keeps block size == page size when the viewer picks a
+                  // different page size — otherwise one page would span
+                  // several blocks, more than the 1-block cache holds.
+                  onPaginationChanged: function (e) {
+                    if (!e.newPageSize) return;
+                    var size = e.api.paginationGetPageSize();
+                    if (e.api.getGridOption('cacheBlockSize') !== size) e.api.setGridOption('cacheBlockSize', size);
+                  }
                 });
 
                 if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
@@ -253,19 +303,12 @@ module Cogworker
 
                 // AG Grid isn't htmx-swapped (unlike Workers/Stats/Overview), so
                 // it needs its own poll — gated by the same global toggle —
-                // that replaces just `rowData` in place rather than
-                // reloading the fragment and tearing the grid instance down.
+                // that re-fetches just the cached blocks in place (current
+                // sort/filter/page kept) rather than reloading the fragment
+                // and tearing the grid instance down.
                 function refreshRows() {
                   if (!window.cogworkerLiveUpdate) return;
-                  fetch(dataUrl, { headers: { 'Accept': 'application/json' } })
-                    .then(function (r) { return r.ok ? r.json() : null; })
-                    .then(function (data) {
-                      if (!data) return;
-                      rowData = data;
-                      indexBacktraces();
-                      gridApi.setGridOption('rowData', rowData);
-                    })
-                    .catch(function () {});
+                  gridApi.refreshInfiniteCache();
                 }
                 setInterval(refreshRows, #{Cogworker::Web.live_update_interval * 1000});
               })();

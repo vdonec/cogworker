@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'cgi'
 require 'rack/mock'
 require 'rack/lint'
 
@@ -169,7 +170,11 @@ RSpec.describe Cogworker::Web do
       end
     end
 
-    it 'renders the AG Grid container/assets and embeds full args + backtrace as row data for the JS grid to render' do
+    def data(query = '')
+      JSON.parse(mock.get("/history/data#{query}").body)
+    end
+
+    it 'renders the AG Grid shell (Infinite Row Model) without embedding any row data in the page itself' do
       seed_entry('success', jid: 'ok1', args: [1, 'two'])
       seed_entry('failed', jid: 'bad1', error_class: 'RuntimeError', error_message: 'kaboom')
 
@@ -177,45 +182,21 @@ RSpec.describe Cogworker::Web do
       expect(body).to include('ag-grid-community')
       expect(body).to include('id="history-grid"')
       expect(body).to include('id="history-backtrace-dialog"')
-      expect(body).to include('"jid":"ok1"')
-      expect(body).to include('"args":[1,"two"]')
-      expect(body).to include('"jid":"bad1"')
-      expect(body).to include('kaboom')
-      expect(body).to include('"backtrace":["line1","line2"]')
+      expect(body).to include("rowModelType: 'infinite'")
+      expect(body).not_to include('"jid":"ok1"') # rows come from /history/data, block by block
+      expect(body).not_to include('kaboom')
     end
 
-    it 'escapes a </script> sequence hiding in job data so it cannot break out of the inline script tag' do
-      seed_entry('success', jid: 'ok1', args: ['</script><script>window.pwned = true</script>'])
-
-      body = mock.get('/history').body
-      expect(body).not_to include('</script><script>window.pwned')
-      expect(body).to include('<\\/script>')
-    end
-
-    it 'filters by status via ?status=, still server-side (a smaller row-data payload per filter)' do
-      seed_entry('success', jid: 'ok1')
-      seed_entry('failed', jid: 'bad1')
-
-      success_body = mock.get('/history?status=success').body
-      expect(success_body).to include('"jid":"ok1"')
-      expect(success_body).not_to include('"jid":"bad1"')
-
-      failed_body = mock.get('/history?status=failed').body
-      expect(failed_body).to include('"jid":"bad1"')
-      expect(failed_body).not_to include('"jid":"ok1"')
-    end
-
-    it 'sends every retained entry to the grid (client-side pagination), and configures the page size from Web.history_per_page' do
+    it 'configures the page size (and the matching fetch block size) from Web.history_per_page' do
       Cogworker::Web.history_per_page = 2
-      seed_entry('success', jid: 'newest', finished_at: 20.0)
-      seed_entry('success', jid: 'oldest', finished_at: 10.0)
-
       body = mock.get('/history').body
-      expect(body).to include('"jid":"newest"')
-      expect(body).to include('"jid":"oldest"') # not server-truncated — AG Grid paginates client-side
       expect(body).to include('paginationPageSize: 2')
+      expect(body).to include('cacheBlockSize: 2')
+      # A 1-block cache: the live poll's refreshInfiniteCache() re-fetches
+      # every cached block, so anything bigger means one extra request per
+      # page visited, on every tick.
+      expect(body).to include('maxBlocksInCache: 1')
     end
-
     it 'embeds a data URL the grid polls for live updates, gated by the same live-update toggle' do
       body = mock.get('/history').body
       expect(body).to include('var dataUrl = "\\/history\\/data?status=all"') # '/' escaped per Layout.json_for_script
@@ -240,18 +221,89 @@ RSpec.describe Cogworker::Web do
       expect(body.index('<h2 style="margin: 0;">History</h2>')).to be < body.index('class="seg"')
     end
 
-    describe 'GET /history/data (JSON, polled by the grid for live updates)' do
-      it 'returns the full entry list as JSON, honoring the status filter, without the HTML chrome' do
-        seed_entry('success', jid: 'ok1')
-        seed_entry('failed', jid: 'bad1', error_class: 'RuntimeError', error_message: 'kaboom')
+    describe 'GET /history/data (the grid\'s server-side datasource)' do
+      it 'returns one block of rows plus the total, newest first, with full args + backtrace' do
+        seed_entry('success', jid: 'ok1', args: [1, 'two'], finished_at: 3.0)
+        seed_entry('failed', jid: 'bad1', error_class: 'RuntimeError', error_message: 'kaboom', finished_at: 2.0)
 
-        resp = mock.get('/history/data')
+        resp = mock.get('/history/data?start=0&end=50')
         expect(resp.headers['content-type']).to eq('application/json')
         parsed = JSON.parse(resp.body)
-        expect(parsed.map { |e| e['jid'] }).to contain_exactly('ok1', 'bad1')
+        expect(parsed['total']).to eq(2)
+        expect(parsed['rows'].map { |e| e['jid'] }).to eq(%w[ok1 bad1])
+        expect(parsed['rows'][0]['args']).to eq([1, 'two'])
+        expect(parsed['rows'][1]['backtrace']).to eq(%w[line1 line2])
+      end
 
-        failed_only = JSON.parse(mock.get('/history/data?status=failed').body)
-        expect(failed_only.map { |e| e['jid'] }).to eq(['bad1'])
+      it 'pages server-side: only the requested start/end slice is returned, total stays the full count' do
+        5.times { |i| seed_entry('success', jid: "j#{i}", finished_at: 10.0 + i) }
+
+        page2 = data('?start=2&end=4')
+        expect(page2['total']).to eq(5)
+        expect(page2['rows'].map { |e| e['jid'] }).to eq(%w[j2 j1])
+      end
+
+      it 'honors the status filter (a different ZSET), with its own total' do
+        seed_entry('success', jid: 'ok1')
+        seed_entry('failed', jid: 'bad1')
+
+        failed_only = data('?status=failed&start=0&end=50')
+        expect(failed_only['rows'].map { |e| e['jid'] }).to eq(['bad1'])
+        expect(failed_only['total']).to eq(1)
+      end
+
+      it "sorts server-side by the grid's sortModel, including computed columns like Duration" do
+        seed_entry('success', jid: 'slow', finished_at: 9.0)  # started_at 1.0 → 8000ms
+        seed_entry('success', jid: 'fast', finished_at: 1.5)  # 500ms
+        seed_entry('success', jid: 'mid', finished_at: 3.0)   # 2000ms
+
+        asc = data("?start=0&end=50&sort=#{CGI.escape('[{"colId":"duration","sort":"asc"}]')}")
+        expect(asc['rows'].map { |e| e['jid'] }).to eq(%w[fast mid slow])
+
+        oldest_first = data("?start=0&end=50&sort=#{CGI.escape('[{"colId":"finished_at","sort":"asc"}]')}")
+        expect(oldest_first['rows'].map { |e| e['jid'] }).to eq(%w[fast mid slow])
+      end
+
+      it "filters server-side by the grid's filterModel, total reflecting the filtered count" do
+        seed_entry('success', jid: 'a1', klass: 'MailerJob', finished_at: 3.0)
+        seed_entry('failed', jid: 'a2', klass: 'ReportJob', finished_at: 2.0,
+                             error_class: 'Timeout::Error', error_message: 'too slow')
+        seed_entry('success', jid: 'a3', klass: 'mailer_cleanup', finished_at: 1.5)
+
+        by_class = { 'class' => { 'filterType' => 'text', 'type' => 'contains', 'filter' => 'MAILER' } }
+        resp = data("?start=0&end=1&filter=#{CGI.escape(JSON.generate(by_class))}")
+        expect(resp['total']).to eq(2) # case-insensitive, like AG Grid's own text filter
+        expect(resp['rows'].map { |e| e['jid'] }).to eq(['a1'])
+
+        by_error = { 'error' => { 'filterType' => 'text', 'type' => 'startsWith', 'filter' => 'timeout::' } }
+        expect(data("?start=0&end=50&filter=#{CGI.escape(JSON.generate(by_error))}")['rows'].map { |e| e['jid'] })
+          .to eq(['a2'])
+
+        slow = { 'duration' => { 'filterType' => 'number', 'type' => 'greaterThan', 'filter' => 600 } }
+        expect(data("?start=0&end=50&filter=#{CGI.escape(JSON.generate(slow))}")['rows'].map { |e| e['jid'] })
+          .to contain_exactly('a1', 'a2')
+
+        either = { 'class' => { 'filterType' => 'text', 'operator' => 'OR', 'conditions' => [
+          { 'filterType' => 'text', 'type' => 'equals', 'filter' => 'reportjob' },
+          { 'filterType' => 'text', 'type' => 'endsWith', 'filter' => 'cleanup' }
+        ] } }
+        expect(data("?start=0&end=50&filter=#{CGI.escape(JSON.generate(either))}")['rows'].map { |e| e['jid'] })
+          .to eq(%w[a2 a3])
+      end
+
+      it 'treats a malformed sort/filter param as none rather than erroring' do
+        seed_entry('success', jid: 'ok1')
+
+        resp = mock.get('/history/data?start=0&end=50&sort=not-json&filter=%5B1%5D')
+        expect(resp.status).to eq(200)
+        expect(JSON.parse(resp.body)['rows'].map { |e| e['jid'] }).to eq(['ok1'])
+      end
+
+      it 'caps a single block at HistoryQuery::MAX_LIMIT rows, whatever end= asks for' do
+        stub_const('Cogworker::Web::HistoryQuery::MAX_LIMIT', 2)
+        3.times { |i| seed_entry('success', jid: "c#{i}", finished_at: 10.0 + i) }
+
+        expect(data('?start=0&end=100000')['rows'].size).to eq(2)
       end
     end
   end
@@ -564,15 +616,15 @@ RSpec.describe Cogworker::Web do
       end
 
       body = mock.get('/history?jid=trackedjid').body
-      expect(body).to include('TrackedJob')
-      expect(body).not_to include('OtherJob')
       expect(body).to include('Filtered to job')
+      expect(body).to include('var dataUrl = "\\/history\\/data?status=all&jid=trackedjid"')
       expect(body).to include('trackedjid')
       expect(body).to include('href="/history?status=all"') # clears the filter, keeps the status
 
-      resp = mock.get('/history/data?jid=trackedjid')
+      resp = mock.get('/history/data?jid=trackedjid&start=0&end=50')
       parsed = JSON.parse(resp.body)
-      expect(parsed.map { |e| e['jid'] }).to eq(['trackedjid'])
+      expect(parsed['rows'].map { |e| e['jid'] }).to eq(['trackedjid'])
+      expect(parsed['total']).to eq(1)
     end
 
     it 'generates nav links and form actions prefixed with the actual mount point, not root-absolute' do

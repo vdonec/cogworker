@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    cogworker (0.2.1)
+    cogworker (0.2.2)
       connection_pool (~> 2.4)
       fugit (~> 1.9)
       logger (~> 1.6)

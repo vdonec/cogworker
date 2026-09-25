@@ -96,7 +96,8 @@ bundle exec ruby ./examples/stress_test.rb -h              # every option, with 
 ```
 
 The **History** tab lists every run (success and failure) in an AG Grid
-table (sortable/filterable columns, client-side pagination), filterable by
+table (sortable/filterable columns and pagination, all server-side — the
+grid fetches one page at a time from `/history/data`), filterable by
 status via the All/Success/Failed links above it, with the job's full args
 and — for failures — a click-to-open backtrace dialog. Retention depth is
 set in `init.rb`

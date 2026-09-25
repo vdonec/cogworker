@@ -432,6 +432,31 @@ RSpec.describe 'Web UI (real browser)' do
     page.current_window.resize_to(1200, 800)
   end
 
+  it "History tab: pages server-side — the next page's rows are fetched on demand, not shipped up front" do
+    original_per_page = Cogworker::Web.history_per_page
+    Cogworker::Web.history_per_page = 2
+    Cogworker.config.redis do |c|
+      %w[PageOneA PageOneB PageTwoJob].each_with_index do |klass, i|
+        raw = JSON.generate('jid' => "pg#{i}", 'class' => klass, 'queue' => 'default', 'args' => [],
+                            'status' => 'success', 'started_at' => 1.0, 'finished_at' => 30.0 - i)
+        c.zadd('cogworker:history:all', 30.0 - i, raw)
+        c.zadd('cogworker:history:success', 30.0 - i, raw)
+      end
+    end
+
+    visit '/history'
+    expect(page).to have_content('PageOneA')
+    expect(page).to have_content('PageOneB')
+    expect(page).to have_no_content('PageTwoJob')
+    expect(page.html).not_to include('PageTwoJob') # not merely hidden client-side — never sent
+
+    find('.ag-paging-button[aria-label="Next Page"]').click
+    expect(page).to have_content('PageTwoJob')
+    expect(page).to have_no_content('PageOneA')
+  ensure
+    Cogworker::Web.history_per_page = original_per_page
+  end
+
   it 'History tab: live-refreshes newly recorded runs into the grid in place, and stops once live-update is switched off' do
     raw_first = JSON.generate('jid' => 'sysfirst', 'class' => 'SysFirstJob', 'queue' => 'default', 'args' => [],
                               'status' => 'success', 'started_at' => 1.0, 'finished_at' => 2.0)
