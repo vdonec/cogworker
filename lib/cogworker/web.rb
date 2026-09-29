@@ -20,7 +20,7 @@ module Cogworker
     # Every built-in tab lives under here; touching each constant once
     # forces Zeitwerk to load that file (and run its
     # `Cogworker::Web.register(...)` bottom-of-file side effect) — nothing
-    # else ever references `Routes::Queues` etc. by name, so without this
+    # else ever references `Routes::Overview` etc. by name, so without this
     # they would simply never load.
     BUILT_IN_ROUTE_NAMES = %i[Overview Jobs Schedules Workers History SaveSession].freeze
     DEFAULT_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -132,10 +132,11 @@ module Cogworker
       end
 
       # How often (in seconds) every auto-refreshing tab polls while the
-      # global live-update toggle is on — both the htmx-polled Busy/Stats/
-      # Queues tabs (`Layout.poll_div`'s `hx-trigger="every Ns [...]"`) and
-      # History's own AG Grid `refreshRows()` JS poll share this one value,
-      # so there's a single knob rather than one per tab. Set this from your
+      # global live-update toggle is on — the htmx-polled Overview/Jobs/
+      # Schedules/Workers tabs (`Layout.poll_div`'s `hx-trigger="every Ns
+      # [...]"`), History's AG Grid poll and Overview's Chart.js polls all
+      # share this one value, so there's a single knob rather than one per
+      # tab. Set this from your
       # own init file/config.ru, e.g. `Cogworker::Web.live_update_interval = 10`.
       def live_update_interval
         @live_update_interval ||= DEFAULT_LIVE_UPDATE_INTERVAL
@@ -237,10 +238,10 @@ module Cogworker
         builder.use(Rack::Session::Cookie, secret: session_secret, key: 'cogworker.session')
         # No `cache_control:` (no `immutable`/long `max-age`): these files
         # are plain, unfingerprinted paths that *do* change — every time
-        # this gem's Tailwind bundle gets rebuilt, or on any gem upgrade —
+        # a vendored stylesheet/script gets edited, or on any gem upgrade —
         # and `immutable` previously told browsers to keep serving a stale
         # cached copy under the old URL for up to a year with no
-        # revalidation at all (caught by hand: a real edit to tailwind.css
+        # revalidation at all (caught by hand: a real edit to a vendored stylesheet
         # didn't show up in an already-open tab until a hard reload).
         # `Rack::Static`/`Rack::Files` already sends `Last-Modified` and
         # honors conditional GETs by default, which is all that's needed

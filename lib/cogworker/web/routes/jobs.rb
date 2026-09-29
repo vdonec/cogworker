@@ -14,9 +14,9 @@ module Cogworker
       # retry timeline, last error, actions) in place of `Routes::Dead`'s
       # flat rows. (*`Routes::Queues`' own queue-level browsing survives
       # separately, as `Routes::Overview` layout B — this tab is the
-      # cross-queue, cross-status view; the two overlap a little on purpose,
-      # the same way a real Sidekiq-style admin wants both "what's in this
-      # queue" and "find this one job wherever it is".)
+      # cross-queue, cross-status view; the two overlap a little on purpose:
+      # an operator wants both "what's in this queue" and "find this one job
+      # wherever it is".)
       #
       # `?status=`/`?q=`/`?selected=` are plain query params, read fresh on
       # every request and carried through the self-poll and every action's
@@ -67,7 +67,7 @@ module Cogworker
             Jobs.respond(self, params)
           end
 
-          # Same "graduate back onto its queue" move `Routes::Dead#retry`/
+          # Same "graduate back onto its queue" move `/jobs/dead/retry` below/
           # `Cogworker::Scheduled#graduate` make — `zrem` winning (not
           # losing) gates it so two tabs retrying the same entry at once
           # can't both requeue it; the `redis` gem's `#zrem` returns a

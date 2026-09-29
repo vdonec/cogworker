@@ -33,8 +33,8 @@ module Cogworker
     end
 
     # Removes every occurrence of this exact raw job entry (matched by full
-    # JSON string, same "raw" identity `Routes::Dead`/`Routes::Retries`
-    # already key their own delete/retry actions off).
+    # JSON string, same "raw" identity `Routes::Jobs`' dead/retrying
+    # actions already key their own delete/retry off).
     def delete(raw)
       Cogworker.config.redis { |c| c.lrem(@key, 0, raw) }
     end

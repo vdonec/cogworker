@@ -47,16 +47,22 @@ bundle exec rackup ./examples/config.ru -p 9394
 COGWORKER_RELOAD=true bundle exec rackup ./examples/config.ru -p 9394
 ```
 
-The Workers/Overview tabs auto-refresh (htmx polling), and History's own
-AG Grid live-refreshes in place, every `Cogworker::Web.live_update_interval`
-seconds (default 3; set here in `config.ru`) — a single "Live" toggle in the
-header (persisted in your browser) pauses/resumes all of them together. The
-quiet/stop/delete/retry-now buttons update the page in place instead of
-reloading — but every one of them still works with JS disabled too (falls
-back to a normal form POST + redirect). The **Dead** tab's `retry` button
+Overview/Jobs/Schedules/Workers auto-refresh (htmx polling), and
+History's AG Grid and Overview's charts live-refresh in place, every
+`Cogworker::Web.live_update_interval` seconds (default 3; set to 5 here in
+`config.ru`) — a single "Live" toggle in the header (persisted in your
+browser) pauses/resumes all of them together. The header also has
+cluster-wide "Pause intake"/"Resume intake" buttons (quiet/resume every
+worker process at once) and a fixed-/full-width layout toggle.
+
+The action buttons (quiet/resume/stop, delete, retry now, reschedule, run
+now) update the page in place instead of reloading — but every one of them
+still works with JS disabled too (falls back to a normal form POST +
+redirect). On the **Jobs** tab, filtered to Dead, a job's `retry` button
 does the same "put it back on its queue for one more attempt" move as
-Retries' `retry now` — a job only ends up dead after already exhausting its
-retries, so this is a manual, one-off exception to that.
+`retry now` does for a Retrying one — a job only ends up dead after
+already exhausting its retries, so this is a manual, one-off exception to
+that.
 
 Signals on the worker process(es): `TSTP` = quiet (stop fetching new jobs),
 `TERM`/`INT` = graceful stop. On the swarm parent specifically, `USR2`
@@ -69,9 +75,12 @@ Check a job's status from any Ruby console that requires `./init.rb`:
 Cogworker::Status.status(jid)  # "queued" / "working" / "retrying" / "complete" / "failed"
 ```
 
-The **Periodic** tab is read-only: it lists every `config.periodic { |mgr|
+The **Schedules** tab lists every `config.periodic { |mgr|
 mgr.register(...) }` entry (cron, class, args, unique mode) along with its
-computed next run and its last actual run time — sourced from Redis
+computed next run and its last actual run time, plus "Run now" (push it as
+a one-off job right away) and "Disable"/"Enable" (skip its cron ticks
+until re-enabled). New schedules can't be added from the UI —
+`config.periodic` in `init.rb` is the source of truth. It's sourced from Redis
 (`periodic:schedule`/`periodic:last_slot:<pjid>`), which only gets written
 once a real worker process's `Periodic::Ticker` has booted at least once;
 running only the Web UI shows an empty state, same as Workers with no worker
@@ -99,7 +108,9 @@ The **History** tab lists every run (success and failure) in an AG Grid
 table (sortable/filterable columns and pagination, all server-side — the
 grid fetches one page at a time from `/history/data`), filterable by
 status via the All/Success/Failed links above it, with the job's full args
-and — for failures — a click-to-open backtrace dialog. Retention depth is
-set in `init.rb`
-(`Cogworker::History.configure_server_middleware(config, max_entries: 500)`);
-page size is `Cogworker::Web.history_per_page` (default 25).
+and — for failures — a click-to-open backtrace dialog. Retention is set in
+`init.rb` via `Cogworker::History.configure_server_middleware(config, ...)`:
+`retention_days:` (default 30) is the primary, age-based trim and
+`max_entries:` (default 50,000; this example sets 500) is a count-based
+safety ceiling; page size is `Cogworker::Web.history_per_page` (default
+25).

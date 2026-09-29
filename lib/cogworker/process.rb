@@ -6,8 +6,8 @@ module Cogworker
   # that's this same process — e.g. WorkerKiller finding itself via
   # ProcessSet — or a genuinely remote one) is subscribed to it and reacts.
   # `#quiet!`/`#stop!` mirror a real `kill -TSTP`/`TERM`; `#resume!` has no
-  # OS-signal equivalent (there's no `SIGCONT`-style un-quiet in real
-  # Sidekiq-alike tooling) — it's Cogworker-specific, made possible by
+  # OS-signal equivalent (there's no `SIGCONT`-style un-quiet signal) —
+  # it's Cogworker-specific, made possible by
   # `Manager#quiet` being a plain in-memory flag rather than a one-way state
   # transition like `stopping?`.
   #

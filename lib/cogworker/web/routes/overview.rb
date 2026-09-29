@@ -125,8 +125,8 @@ module Cogworker
           end
 
           # `raw` is the exact JSON string the job entry was pushed with —
-          # same "raw" identity `Routes::Dead`/`Routes::Retries` already key
-          # their own per-row delete off — so `Queue#delete` can `LREM` it
+          # same "raw" identity `Routes::Jobs`' dead/retrying actions already
+          # key their own per-row delete off — so `Queue#delete` can `LREM` it
           # back out of the list.
           app.post('/overview/:name/delete') do
             name = url_params('name')
@@ -447,8 +447,8 @@ module Cogworker
         # `processed`/`failed`. Shared between the initial render
         # (`throughput_section`, baked into the page) and `/overview/
         # throughput_data` (what the chart's own poll re-fetches from then
-        # on), so the two can never drift apart — same pattern `Routes::
-        # Stats#chart_data_payload` already uses for its own chart.
+        # on), so the two can never drift apart — same pattern
+        # `runs_per_day_payload` above uses for the Runs-per-day chart.
         def throughput_payload
           series = Cogworker::Throughput.series
           {

@@ -9,8 +9,8 @@ module Cogworker
     # continue down the chain to the real push. A job that loses the claim
     # (another copy is already enqueued/scheduled/running) never reaches
     # `dispatch` at all — it sets `job['unique_skipped']` instead, which
-    # `Client.push` reads to return `nil` rather than a jid, the same
-    # "nothing was actually pushed" signal `sidekiq-unique-jobs` gives.
+    # `Client.push` reads to return `nil` rather than a jid — the
+    # "nothing was actually pushed" signal to the caller.
     class ClientMiddleware
       def call(_worker_class, job, _queue, redis_pool = Cogworker.config.redis_pool)
         return yield unless UniqueJobs.until_executed?(job)

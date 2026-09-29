@@ -178,8 +178,8 @@ module Cogworker
       end
 
       # Cluster-wide "quiet every process" (`Routes::Workers`'s own `POST
-      # /workers/pause_all`) — the mock's "Pause intake" button. Unlike real
-      # Sidekiq OSS (where quiet is a one-way trip back to a fresh process),
+      # /workers/pause_all`) — the mock's "Pause intake" button. Quiet isn't
+      # a one-way trip that only a fresh process can undo:
       # `Manager#quiet` here is a plain in-memory flag, so `resume_intake_
       # button` below is a genuine, symmetric undo rather than a full
       # process restart.
@@ -237,7 +237,7 @@ module Cogworker
       # each one's visible text to the *browser's local* time, in
       # `Web.time_format`. Registered on `htmx:load`, which htmx fires once
       # for the initial page **and** again after every fragment swap — so
-      # newly-swapped-in timestamps (an auto-refreshed Busy/Scheduled/Dead
+      # newly-swapped-in timestamps (an auto-refreshed Workers/Jobs/Schedules
       # tab) get the same treatment without a full reload.
       #
       # `window.cogworkerFormatTime` is the same formatter exposed globally

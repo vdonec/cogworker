@@ -18,7 +18,7 @@ Cogworker::Web
 # Cogworker::Web.load_routes! — nothing to reference here. Opt out with
 # Cogworker::Web.prometheus_exporter_enabled = false if you don't want it.
 
-# Every timestamp in the Web UI (Busy/Scheduled/Dead) renders in the
+# Every timestamp in the Web UI (Workers/Jobs/Schedules/History) renders in the
 # *browser's* local timezone, formatted with this Time#strftime pattern —
 # the same tokens are reused client-side, just against local instead of UTC.
 Cogworker::Web.time_format = '%d.%m.%Y %H:%M:%S'

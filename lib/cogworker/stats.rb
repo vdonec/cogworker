@@ -30,7 +30,7 @@ module Cogworker
 
     # The raw `INFO` reply as a flat Hash (server/clients/memory/stats/...
     # sections all merged together, same as the `redis` gem always returns
-    # it) — the Web UI's Stats tab picks a handful of fields (version,
+    # it) — the Web UI's Overview tab picks a handful of fields (version,
     # uptime, connected clients, memory usage) back out of this itself,
     # rather than this class pre-selecting/renaming them, so a future
     # consumer isn't limited to whatever subset this method chose.
