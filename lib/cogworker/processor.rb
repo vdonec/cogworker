@@ -86,14 +86,22 @@ module Cogworker
       return fetcher.give_back(work) if @manager.stopping?
 
       @manager.processor_busy!
+      @manager.job_started(work.raw_job)
       @busy = true
-      disposition = :give_back
+      @ran = nil
+      disposition = nil
       begin
         disposition = execute(work)
       ensure
         @busy = false
         @manager.processor_idle!
-        settle(work, disposition)
+        # `execute` raising leaves `disposition` unset: before the job ran
+        # that's a hand-back; once it ran, whatever its outcome dictates
+        # (`@ran`, set the moment `run_job` returns) — so an unexpected
+        # exception later in the bookkeeping (a bug, a misbehaving logger)
+        # can't re-queue a job that already ran.
+        settle(work, disposition || @ran || :give_back)
+        @manager.job_finished(work.raw_job)
       end
     end
 
@@ -123,23 +131,57 @@ module Cogworker
     def interrupt(work, job, error)
       payload = JSON.parse(work.raw_job)
       count = payload['interrupted_count'].to_i + 1
-      payload.merge!('interrupted_count' => count, 'retry_count' => job['retry_count'],
+      # This attempt's number, from the payload as fetched — not from the
+      # in-memory job, whose count `route_failure` may not have got to.
+      attempt = payload['retry_count'].to_i + 1
+      payload.merge!('interrupted_count' => count, 'retry_count' => attempt,
                      'error_class' => error.class.name, 'error_message' => JobUtil.error_message(error),
                      'failed_at' => Time.now.to_f)
-      set, score = if count > MAX_INTERRUPTS
+      # No retries left (`retry: false`/`0`, or the last one used up) means
+      # no extra attempt either — straight to dead, like any terminal failure.
+      out_of_retries = attempt > JobUtil.max_retries(payload)
+      delay = INTERRUPT_DELAY * count
+      set, score = if out_of_retries || count > MAX_INTERRUPTS
                      [RedisKeys::DEAD, Time.now.to_f]
                    else
-                     [RedisKeys::RETRY, Time.now.to_f + (INTERRUPT_DELAY * count)]
+                     [RedisKeys::RETRY, Time.now.to_f + delay]
                    end
-      fetcher.interrupt(work, set, score, JSON.generate(payload))
-      Cogworker.logger.error do
-        "couldn't record the failure of jid=#{payload['jid']} (#{error.class}); " \
-          "moved to #{set.delete_prefix('cogworker:')} (interruption #{count}/#{MAX_INTERRUPTS})"
+      encoded = JSON.generate(payload)
+      begin
+        fetcher.interrupt(work, set, score, encoded)
+      rescue StandardError
+        # Remembered with its payload: this process's reconcile (and its
+        # shutdown) keep trying to file it — never re-run it as a stray.
+        @manager.settle_later(work.raw_job, [set, score, encoded]) if fetcher.is_a?(ReliableFetch)
+        raise
       end
+      best_effort('lock extension') { extend_locks_for_retry(job, delay) } if set == RedisKeys::RETRY
+      reason = if set == RedisKeys::RETRY
+                 "retrying in #{delay}s (interruption #{count} of at most #{MAX_INTERRUPTS})"
+               elsif out_of_retries
+                 'moved to dead: no retries left'
+               else
+                 "moved to dead: interrupted more than #{MAX_INTERRUPTS} times"
+               end
+      Cogworker.logger.error { "couldn't record the failure of jid=#{payload['jid']} (#{error.class}); #{reason}" }
     rescue StandardError => e
+      # Whatever failed (even before anything was written), remember the job
+      # with the simplest possible dead entry, so reconcile files it — not
+      # leave it a stray to be re-run. (Already remembered if it got as far
+      # as the write.)
+      remember_for_dead(work, error) if fetcher.is_a?(ReliableFetch) && !@manager.pending_settlements.key?(work.raw_job)
       Cogworker.logger.error do
         "couldn't record or interrupt jid=#{jid_of(work)} (left in progress): #{e.class}: #{e.message}"
       end
+    end
+
+    def remember_for_dead(work, error)
+      entry = JSON.generate('jid' => jid_of(work), 'error_class' => error.class.name.to_s,
+                            'error_message' => JobUtil.error_message(error), 'failed_at' => Time.now.to_f,
+                            'raw_payload' => JobUtil.safe_string(work.raw_job, 100_000))
+      @manager.settle_later(work.raw_job, [RedisKeys::DEAD, Time.now.to_f, entry])
+    rescue StandardError
+      nil
     end
 
     # A failed ack leaves an already-finished job on this process's own
@@ -156,9 +198,12 @@ module Cogworker
           sleep(0.1 * attempts)
           retry
         end
+        # Remembered, so this process's own reconcile finishes the ack later
+        # instead of mistaking the entry for a stray and re-running it.
+        @manager.settle_later(work.raw_job, :ack)
         Cogworker.logger.error do
           "couldn't acknowledge finished job jid=#{jid_of(work)} after #{attempts} attempts " \
-            "(it may run again on shutdown): #{e.class}: #{e.message}"
+            "(will retry; it may run again if this process stops first): #{e.class}: #{e.message}"
         end
       end
     end
@@ -169,17 +214,23 @@ module Cogworker
       '?'
     end
 
-    # Returns how `settle` should dispose of the fetched job; raises only
-    # before the job has run (then `process_one`'s default, :give_back,
-    # applies).
+    # Returns how `settle` should dispose of the fetched job. If it raises
+    # instead, `process_one` falls back on `@ran` — set the moment the job
+    # has run — or, before that, on :give_back.
     def execute(work)
       job = parse_job(work)
       return :acknowledge unless job
 
-      register_in_workers(work.queue, job)
+      # Best-effort: for the reliable fetch the in-progress list is what
+      # keeps the job safe; `cogworker:workers` only feeds the Workers tab
+      # (and BasicFetch's shutdown requeue). A failure here — even a
+      # deterministic one, the key holding the wrong type — used to hand
+      # the job back before it ever ran, over and over.
+      best_effort('register') { register_in_workers(work.queue, job) }
       Cogworker.logger.info { "start: #{job['class']} jid=#{job['jid']}" }
       begin
         error = run_job(work, job)
+        @ran = error ? [:interrupt, job, error] : :acknowledge
         error ? finish_failure(job, error) : finish_success(job)
       ensure
         best_effort('deregister') { deregister_from_workers }

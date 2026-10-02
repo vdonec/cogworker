@@ -88,14 +88,11 @@ RSpec.describe Cogworker::Heartbeat do
     wait_for { Cogworker.config.redis { |c| c.pubsub(:numsub, channel) }.last.to_i.zero? }
   end
 
-  it "keeps an in-flight periodic run's running lock alive on every beat" do
+  it "keeps an in-flight periodic run's running lock alive on every beat — from the process's own record, " \
+     'not cogworker:workers (which a failover can lose)' do
     key = 'periodic:running:pj1'
-    Cogworker.config.redis do |c|
-      c.set(key, 'jid1', ex: 5)
-      c.hset("cogworker:workers:#{Cogworker.identity}", 'tid1',
-             JSON.generate('queue' => 'default', 'run_at' => Time.now.to_i,
-                           'payload' => { 'class' => 'X', 'jid' => 'jid1', 'periodic_pjid' => 'pj1' }))
-    end
+    Cogworker.config.redis { |c| c.set(key, 'jid1', ex: 5) }
+    manager.job_started(JSON.generate('class' => 'X', 'jid' => 'jid1', 'periodic_pjid' => 'pj1'))
 
     described_class.new(manager).send(:beat)
 
@@ -119,13 +116,9 @@ RSpec.describe Cogworker::Heartbeat do
 
   it "still refreshes the other in-flight periodic locks when one in-flight entry can't be read" do
     key = 'periodic:running:pj2'
-    Cogworker.config.redis do |c|
-      c.set(key, 'jid2', ex: 5)
-      workers = "cogworker:workers:#{Cogworker.identity}"
-      c.hset(workers, 'bad', '{not json')
-      c.hset(workers, 'good', JSON.generate('queue' => 'default', 'run_at' => Time.now.to_i,
-                                            'payload' => { 'jid' => 'jid2', 'periodic_pjid' => 'pj2' }))
-    end
+    Cogworker.config.redis { |c| c.set(key, 'jid2', ex: 5) }
+    manager.job_started('{not json')
+    manager.job_started(JSON.generate('jid' => 'jid2', 'periodic_pjid' => 'pj2'))
     allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
 
     described_class.new(manager).send(:beat)
@@ -166,5 +159,22 @@ RSpec.describe Cogworker::Heartbeat do
     allow(conn).to receive(:time).and_raise(Redis::CommandError, "ERR unknown command 'TIME'")
 
     expect(heartbeat.send(:redis_now, conn)).to be_within(2).of(Time.now.to_i)
+  end
+
+  it "still beats (and so a process can start) when a shared registry key holds the wrong type" do
+    Cogworker.config.redis do |c|
+      c.set('cogworker:inprogress_identities', 'x')
+      c.set('cogworker:last_beat', 'x')
+      c.set('cogworker:processes', 'x')
+    end
+    log = StringIO.new
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(log))
+    heartbeat = described_class.new(manager)
+
+    expect(heartbeat.start!).to be(true)
+    expect(Cogworker.config.redis { |c| c.exists?("cogworker:process:#{Cogworker.identity}") }).to be(true)
+    expect(log.string).to include('process registry not written') # (written in any fetch mode)
+  ensure
+    heartbeat&.stop!
   end
 end

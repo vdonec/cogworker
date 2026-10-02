@@ -37,11 +37,18 @@ module Cogworker
     # define `#to_i` (`nil.to_i` happens to be `0` — coincidentally correct
     # for absent — but `false.to_i` raises `NoMethodError` outright, which is
     # exactly the bug this method exists to not have).
+    #
+    # Anything else (a Hash, a non-numeric String…) means no retries — the
+    # cautious reading for a job with side effects — rather than raising
+    # from the middle of recording its failure.
     def max_retries(job)
-      case job['retry']
+      case (value = job['retry'])
       when false then 0
       when true, nil then DEFAULT_MAX_RETRY_ATTEMPTS
-      else job['retry'].to_i
+      when Integer then value
+      when Float then value.to_i
+      when String then Integer(value, exception: false) || 0
+      else 0
       end
     end
 
@@ -75,12 +82,17 @@ module Cogworker
     # commands, a crash or dropped connection between the ZREM and the
     # LPUSH lost the job. The new payload is built in Ruby, not re-encoded
     # by Lua's cjson (which would round large integers in args).
+    # Present? Push, then remove — never remove first: a script stopped by
+    # an error keeps the writes made before it, so a ZREM followed by a
+    # failing LPUSH (the queue key holding the wrong type) lost the entry.
+    # The `cogworker:queues` listing is best-effort.
     CLAIM_AND_REQUEUE_SCRIPT = <<~LUA
-      if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then
+      if not redis.call("ZSCORE", KEYS[1], ARGV[1]) then
         return 0
       end
-      redis.call("SADD", KEYS[2], ARGV[2])
       redis.call("LPUSH", KEYS[3], ARGV[3])
+      redis.call("ZREM", KEYS[1], ARGV[1])
+      redis.pcall("SADD", KEYS[2], ARGV[2])
       return 1
     LUA
 
@@ -120,8 +132,14 @@ module Cogworker
       limit ? str[0, limit] : str
     end
 
+    # Never raises: an exception whose own `#message` raises (a broken
+    # custom exception class) used to escape from the middle of recording
+    # its failure — and, the job then counting as not-yet-run, it was handed
+    # back and re-run about once a second, forever.
     def error_message(error)
       safe_string(error.message, ERROR_MESSAGE_LIMIT)
+    rescue Exception # rubocop:disable Lint/RescueException
+      "#<#{error.class}>"
     end
 
     UNPARSEABLE_CLASS = '(unparseable)'

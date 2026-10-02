@@ -17,6 +17,15 @@ module Cogworker
     # No TTL, unlike `process(identity)`: it's what tells "dead for a
     # while" apart from "missed a few beats" (Config#orphan_threshold).
     LAST_BEAT = 'cogworker:last_beat'
+    # Jobs recovered from dead processes more than `config.max_orphanings` times,
+    # parked by REQUEUE_SCRIPT for Ruby to file in `dead` (see
+    # ReliableFetch.bury_repeat_orphans).
+    REPEAT_ORPHANS = 'cogworker:repeat_orphans'
+    ORPHANINGS_PREFIX = 'cogworker:orphanings:'
+    # Jobs that ran and failed but couldn't be filed in retry/dead, handed
+    # over by a process shutting down (JSON {set, score, payload} each) —
+    # see ReliableFetch.park_unsettled / file_unsettled.
+    UNSETTLED = 'cogworker:unsettled'
     QUEUES = 'cogworker:queues'
     SCHEDULE = 'cogworker:schedule'
     RETRY = 'cogworker:retry'

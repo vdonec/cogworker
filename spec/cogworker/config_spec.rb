@@ -21,6 +21,14 @@ RSpec.describe Cogworker::Config do
     expect { Cogworker.config.fetch = nil }.to raise_error(ArgumentError, /got nil/)
   end
 
+  it 'defaults max_orphanings to 3 and accepts only a positive Integer' do
+    expect(Cogworker.config.max_orphanings).to eq(3)
+    Cogworker.config.max_orphanings = 5
+    expect(Cogworker.config.max_orphanings).to eq(5)
+    expect { Cogworker.config.max_orphanings = 0 }.to raise_error(ArgumentError)
+    expect { Cogworker.config.max_orphanings = 2.5 }.to raise_error(ArgumentError)
+  end
+
   it 'defaults orphan_threshold to 5 minutes and accepts only a positive number' do
     expect(Cogworker.config.orphan_threshold).to eq(300)
     Cogworker.config.orphan_threshold = 120

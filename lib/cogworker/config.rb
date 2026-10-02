@@ -9,7 +9,7 @@ module Cogworker
     FETCH_MODES = %i[reliable basic].freeze
 
     attr_reader :server_chain, :client_chain, :periodic_manager, :redis_options, :fetch, :fetch_idle_max_interval,
-                :orphan_threshold
+                :orphan_threshold, :max_orphanings
     attr_accessor :concurrency, :queues, :periodic_catch_up, :unique_lock_ttl
 
     def initialize
@@ -51,7 +51,19 @@ module Cogworker
       # failover, a long GVL-holding call) — each of which runs its jobs
       # twice; lower: a really crashed process's jobs come back sooner.
       @orphan_threshold = 300
+      # How many times a job may be recovered from a process that died
+      # while running it before it goes to dead instead (ReliableFetch). The
+      # count can't single out the culprit: every job running in a process
+      # that crashed is counted, so keep this above the number of crashes an
+      # innocent job might plausibly sit through.
+      @max_orphanings = 3
       register_default_middleware
+    end
+
+    def max_orphanings=(count)
+      raise ArgumentError, "max_orphanings must be a positive Integer, got #{count.inspect}" unless count.is_a?(Integer) && count.positive?
+
+      @max_orphanings = count
     end
 
     def orphan_threshold=(seconds)

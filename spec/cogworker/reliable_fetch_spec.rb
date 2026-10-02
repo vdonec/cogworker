@@ -207,15 +207,146 @@ RSpec.describe Cogworker::ReliableFetch do
       expect(in_progress).to be_empty
     end
 
-    it 'leaves alone a job a processor thread is actually running' do
-      Cogworker.config.redis do |c|
-        c.hset("cogworker:workers:#{Cogworker.identity}", 't1',
-               JSON.generate('queue' => 'default', 'payload' => { 'jid' => 'stuck' }))
-      end
-
-      expect(described_class.reconcile(Cogworker.identity, [raw])).to be_empty
+    it "leaves alone a job this process is running — by its own record, even if Redis lost cogworker:workers" do
+      expect(described_class.reconcile(Cogworker.identity, [raw], running: [raw])).to be_empty
       expect(in_progress).to eq([raw])
     end
+
+    it 'finishes the ack of a job whose ack failed, instead of re-running it' do
+      acked = []
+      described_class.reconcile(Cogworker.identity, [raw], pending: { raw => :ack }) { |r| acked << r }
+
+      expect(acked).to eq([raw])
+      expect(in_progress).to be_empty
+      expect(queue_jids).to be_empty
+    end
+  end
+
+  describe 'with keys of the wrong type (a script stopped mid-way keeps what it already did)' do
+    let(:dead_list) { 'cogworker:inprogress:dead-host:9:z' }
+    let(:job) { JSON.generate('jid' => 'keep-me', 'queue' => 'default') }
+
+    before do
+      allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+      Cogworker.config.redis do |c|
+        c.lpush(dead_list, job)
+        c.sadd?('cogworker:inprogress_identities', 'dead-host:9:z')
+      end
+    end
+
+    it 'keeps the job on its in-progress list when its queue key is not a list' do
+      Cogworker.config.redis { |c| c.set('cogworker:queue:default', 'not a list') }
+
+      described_class.recover_orphans
+
+      expect(Cogworker.config.redis { |c| c.lrange(dead_list, 0, -1) }).to eq([job])
+    end
+
+    it 'still enforces max_orphanings when the parking list is unusable — straight to dead' do
+      Cogworker.config.redis do |c|
+        c.set('cogworker:orphanings:keep-me', Cogworker.config.max_orphanings)
+        c.set('cogworker:repeat_orphans', 'not a list')
+      end
+
+      described_class.recover_orphans
+
+      expect(queue_jids).to be_empty
+      expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(1)
+    end
+
+    it "starts an unusable orphan counter over instead of letting it switch the limit off" do
+      Cogworker.config.max_orphanings = 1
+      Cogworker.config.redis { |c| c.rpush('cogworker:orphanings:keep-me', 'a list?!') }
+
+      described_class.recover_orphans # count restarts at 1: still within the limit
+      expect(queue_jids).to eq(['keep-me'])
+      Cogworker.config.redis do |c|
+        c.del('cogworker:queue:default')
+        c.lpush(dead_list, job)
+        c.sadd?('cogworker:inprogress_identities', 'dead-host:9:z') # its process died again
+      end
+      described_class.recover_orphans # 2 > 1
+
+      expect(queue_jids).to be_empty
+      expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(1)
+    end
+
+    it 'completes a repeat orphan filed straight into dead: a proper entry, counted, counter cleared' do
+      Cogworker.config.redis do |c|
+        c.set('cogworker:orphanings:keep-me', Cogworker.config.max_orphanings)
+        c.set('cogworker:repeat_orphans', 'not a list')
+      end
+
+      described_class.recover_orphans
+
+      dead = Cogworker.config.redis { |c| c.zrange('cogworker:dead', 0, -1) }.map { |raw| JSON.parse(raw) }
+      expect(dead.map { |j| j.values_at('jid', 'error_class') }).to eq([['keep-me', 'Cogworker::ProcessDied']])
+      expect(Cogworker::Stats.new.failed).to eq(1)
+      expect(Cogworker.config.redis { |c| c.exists?('cogworker:orphanings:keep-me') }).to be(false)
+    end
+
+    it "doesn't let one job whose queue is broken hold up the ones behind it" do
+      blocked = JSON.generate('jid' => 'blocked', 'queue' => 'broken')
+      Cogworker.config.redis do |c|
+        c.set('cogworker:queue:broken', 'not a list')
+        c.lpush(dead_list, blocked) # now ahead of keep-me (LPUSH = head)
+      end
+
+      described_class.recover_orphans
+
+      expect(queue_jids).to eq(['keep-me'])
+      expect(Cogworker.config.redis { |c| c.lrange(dead_list, 0, -1) }).to eq([blocked]) # kept, retried next pass
+    end
+
+    it 'requeues normally when its orphan counter or the parking list is unusable' do
+      Cogworker.config.redis do |c|
+        c.set('cogworker:orphanings:keep-me', 'not a number')
+        c.hset('cogworker:repeat_orphans', 'x', 'not a list')
+      end
+
+      described_class.recover_orphans
+
+      expect(queue_jids).to eq(['keep-me'])
+    end
+
+    it "keeps an interrupted job on the in-progress list when dead/retry isn't a sorted set" do
+      Cogworker.config.redis do |c|
+        c.lpush("cogworker:inprogress:#{Cogworker.identity}", job)
+        c.set('cogworker:dead', 'not a zset')
+      end
+      fetch = described_class.new(%w[default])
+
+      expect { fetch.interrupt(Cogworker::BasicFetch::UnitOfWork.new('default', job), 'cogworker:dead', 1, '{}') }
+        .to raise_error(Redis::CommandError)
+      expect(in_progress).to eq([job])
+    end
+  end
+
+  it 'clears the orphan counter on every path that completes a job: except: on shutdown, and a delayed ack' do
+    finished = JSON.generate('jid' => 'f1', 'queue' => 'default')
+    late = JSON.generate('jid' => 'f2', 'queue' => 'default')
+    Cogworker.config.redis do |c|
+      c.lpush("cogworker:inprogress:#{Cogworker.identity}", [finished, late])
+      c.set('cogworker:orphanings:f1', 2)
+      c.set('cogworker:orphanings:f2', 2)
+    end
+
+    described_class.settle_pending(Cogworker.identity, late => :ack)
+    described_class.requeue_in_progress(Cogworker.identity, except: [finished])
+
+    expect(Cogworker.config.redis { |c| [c.exists?('cogworker:orphanings:f1'), c.exists?('cogworker:orphanings:f2')] })
+      .to eq([false, false])
+  end
+
+  it 'drops (acks) jobs passed as except: instead of requeueing them, on a shutdown requeue' do
+    finished = JSON.generate('jid' => 'finished', 'queue' => 'default')
+    unfinished = JSON.generate('jid' => 'unfinished', 'queue' => 'default')
+    Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", [finished, unfinished]) }
+
+    expect(described_class.requeue_in_progress(Cogworker.identity, except: [finished])).to eq(1)
+
+    expect(queue_jids).to eq(['unfinished'])
+    expect(in_progress).to be_empty
   end
 
   describe '.recover_orphans' do
@@ -287,6 +418,79 @@ RSpec.describe Cogworker::ReliableFetch do
 
         expect(Cogworker.config.redis { |c| c.hget('cogworker:last_beat', 'dead-host:1:abc') }).not_to be_nil
         expect(Cogworker.config.redis { |c| c.smembers('cogworker:inprogress_identities') }).to include('dead-host:1:abc')
+      end
+
+      it 'treats a last-beat stamp that is not a number as no stamp, instead of failing the check' do
+        Cogworker.config.redis do |c|
+          c.hset('cogworker:last_beat', 'dead-host:1:abc', 'garbage')
+          c.sadd?('cogworker:inprogress_identities', 'dead-host:1:abc')
+        end
+        allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+
+        expect(described_class.recover_orphans).to eq(1)
+      end
+
+      it 'sends a job to dead once its process has died running it more than MAX_ORPHANINGS times' do
+        job = JSON.generate('jid' => 'oom', 'class' => 'X', 'queue' => 'default', 'args' => [], 'retry' => 25)
+        allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+        (Cogworker.config.max_orphanings + 1).times do
+          Cogworker.config.redis do |c|
+            c.del('cogworker:queue:default')
+            c.lpush('cogworker:inprogress:dead-host:1:abc', job)
+            c.sadd?('cogworker:inprogress_identities', 'dead-host:1:abc')
+          end
+          described_class.recover_orphans
+        end
+
+        dead = Cogworker.config.redis { |c| c.zrange('cogworker:dead', 0, -1) }.map { |raw| JSON.parse(raw) }
+        expect(dead.map { |j| j.values_at('jid', 'error_class') }).to include(['oom', 'Cogworker::ProcessDied'])
+        expect(queue_jids).not_to include('oom')
+      end
+
+      it 'on burying a repeat orphan, counts it as failed and releases its until_executed locks' do
+        Cogworker.config.max_orphanings = 1
+        job = JSON.generate('jid' => 'oom2', 'class' => 'X', 'queue' => 'default', 'args' => [],
+                            'periodic_pjid' => 'pjx', 'unique' => 'until_executed')
+        digest = Cogworker::UniqueJobs.digest(JSON.parse(job))
+        allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+        Cogworker.config.redis do |c|
+          c.set('periodic:running:pjx', 'oom2')
+          c.set("cogworker:unique:#{digest}", 'oom2')
+        end
+        2.times do
+          Cogworker.config.redis do |c|
+            c.lpush('cogworker:inprogress:dead-host:1:abc', job)
+            c.sadd?('cogworker:inprogress_identities', 'dead-host:1:abc')
+          end
+          described_class.recover_orphans
+        end
+
+        expect(Cogworker::Stats.new.failed).to eq(1)
+        expect(Cogworker.config.redis { |c| [c.get('periodic:running:pjx'), c.get("cogworker:unique:#{digest}")] })
+          .to eq([nil, nil])
+      end
+
+      it 'forgets a job\'s orphan count once it gets to finish' do
+        raw = JSON.generate('jid' => 'survivor', 'queue' => 'default')
+        Cogworker.config.redis do |c|
+          c.set('cogworker:orphanings:survivor', 2)
+          c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw)
+        end
+
+        described_class.new(%w[default]).acknowledge(Cogworker::BasicFetch::UnitOfWork.new('default', raw))
+
+        expect(Cogworker.config.redis { |c| c.exists?('cogworker:orphanings:survivor') }).to be(false)
+      end
+
+      it "doesn't count a shutdown's own requeue as an orphaning" do
+        job = JSON.generate('jid' => 'long', 'queue' => 'default')
+        (Cogworker.config.max_orphanings + 2).times do
+          Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", job) }
+          described_class.requeue_in_progress(Cogworker.identity)
+        end
+
+        expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(0)
+        expect(Cogworker.config.redis { |c| c.exists?('cogworker:orphanings:long') }).to be(false)
       end
 
       it 'follows a configured threshold' do

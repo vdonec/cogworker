@@ -7,6 +7,16 @@ module Cogworker
     def initialize(config = Cogworker.config)
       @config = config
       @fetch_mutex = Mutex.new
+      # This process's own record of its jobs (raw payloads, as fetched):
+      # running right now (a count — two copies of one payload can run at
+      # once), and finished but not yet settled in Redis — `:ack` (the ack
+      # failed) or `[set, score, payload]` (the job ran and failed, and
+      # filing it in retry/dead failed too). In memory on purpose:
+      # ReliableFetch.reconcile trusts it over anything in Redis, which may
+      # be what's failing (or what lost its last writes in a failover).
+      @jobs_mutex = Mutex.new
+      @running_jobs = Hash.new(0)
+      @pending_settlements = {}
       @processors = Array.new(config.concurrency) { Processor.new(self) }
       @quiet = false
       @stopping = false
@@ -63,6 +73,34 @@ module Cogworker
       @stopping
     end
 
+    def job_started(raw)
+      @jobs_mutex.synchronize { @running_jobs[raw] += 1 }
+    end
+
+    def job_finished(raw)
+      @jobs_mutex.synchronize do
+        @running_jobs[raw] -= 1
+        @running_jobs.delete(raw) unless @running_jobs[raw].positive?
+      end
+    end
+
+    def running_jobs
+      @jobs_mutex.synchronize { @running_jobs.keys }
+    end
+
+    # `how`: :ack, or [set, score, payload] — see ReliableFetch.settle.
+    def settle_later(raw, how)
+      @jobs_mutex.synchronize { @pending_settlements[raw] = how }
+    end
+
+    def settled(raw)
+      @jobs_mutex.synchronize { @pending_settlements.delete(raw) }
+    end
+
+    def pending_settlements
+      @jobs_mutex.synchronize { @pending_settlements.dup }
+    end
+
     def busy_count
       @busy_mutex.synchronize { @busy_count }
     end
@@ -109,8 +147,27 @@ module Cogworker
       end
     end
 
+    # Jobs that finished but aren't settled in Redis yet are still on the
+    # in-progress list. One more try at settling them first; then `except:`
+    # drops the ones only waiting for their ack (which is what dropping
+    # them is), in the same atomic step as requeueing the rest — a separate
+    # ack pass that failed used to leave them to be requeued and run again.
+    # Ones that couldn't be filed in retry/dead even now are handed over to
+    # UNSETTLED for any live process to file later (ReliableFetch.park_unsettled)
+    # — never requeued: they already ran. Any that can't even be handed
+    # over are left on the list (`keep:`): orphan recovery requeues them
+    # once this process is gone, at most `max_orphanings` times.
     def requeue_unfinished
-      moved = fetch_class.requeue_in_progress(Cogworker.identity)
+      keep = []
+      if fetch_class == ReliableFetch
+        ReliableFetch.settle_pending(Cogworker.identity, pending_settlements) { |raw| settled(raw) }
+        unfiled = pending_settlements.reject { |_raw, how| how == :ack }
+        keep = ReliableFetch.park_unsettled(Cogworker.identity, unfiled)
+        (unfiled.keys - keep).each { |raw| settled(raw) }
+      end
+      to_ack = pending_settlements.select { |_raw, how| how == :ack }.keys
+      moved = fetch_class.requeue_in_progress(Cogworker.identity, except: to_ack, keep: keep)
+      to_ack.each { |raw| settled(raw) }
       Cogworker.logger.warn { "requeued #{moved} job(s) unfinished at shutdown" } if moved.positive?
     rescue StandardError => e
       Cogworker.logger.error { "Requeueing unfinished jobs failed: #{e.class}: #{e.message}" }

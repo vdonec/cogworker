@@ -68,7 +68,8 @@ module Cogworker
     # that's what gets pushed back — onto the end its queue is popped from,
     # so it runs next. Returns how many. One entry that can't be read is
     # logged and skipped, never allowed to cost the others their requeue.
-    def self.requeue_in_progress(identity)
+    # (`except:` is ReliableFetch's — there's no in-progress list here.)
+    def self.requeue_in_progress(identity, except: [], keep: []) # rubocop:disable Lint/UnusedMethodArgument
       Cogworker.config.redis do |c|
         c.hvals(RedisKeys.workers(identity)).count do |raw|
           entry = JSON.parse(raw)

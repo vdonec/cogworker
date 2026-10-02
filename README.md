@@ -21,6 +21,9 @@ gem 'cogworker'
 bundle install
 ```
 
+Requires a standalone Redis (or a primary/replica setup) — Redis Cluster
+isn't supported: several Lua scripts touch keys they don't declare up front.
+
 ## Quick start
 
 ### 1. Define a job
@@ -160,11 +163,45 @@ has registered itself in Redis, so with Redis unreachable at boot it waits
 (and still stops on `TERM`).
 Either way delivery is *at least once*: a job that was partly done when its
 process died or was stopped runs again from the start, so make jobs safe to
-repeat. A job is never re-run because of a Redis error *after* it ran,
-though: once it has run, it is acknowledged (and on failure recorded in
-Retry/Dead); if even recording the failure fails, it goes to Retry with a
-short delay — to Dead after 3 such interruptions — never straight back onto
-its queue.
+repeat. While the worker process stays up, a job is not re-run because of a
+Redis error *after* it ran: once it has run it is acknowledged (and, if it
+failed, recorded in Retry/Dead). If recording the failure itself fails, the
+job goes to Retry after a short delay — or straight to Dead if it had no
+retries left (`retry: false`/`0`, or its last one used up), and to Dead too
+after 3 such interruptions. If even that, or the acknowledgement, can't be
+written, the process remembers the job and keeps trying to settle it,
+without running it again. That memory doesn't survive the process: if it
+dies (or is stopped) while Redis is still failing, such a job can run once
+more after recovery.
+
+A job whose process dies while running it more than
+`config.max_orphanings` times (default 3; one that runs the process out of
+memory, say) goes to Dead with `Cogworker::ProcessDied` instead of being
+recovered again — whatever its `retry` setting. A restart or deploy stopping
+it cleanly doesn't count towards that, and the count resets once the job
+gets to finish. It can't single out the culprit, though: every job running
+in a process that crashed is counted, so a job that just happened to share a
+process with a memory hog several times can end up in Dead too — raise the
+limit if that's plausible for you.
+
+With redis-rb 4.x, a connection that drops in the middle of a blocking
+fetch is retried by the client itself; if Redis had already handed out a
+job on the dropped connection, that job waits on the process's in-progress
+list until it's noticed (about two minutes) rather than running at once.
+It isn't lost.
+
+### Damaged keys
+
+Every worker checks this gem's Redis keys once a minute (and at boot). A
+key holding the wrong type of value — which only a manual write or data
+corruption produces, but which breaks every command on it — is renamed to
+`cogworker:quarantine:<key>:<time>:<random>` (kept 30 days) and logged as an error,
+and everything carries on with a fresh key. In between checks, work around
+such a key keeps going: a job that can't be put back on a broken queue
+waits behind the others rather than blocking them, a retry/schedule entry
+that can't be moved is postponed a minute, and a failed job that can't be
+filed when its process shuts down is handed over to
+`cogworker:unsettled` for another process to file — not run again.
 
 ### Multiple processes (swarm)
 
@@ -279,7 +316,15 @@ end
 ```
 
 Each schedule slot runs **exactly once**, no matter how many processes are
-running. Processes claim a slot atomically in Redis, with no leader. With
+running. (Two narrow exceptions: a push that times out after Redis already
+applied it can't be told apart from one that never arrived, so that slot may
+run twice; and if a push fails while Redis is unreachable, undoing that
+slot's claim is retried from memory — lost if the process restarts first,
+in which case the slot is skipped and, for an `until_executed` entry, the
+entry stays locked until that lock's TTL, `config.unique_lock_ttl`.) An
+entry that keeps failing (its push, say) is retried with a growing pause,
+5 s up to 5 minutes, instead of on every 5 s tick. Processes claim a slot
+atomically in Redis, with no leader. With
 `unique: :until_executed`, a new slot is skipped while the previous run is
 still in progress. If the process running it dies (OOM, `SIGKILL`), the entry
 frees itself within a minute, since that lock is kept alive by the running
@@ -470,6 +515,19 @@ then the previous mode comes back. In `inline!` mode, an exception from
 `examples/` contains a working app: jobs, an init file, `cogworker.yml`,
 and a `config.ru` that mounts the Web UI. See
 [`examples/README.md`](examples/README.md) for how to run it.
+
+## Upgrading
+
+- **From 0.3.0, with a rolling upgrade:** until every process runs a newer
+  version, 0.3.0 processes still treat another process as dead as soon as
+  its 60 s heartbeat key expires (newer ones wait for
+  `config.orphan_threshold`), so a live process that couldn't reach Redis
+  for a minute can have its running jobs started a second time. Upgrade
+  the whole fleet together, or accept that window.
+- `until_executed` periodic jobs already enqueued by 0.3.0 don't carry the
+  marker that lets a recovery re-take their running lock: if such a job is
+  recovered after a crash, the entry's next slot can run alongside it.
+- `Status.status(jid)` returns a Symbol since 0.3.0 (it was a String).
 
 ## Development
 

@@ -252,7 +252,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     end
   end
 
-  it 'hands a job back to its queue, rather than acknowledging it away, when bookkeeping around it fails' do
+  it 'interrupts a job that ran (into retry, not its queue) when recording its failure blows up' do
     stub_const('BookkeepingJob', Class.new { include Cogworker::Worker })
     BookkeepingJob.define_method(:perform) { raise 'boom' }
     jid = BookkeepingJob.perform_async
@@ -264,8 +264,9 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
 
     expect { processor.send(:process_one) }.to raise_error(Redis::CannotConnectError)
 
-    expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') + c.zcard('cogworker:dead') }).to eq(0)
-    expect(queued_jobs.map { |j| j['jid'] }).to eq([jid])
+    expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(1)
+    expect(queued_jobs).to be_empty
+    expect(JSON.parse(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, 0) }.first)['jid']).to eq(jid)
     expect(Cogworker.config.redis { |c| c.llen("cogworker:inprogress:#{Cogworker.identity}") }).to eq(0)
   end
 
@@ -356,5 +357,198 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
 
       expect(counts).to include(retry: 0, dead: 1)
     end
+  end
+
+  describe 'interrupting (recording the failure itself failed)' do
+    let(:processor) { Cogworker::Processor.new(Cogworker::Manager.new) }
+
+    before { allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new)) }
+
+    # `attempt`: the number of the attempt whose failure couldn't be recorded
+    # (the fetched payload carries the previous attempts' count).
+    def interrupt(job_fields, attempt)
+      raw = JSON.generate({ 'jid' => 'i1', 'class' => 'X', 'queue' => 'default', 'args' => [],
+                            'retry_count' => attempt - 1 }.merge(job_fields))
+      retry_count = attempt
+      Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw) }
+      job = JSON.parse(raw).merge('retry_count' => retry_count)
+      processor.send(:interrupt, Cogworker::BasicFetch::UnitOfWork.new('default', raw), job, RuntimeError.new('boom'))
+      Cogworker.config.redis { |c| [c.zcard('cogworker:retry'), c.zcard('cogworker:dead')] }
+    end
+
+    it 'sends a job with retry: false straight to dead — no extra attempt it was never allowed' do
+      expect(interrupt({ 'retry' => false }, 1)).to eq([0, 1])
+    end
+
+    it 'sends a job whose last retry was this one straight to dead' do
+      expect(interrupt({ 'retry' => 2 }, 3)).to eq([0, 1])
+    end
+
+    it 'extends a unique job\'s lock over the interruption delay' do
+      fields = { 'unique' => 'until_executed', 'retry' => 3 }
+      digest = Cogworker::UniqueJobs.digest(JSON.parse(JSON.generate({ 'class' => 'X', 'queue' => 'default', 'args' => [] })))
+      Cogworker.config.redis { |c| c.set("cogworker:unique:#{digest}", 'i1', ex: 5) }
+
+      expect(interrupt(fields, 1)).to eq([1, 0])
+      expect(Cogworker.config.redis { |c| c.ttl("cogworker:unique:#{digest}") }).to be > Cogworker::Processor::INTERRUPT_DELAY
+    end
+  end
+
+  it 'records a failure whose exception raises from #message, instead of re-running it every second' do
+    broken = Class.new(StandardError) { def message = raise('no message for you') }
+    stub_const('BrokenMessageError', broken)
+    stub_const('BrokenMessageJob', Class.new { include Cogworker::Worker })
+    runs = 0
+    BrokenMessageJob.define_method(:perform) { |*| (runs += 1) && raise(BrokenMessageError) }
+    BrokenMessageJob.perform_async
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+
+    Cogworker::Processor.new(Cogworker::Manager.new).send(:process_one)
+
+    expect(runs).to eq(1)
+    retried = JSON.parse(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, 0) }.first)
+    expect(retried['error_message']).to eq('#<BrokenMessageError>')
+  end
+
+  it "doesn't re-run, on shutdown, a job that finished but whose ack failed", :reliable_fetch do
+    manager = Cogworker::Manager.new
+    raw = JSON.generate('jid' => 'done1', 'queue' => 'default')
+    Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw) }
+    manager.settle_later(raw, :ack)
+
+    manager.stop!(timeout: 0)
+
+    expect(queued_jobs).to be_empty
+    expect(Cogworker.config.redis { |c| c.llen("cogworker:inprogress:#{Cogworker.identity}") }).to eq(0)
+  end
+
+  describe 'an unexpected exception after the job ran' do
+    let(:processor) { Cogworker::Processor.new(Cogworker::Manager.new) }
+
+    before { allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new)) }
+
+    def counts
+      Cogworker.config.redis do |c|
+        [c.zcard('cogworker:retry'), c.zcard('cogworker:dead'), c.llen('cogworker:queue:default'),
+         c.llen("cogworker:inprogress:#{Cogworker.identity}")]
+      end
+    end
+
+    it 'never re-queues a failed job — with retry: false, it goes to dead' do
+      stub_const('NoRetryJob', Class.new { include Cogworker::Worker })
+      runs = 0
+      NoRetryJob.define_method(:perform) { |*| (runs += 1) && raise('boom') }
+      Cogworker::Client.push('class' => 'NoRetryJob', 'args' => [], 'retry' => false)
+      allow(processor).to receive(:route_failure).and_raise(NoMethodError, 'bug in bookkeeping')
+
+      expect { processor.send(:process_one) }.to raise_error(NoMethodError)
+
+      expect(runs).to eq(1)
+      expect(counts).to eq([0, 1, 0, 0])
+    end
+
+    it 'acknowledges a job that succeeded, rather than re-queueing it' do
+      stub_const('OkJob', Class.new { include Cogworker::Worker })
+      OkJob.define_method(:perform) { |*| nil }
+      OkJob.perform_async
+      allow(processor).to receive(:finish_success).and_raise(NoMethodError, 'bug in bookkeeping')
+
+      expect { processor.send(:process_one) }.to raise_error(NoMethodError)
+
+      expect(counts).to eq([0, 0, 0, 0])
+    end
+
+    it "still runs a job whose registration in cogworker:workers fails (the key holding the wrong type)" do
+      stub_const('RegJob', Class.new { include Cogworker::Worker })
+      runs = 0
+      RegJob.define_method(:perform) { |*| runs += 1 }
+      RegJob.perform_async
+      Cogworker.config.redis { |c| c.set("cogworker:workers:#{Cogworker.identity}", 'not a hash') }
+
+      processor.send(:process_one)
+
+      expect(runs).to eq(1)
+      expect(counts).to eq([0, 0, 0, 0])
+    end
+  end
+
+  it 'never re-runs a retry: false job whose failure could not be filed anywhere — reconcile keeps filing it',
+     :reliable_fetch do
+    manager = Cogworker::Manager.new
+    processor = Cogworker::Processor.new(manager)
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    stub_const('DoomedJob', Class.new { include Cogworker::Worker })
+    runs = 0
+    DoomedJob.define_method(:perform) { |*| (runs += 1) && raise('boom') }
+    Cogworker::Client.push('class' => 'DoomedJob', 'args' => [], 'retry' => false)
+    Cogworker.config.redis { |c| c.set('cogworker:dead', 'not a zset') } # every write to dead fails
+
+    processor.send(:process_one)
+    expect(manager.pending_settlements.size).to eq(1)
+
+    strays = []
+    2.times do
+      strays = Cogworker::ReliableFetch.reconcile(Cogworker.identity, strays, running: manager.running_jobs,
+                                                                              pending: manager.pending_settlements) { |raw| manager.settled(raw) }
+    end
+    expect(queued_jobs).to be_empty # not requeued as a stray
+
+    Cogworker.config.redis { |c| c.del('cogworker:dead') } # Redis is fine again
+    Cogworker::ReliableFetch.reconcile(Cogworker.identity, strays, running: manager.running_jobs,
+                                                                   pending: manager.pending_settlements) { |raw| manager.settled(raw) }
+
+    expect(runs).to eq(1)
+    expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(1)
+    expect(manager.pending_settlements).to be_empty
+    expect(Cogworker.config.redis { |c| c.llen("cogworker:inprogress:#{Cogworker.identity}") }).to eq(0)
+  end
+
+  it 'keeps a payload marked running until every concurrent copy of it has finished' do
+    manager = Cogworker::Manager.new
+    manager.job_started('same')
+    manager.job_started('same')
+    manager.job_finished('same')
+
+    expect(manager.running_jobs).to eq(['same'])
+    manager.job_finished('same')
+    expect(manager.running_jobs).to be_empty
+  end
+
+  it "hands an unfileable failure over to cogworker:unsettled on shutdown — never requeues it — and it's filed once possible",
+     :reliable_fetch do
+    manager = Cogworker::Manager.new
+    raw = JSON.generate('jid' => 'pay1', 'class' => 'PaymentJob', 'queue' => 'default', 'args' => [], 'retry' => false)
+    Cogworker.config.redis do |c|
+      c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw)
+      c.set('cogworker:dead', 'not a zset')
+    end
+    manager.settle_later(raw, ['cogworker:dead', 1.0, JSON.generate('jid' => 'pay1', 'error_class' => 'X')])
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+
+    manager.stop!(timeout: 0)
+
+    expect(queued_jobs).to be_empty
+    expect(Cogworker.config.redis { |c| c.llen("cogworker:inprogress:#{Cogworker.identity}") }).to eq(0)
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:unsettled') }).to eq(1)
+
+    Cogworker.config.redis { |c| c.del('cogworker:dead') }
+    Cogworker::ReliableFetch.recover_orphans
+
+    expect(Cogworker.config.redis { |c| [c.zcard('cogworker:dead'), c.llen('cogworker:unsettled')] }).to eq([1, 0])
+  end
+
+  it 'remembers a job for dead when interrupt itself blows up before writing anything — never a stray to re-run',
+     :reliable_fetch do
+    manager = Cogworker::Manager.new
+    processor = Cogworker::Processor.new(manager)
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    raw = JSON.generate('jid' => 'odd', 'class' => 'X', 'queue' => 'default', 'args' => [])
+    allow(Cogworker::JobUtil).to receive(:max_retries).and_raise(NoMethodError, 'unexpected')
+
+    processor.send(:interrupt, Cogworker::BasicFetch::UnitOfWork.new('default', raw), {}, RuntimeError.new('boom'))
+
+    set, _score, entry = manager.pending_settlements.fetch(raw)
+    expect(set).to eq('cogworker:dead')
+    expect(JSON.parse(entry)).to include('jid' => 'odd', 'error_class' => 'RuntimeError')
   end
 end

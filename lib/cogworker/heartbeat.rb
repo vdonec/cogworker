@@ -117,20 +117,33 @@ module Cogworker
         'rss_kb' => current_rss_kb
       }
 
+      # The presence key is what makes this process alive to everyone else
+      # (and what Heartbeat#start! waits for) — the one write a beat can't
+      # do without. Everything else is written on its own, best-effort: one
+      # shared key of the wrong type used to fail every beat of every
+      # process, so no new process could start anywhere in the fleet.
       Cogworker.config.redis do |c|
-        c.sadd?(RedisKeys::PROCESSES, identity)
         c.hset(RedisKeys.process(identity),
                'info', JSON.generate(info),
                'busy', @manager.busy_count.to_s,
                'quiet', @manager.quiet?.to_s)
         c.expire(RedisKeys.process(identity), TTL)
-        c.expire(RedisKeys.workers(identity), TTL)
+        secondary('process registry') { c.sadd?(RedisKeys::PROCESSES, identity) }
+        secondary('workers expiry') { c.expire(RedisKeys.workers(identity), TTL) }
         if reliable
-          c.sadd?(RedisKeys::IN_PROGRESS_IDENTITIES, identity)
-          c.hset(RedisKeys::LAST_BEAT, identity, redis_now(c))
+          secondary('in-progress registry') { c.sadd?(RedisKeys::IN_PROGRESS_IDENTITIES, identity) }
+          secondary('last-beat stamp') { c.hset(RedisKeys::LAST_BEAT, identity, redis_now(c)) }
         end
         touch_running_periodic_locks(c, identity)
       end
+    end
+
+    def secondary(what)
+      yield
+    rescue Redis::BaseConnectionError
+      raise # Redis itself is gone: the beat as a whole failed
+    rescue StandardError => e
+      Cogworker.logger.error { "Heartbeat: #{what} not written: #{e.class}: #{e.message}" }
     end
 
     # Redis's clock, not this host's (so host clock skew doesn't matter to
@@ -145,12 +158,12 @@ module Cogworker
 
     # Keeps every in-flight `until_executed` periodic run's
     # `periodic:running:<pjid>` lock alive for as long as this process is —
-    # see Periodic::RunningLock. Reads the same `cogworker:workers:<identity>`
-    # Hash the Workers tab does, so it covers exactly the jobs actually
-    # executing here right now.
-    def touch_running_periodic_locks(conn, identity)
-      conn.hvals(RedisKeys.workers(identity)).each do |raw|
-        job = JSON.parse(raw)['payload']
+    # see Periodic::RunningLock. From the Manager's own in-memory record of
+    # what's running here, not `cogworker:workers` in Redis: a failover that
+    # lost that Hash would otherwise let a long run's lock lapse mid-run.
+    def touch_running_periodic_locks(conn, _identity)
+      @manager.running_jobs.each do |raw|
+        job = JSON.parse(raw)
         next unless job.is_a?(Hash) && job['periodic_pjid']
 
         Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], Periodic::RunningLock.active_ttl, conn)

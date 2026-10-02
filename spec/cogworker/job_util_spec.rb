@@ -49,6 +49,15 @@ RSpec.describe Cogworker::JobUtil do
       expect(queued_jobs.map { |j| j['jid'] }).to eq(['a'])
     end
 
+    it "leaves the entry in place when its queue key isn't a list, instead of removing it first" do
+      raw = JSON.generate('jid' => 'w', 'queue' => 'default')
+      zadd(raw)
+      Cogworker.config.redis { |c| c.set('cogworker:queue:default', 'not a list') }
+
+      expect { call(raw) }.to raise_error(Redis::CommandError)
+      expect(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, -1) }).to eq([raw])
+    end
+
     it 'never claims an entry it could not requeue — no JSON object, or no String queue' do
       ['{not json', '[1]', JSON.generate('jid' => 'b'), JSON.generate('jid' => 'c', 'queue' => nil)].each do |raw|
         zadd(raw)
@@ -65,6 +74,15 @@ RSpec.describe Cogworker::JobUtil do
       expect(described_class.safe_string('Привет'.encode('Windows-1251'))).to eq('Привет')
       expect(described_class.safe_string('abcdef', 3)).to eq('abc')
       expect(JSON.generate('m' => described_class.safe_string("\xff\xfe".b))).to be_a(String)
+    end
+  end
+
+  describe '.max_retries with a value it doesn\'t understand' do
+    it 'reads it as no retries instead of raising' do
+      expect(described_class.max_retries('retry' => {})).to eq(0)
+      expect(described_class.max_retries('retry' => 'lots')).to eq(0)
+      expect(described_class.max_retries('retry' => '4')).to eq(4)
+      expect(described_class.max_retries('retry' => 2.0)).to eq(2)
     end
   end
 end

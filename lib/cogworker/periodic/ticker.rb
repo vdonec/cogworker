@@ -20,10 +20,14 @@ module Cogworker
       # Undoes a won claim whose push then failed, so the slot isn't lost:
       # puts `last_slot` back (only if it still is this slot — a later slot
       # may have been claimed since) and drops the per-slot NX lock.
-      # KEYS[1] = last_slot, KEYS[2] = slot lock; ARGV[1] = slot, ARGV[2] =
-      # previous last_slot ("" if none: then slot - 1, which still lets this
-      # slot fire, unlike deleting the key — with catch_up off, a missing
-      # last_slot would be re-primed to this very slot instead).
+      # KEYS[1] = last_slot, KEYS[2] = slot lock, KEYS[3] = running lock;
+      # ARGV[1] = slot, ARGV[2] = previous last_slot ("" if none: then
+      # slot - 1, which still lets this slot fire, unlike deleting the key —
+      # with catch_up off, a missing last_slot would be re-primed to this
+      # very slot instead), ARGV[3] = the jid the claim took the running lock
+      # under. Releasing that lock happens here too, in the same step: as a
+      # separate call made first, its failure (Redis down — the usual reason
+      # the push failed) skipped the rollback altogether.
       ROLLBACK_SCRIPT = <<~LUA
         if redis.call("GET", KEYS[1]) == ARGV[1] then
           if ARGV[2] == "" then
@@ -33,6 +37,12 @@ module Cogworker
           end
         end
         redis.call("DEL", KEYS[2])
+        -- Best-effort (an entry without until_executed has no lock; one of
+        -- the wrong type mustn't make an applied rollback count as failed
+        -- and be retried forever).
+        if redis.pcall("GET", KEYS[3]) == ARGV[3] then
+          redis.pcall("DEL", KEYS[3])
+        end
         return 1
       LUA
 
@@ -44,10 +54,19 @@ module Cogworker
         @last_checked_slot = {}
         @cron_cache = {}
         @pending_rollbacks = []
+        @failures = Hash.new(0) # pjid => consecutive failed ticks
+        @retry_at = {}          # pjid => monotonic time it may be tried again
       end
 
+      # Publishing is only for restart survival and the Web UI: its failure
+      # (Redis down at boot, the key holding the wrong type) is logged, and
+      # must not take the process down with it.
       def start!
-        publish_schedule!
+        begin
+          publish_schedule!
+        rescue StandardError => e
+          Cogworker.logger.error { "Periodic schedule not published: #{e.class}: #{e.message}" }
+        end
         @thread = Thread.new { run }
       end
 
@@ -96,13 +115,88 @@ module Cogworker
         retry_pending_rollbacks
         now = Time.now
         @entries.each do |entry|
-          slot = cron_for(entry).previous_time(now).to_i
-          next if @last_checked_slot[entry.pjid] == slot
+          next if backing_off?(entry.pjid)
 
-          jid = SecureRandom.hex(12)
-          previous = claim(entry, slot, jid) unless disabled?(entry)
-          enqueue(entry, slot, jid, previous) if previous
-          @last_checked_slot[entry.pjid] = slot
+          tick_entry(entry, now)
+          @failures.delete(entry.pjid)
+        rescue StandardError => e
+          # Per entry: one entry failing (its keys of the wrong type, its
+          # push failing) used to skip every entry after it, on every tick.
+          # Its slot isn't recorded as checked, so it's retried — after an
+          # exponential pause (`back_off`), not on every 5s tick, which made a
+          # deterministically failing entry hammer Redis and the log. Not for
+          # a lost connection, though: that's Redis being away, not the
+          # entry failing — backing off every entry on it left cron idle for
+          # minutes after Redis came back.
+          delay = e.is_a?(Redis::BaseConnectionError) ? TICK_INTERVAL : back_off(entry.pjid)
+          Cogworker.logger.error { "Periodic tick failed for #{entry.pjid} (next try in #{delay}s): #{e.class}: #{e.message}" }
+        end
+      end
+
+      BACKOFF_MAX = 300
+
+      def backing_off?(key)
+        (at = @retry_at[key]) && ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) < at
+      end
+
+      # 5s, 10s, 20s … up to BACKOFF_MAX; reset by the next success.
+      def back_off(key)
+        @failures[key] += 1
+        delay = [TICK_INTERVAL * (2**(@failures[key] - 1)), BACKOFF_MAX].min
+        @retry_at[key] = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) + delay
+        delay
+      end
+
+      def tick_entry(entry, now)
+        slot = cron_for(entry).previous_time(now).to_i
+        return if @last_checked_slot[entry.pjid] == slot
+
+        jid = SecureRandom.hex(12)
+        previous = claim(entry, slot, jid) unless disabled?(entry)
+        enqueue(entry, slot, jid, previous) if previous
+        @last_checked_slot[entry.pjid] = slot
+      end
+
+      # The usual reason a push fails — Redis unreachable — makes this fail
+      # too; it's then kept and retried at the start of every tick until it
+      # goes through (before that tick looks at the slot again), rather than
+      # just logged and the slot lost. Returns true, or the error. (A push
+      # that timed out *after* Redis had applied it is the one case this
+      # turns into a second run of the slot: indistinguishable from one that
+      # never arrived.) Pending
+      # rollbacks live in this process's memory only: one still pending when
+      # the process restarts is lost — that slot is skipped, and an
+      # `until_executed` entry stays locked until its lock's TTL.
+      def rollback_claim(entry, slot, previous_slot, jid)
+        Cogworker.config.redis do |c|
+          keys = [RedisKeys.periodic_last_slot(entry.pjid), RedisKeys.periodic_lock(entry.pjid, slot),
+                  RedisKeys.periodic_running(entry.pjid)]
+          LuaScript.run(c, ROLLBACK_SCRIPT, keys: keys, argv: [slot, previous_slot, jid])
+        end
+        true
+      rescue StandardError => e
+        Cogworker.logger.error { "periodic #{entry.pjid}: couldn't roll back slot #{slot} (will retry): #{e.class}: #{e.message}" }
+        @pending_rollbacks << [entry, slot, previous_slot, jid]
+        e # (truthy, but not `true`: the caller tells a lost connection from a failing rollback)
+      end
+
+      # With the same backoff as a failing entry (keyed by the rollback): a
+      # rollback that keeps failing is retried less and less often, but
+      # always before that entry's slot is looked at again.
+      def retry_pending_rollbacks
+        pending = @pending_rollbacks
+        @pending_rollbacks = []
+        pending.each do |args|
+          key = "rollback:#{args[0].pjid}:#{args[1]}"
+          next @pending_rollbacks << args if backing_off?(key)
+
+          result = rollback_claim(*args)
+          if result == true
+            @failures.delete(key)
+            @retry_at.delete(key)
+          elsif !result.is_a?(Redis::BaseConnectionError)
+            back_off(key) # only a rollback failing on its own backs off; see #tick
+          end
         end
       end
 
@@ -117,32 +211,18 @@ module Cogworker
       # persisted last_slot) still advances either way, exactly as it
       # already did before this entry ever had a disabled state — it only
       # stops this same tick loop from re-evaluating the same slot twice.
-      # The usual reason a push fails — Redis unreachable — makes this fail
-      # too; it's then kept and retried at the start of every tick until it
-      # goes through (before that tick looks at the slot again), rather than
-      # just logged and the slot lost. (A push that timed out *after* Redis
-      # had applied it is the one case this turns into a second run of the
-      # slot: indistinguishable from one that never arrived.)
-      def rollback_claim(entry, slot, previous_slot)
-        Cogworker.config.redis do |c|
-          keys = [RedisKeys.periodic_last_slot(entry.pjid), RedisKeys.periodic_lock(entry.pjid, slot)]
-          LuaScript.run(c, ROLLBACK_SCRIPT, keys: keys, argv: [slot, previous_slot])
-        end
-        true
-      rescue StandardError => e
-        Cogworker.logger.error { "periodic #{entry.pjid}: couldn't roll back slot #{slot} (will retry): #{e.class}: #{e.message}" }
-        @pending_rollbacks << [entry, slot, previous_slot]
-        false
-      end
-
-      def retry_pending_rollbacks
-        pending = @pending_rollbacks
-        @pending_rollbacks = []
-        pending.each { |args| rollback_claim(*args) }
-      end
-
+      #
+      # A disabled-set that can't be read (the key holding the wrong type)
+      # counts as "not disabled", logged: it used to fail every entry's tick,
+      # stopping all cron. Losing a Disable is the lesser evil. A dropped
+      # connection still raises (the tick is then retried as a whole).
       def disabled?(entry)
         Cogworker.config.redis { |c| c.sismember(RedisKeys::PERIODIC_DISABLED, entry.pjid) }
+      rescue Redis::BaseConnectionError
+        raise
+      rescue StandardError => e
+        Cogworker.logger.error { "Periodic: can't read #{RedisKeys::PERIODIC_DISABLED} (#{e.class}: #{e.message}); treating #{entry.pjid} as enabled" }
+        false
       end
 
       def cron_for(entry)
@@ -201,8 +281,7 @@ module Cogworker
         pushed = begin
           Client.push(job)
         rescue StandardError
-          RunningLock.release(entry.pjid, jid) if entry.until_executed?
-          rollback_claim(entry, slot, previous_slot)
+          rollback_claim(entry, slot, previous_slot, jid)
           raise
         end
         return unless entry.until_executed?
