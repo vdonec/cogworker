@@ -8,7 +8,8 @@ module Cogworker
   class Config
     FETCH_MODES = %i[reliable basic].freeze
 
-    attr_reader :server_chain, :client_chain, :periodic_manager, :redis_options, :fetch
+    attr_reader :server_chain, :client_chain, :periodic_manager, :redis_options, :fetch, :fetch_idle_max_interval,
+                :orphan_threshold
     attr_accessor :concurrency, :queues, :periodic_catch_up, :unique_lock_ttl
 
     def initialize
@@ -39,7 +40,34 @@ module Cogworker
       # On an older Redis, `:reliable` falls back to `:basic` with a warning
       # (Manager#resolve_fetch_class).
       @fetch = :reliable
+      # Longest pause (seconds) ReliableFetch makes between polls of empty
+      # queues — the worst-case delay before an idle worker notices a new
+      # job. See ReliableFetch::EMPTY_POLL_INTERVAL.
+      @fetch_idle_max_interval = 1.0
+      # How long (seconds) a process must have gone without a heartbeat
+      # before ReliableFetch.recover_orphans treats it as dead and requeues
+      # its in-progress jobs. Higher: fewer false "dead" verdicts on a live
+      # process that merely couldn't beat for a while (a Redis outage or
+      # failover, a long GVL-holding call) — each of which runs its jobs
+      # twice; lower: a really crashed process's jobs come back sooner.
+      @orphan_threshold = 300
       register_default_middleware
+    end
+
+    def orphan_threshold=(seconds)
+      unless seconds.is_a?(Numeric) && seconds.positive?
+        raise ArgumentError, "orphan_threshold must be a positive number of seconds, got #{seconds.inspect}"
+      end
+
+      @orphan_threshold = seconds
+    end
+
+    def fetch_idle_max_interval=(seconds)
+      unless seconds.is_a?(Numeric) && seconds.positive?
+        raise ArgumentError, "fetch_idle_max_interval must be a positive number of seconds, got #{seconds.inspect}"
+      end
+
+      @fetch_idle_max_interval = seconds
     end
 
     def fetch=(mode)

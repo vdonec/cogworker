@@ -15,6 +15,7 @@ module Cogworker
   class Heartbeat
     INTERVAL = 5
     TTL = 60
+    STARTUP_RETRY_INTERVAL = 1
 
     def initialize(manager)
       @manager = manager
@@ -23,12 +24,21 @@ module Cogworker
     # The first beat is synchronous, before any processor fetches a job:
     # ReliableFetch.recover_orphans treats an in-progress list with no live
     # heartbeat behind it as a dead process's, so this process must be
-    # visibly alive before its own list can have anything on it.
-    def start!
+    # visibly alive before its own list can have anything on it. With Redis
+    # unreachable, it keeps retrying (every STARTUP_RETRY_INTERVAL) rather
+    # than letting the Manager start fetching with no presence key — until
+    # it succeeds (returns true) or `abort_if` says to give up (returns
+    # false, e.g. a stop signal arrived meanwhile; nothing is started then).
+    def start!(abort_if: -> { false })
       @stopping = false
-      beat_safely
+      until beat_safely
+        return false if abort_if.call
+
+        sleep(STARTUP_RETRY_INTERVAL)
+      end
       @beat_thread = Thread.new { beat_loop }
       @signal_thread = Thread.new { subscribe_loop }
+      true
     end
 
     # Tears down both background threads, not just the Redis keys — leaving
@@ -67,6 +77,12 @@ module Cogworker
       Cogworker.config.redis do |c|
         c.del(RedisKeys.process(Cogworker.identity), RedisKeys.workers(Cogworker.identity))
         c.srem?(RedisKeys::PROCESSES, Cogworker.identity)
+        # Clean shutdown: Manager#stop! already requeued this process's
+        # in-progress list, so there's nothing left for recovery to find.
+        if c.llen(RedisKeys.in_progress(Cogworker.identity)).zero?
+          c.srem?(RedisKeys::IN_PROGRESS_IDENTITIES, Cogworker.identity)
+          c.hdel(RedisKeys::LAST_BEAT, Cogworker.identity)
+        end
       end
     end
 
@@ -83,12 +99,15 @@ module Cogworker
 
     def beat_safely
       beat
+      true
     rescue StandardError => e
       Cogworker.logger.error { "Heartbeat failed: #{e.class}: #{e.message}" }
+      false
     end
 
     def beat
       identity = Cogworker.identity
+      reliable = @manager.fetch_class == ReliableFetch
       info = {
         'hostname' => Cogworker.hostname,
         'pid' => ::Process.pid,
@@ -106,6 +125,10 @@ module Cogworker
                'quiet', @manager.quiet?.to_s)
         c.expire(RedisKeys.process(identity), TTL)
         c.expire(RedisKeys.workers(identity), TTL)
+        if reliable
+          c.sadd?(RedisKeys::IN_PROGRESS_IDENTITIES, identity)
+          c.hset(RedisKeys::LAST_BEAT, identity, c.time.first) # Redis's clock, not this host's
+        end
         touch_running_periodic_locks(c, identity)
       end
     end
@@ -120,7 +143,7 @@ module Cogworker
         job = JSON.parse(raw)['payload']
         next unless job.is_a?(Hash) && job['periodic_pjid']
 
-        Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], Periodic::RunningLock::ACTIVE_TTL, conn)
+        Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], Periodic::RunningLock.active_ttl, conn)
       rescue StandardError => e
         # Per entry: one bad entry mustn't leave the others' locks to expire.
         Cogworker.logger.error { "couldn't refresh periodic lock for #{raw.to_s[0, 200]}: #{e.class}: #{e.message}" }
@@ -194,6 +217,7 @@ module Cogworker
     def remote_stop!
       @manager.stop!
       cleanup_presence!
+      Cogworker.flush_output!
       ::Process.exit!(true)
     end
   end

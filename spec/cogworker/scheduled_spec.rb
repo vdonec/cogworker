@@ -30,7 +30,7 @@ RSpec.describe Cogworker::Scheduled do
   end
 
   it 'keeps polling after a failed poll instead of letting the thread die' do
-    manager = double(quiet?: false)
+    manager = double(quiet?: false, fetch_class: Cogworker::ReliableFetch)
     allow(manager).to receive(:stopping?).and_return(false, false, true)
     scheduled = described_class.new(manager)
     calls = 0
@@ -66,5 +66,15 @@ RSpec.describe Cogworker::Scheduled do
     dead = Cogworker.config.redis { |c| c.zrange('cogworker:dead', 0, -1) }.map { |raw| JSON.parse(raw) }
     expect(dead.map { |j| j.values_at('class', 'raw_payload') }).to eq([['(unparseable)', '{not json']])
     expect(Cogworker::Stats.new.failed).to eq(1) # counted like Processor#bury_unparseable
+  end
+
+  it 'only SCANs the keyspace for pre-set in-progress lists when this process itself uses ReliableFetch' do
+    scans = []
+    allow(Cogworker::ReliableFetch).to receive(:recover_orphans) { |scan:| scans << scan }
+
+    described_class.new(double(fetch_class: Cogworker::BasicFetch)).send(:recover_orphans_if_due)
+    described_class.new(double(fetch_class: Cogworker::ReliableFetch)).send(:recover_orphans_if_due)
+
+    expect(scans).to eq([false, true])
   end
 end

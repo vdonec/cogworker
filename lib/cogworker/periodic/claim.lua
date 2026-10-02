@@ -7,8 +7,10 @@
 -- ARGV[4] = jid the caller will push this slot's job under
 -- ARGV[5] = running-lock TTL (seconds)
 --
--- Returns 1 if this call won the claim for this slot (the caller should
--- enqueue the job), 0 otherwise. Composes two guards: `last_slot` stops a
+-- Returns {1, <previous last_slot, or "" if none>} if this call won the
+-- claim for this slot (the caller should enqueue the job — and, if that
+-- fails, roll the claim back with ROLLBACK_SCRIPT using that previous
+-- value), 0 otherwise. Composes two guards: `last_slot` stops a
 -- process re-firing the same (or an earlier) slot on a later tick, and the
 -- NX lock breaks the narrow race where two processes both pass the
 -- `last_slot` check before either has written it back.
@@ -20,7 +22,8 @@ if ARGV[2] == "until_executed" and redis.call("GET", KEYS[1]) then
   return 0
 end
 
-local last = tonumber(redis.call("GET", KEYS[2]) or "0")
+local previous = redis.call("GET", KEYS[2])
+local last = tonumber(previous or "0")
 if tonumber(ARGV[1]) <= last then
   return 0
 end
@@ -33,4 +36,4 @@ redis.call("SET", KEYS[2], ARGV[1])
 if ARGV[2] == "until_executed" then
   redis.call("SET", KEYS[1], ARGV[4], "EX", ARGV[5])
 end
-return 1
+return {1, previous or ""}

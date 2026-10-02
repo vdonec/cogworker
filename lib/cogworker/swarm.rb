@@ -69,6 +69,7 @@ module Cogworker
         # indefinitely, so this OS process would never actually go away —
         # and `Swarm#initiate_restart`'s own `Process.waitpid(pid)` for this
         # exact child would then block forever right along with it.
+        Cogworker.flush_output!
         ::Process.exit!(true)
       end
       @children[pid] = slot

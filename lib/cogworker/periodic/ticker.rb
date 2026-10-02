@@ -17,6 +17,25 @@ module Cogworker
 
       CLAIM_SCRIPT = File.read(File.join(__dir__, 'claim.lua'))
 
+      # Undoes a won claim whose push then failed, so the slot isn't lost:
+      # puts `last_slot` back (only if it still is this slot — a later slot
+      # may have been claimed since) and drops the per-slot NX lock.
+      # KEYS[1] = last_slot, KEYS[2] = slot lock; ARGV[1] = slot, ARGV[2] =
+      # previous last_slot ("" if none: then slot - 1, which still lets this
+      # slot fire, unlike deleting the key — with catch_up off, a missing
+      # last_slot would be re-primed to this very slot instead).
+      ROLLBACK_SCRIPT = <<~LUA
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+          if ARGV[2] == "" then
+            redis.call("SET", KEYS[1], tostring(tonumber(ARGV[1]) - 1))
+          else
+            redis.call("SET", KEYS[1], ARGV[2])
+          end
+        end
+        redis.call("DEL", KEYS[2])
+        return 1
+      LUA
+
       def initialize(manager, entries, catch_up: true)
         @manager = manager
         @entries = entries
@@ -57,8 +76,9 @@ module Cogworker
 
       # A failed tick is logged and retried next interval rather than ending
       # the thread — a single Redis blip used to silently stop every
-      # periodic entry in this process for good. A slot whose claim raised
-      # isn't recorded in `@last_checked_slot`, so the next tick retries it.
+      # periodic entry in this process for good. A slot whose claim or push
+      # raised isn't recorded in `@last_checked_slot` (and a failed push
+      # rolls its claim back — see #enqueue), so the next tick retries it.
       def run
         until @manager.stopping?
           begin
@@ -77,13 +97,14 @@ module Cogworker
           next if @last_checked_slot[entry.pjid] == slot
 
           jid = SecureRandom.hex(12)
-          enqueue(entry, slot, jid) if !disabled?(entry) && claim?(entry, slot, jid)
+          previous = claim(entry, slot, jid) unless disabled?(entry)
+          enqueue(entry, slot, jid, previous) if previous
           @last_checked_slot[entry.pjid] = slot
         end
       end
 
       # Web UI "Disable" (`Routes::Schedules`) — skips the claim/enqueue
-      # step entirely, short-circuiting before `claim?` even runs, so
+      # step entirely, short-circuiting before `claim` even runs, so
       # neither `periodic:last_slot:<pjid>` nor the per-slot lock advance
       # while disabled: the Web UI's own "LastRun" column keeps showing the
       # last time it *actually* ran, not a due-but-skipped slot, and
@@ -93,6 +114,15 @@ module Cogworker
       # persisted last_slot) still advances either way, exactly as it
       # already did before this entry ever had a disabled state — it only
       # stops this same tick loop from re-evaluating the same slot twice.
+      def rollback_claim(entry, slot, previous_slot)
+        Cogworker.config.redis do |c|
+          keys = [RedisKeys.periodic_last_slot(entry.pjid), RedisKeys.periodic_lock(entry.pjid, slot)]
+          c.eval(ROLLBACK_SCRIPT, keys: keys, argv: [slot, previous_slot])
+        end
+      rescue StandardError => e
+        Cogworker.logger.error { "periodic #{entry.pjid}: couldn't roll back slot #{slot}: #{e.class}: #{e.message}" }
+      end
+
       def disabled?(entry)
         Cogworker.config.redis { |c| c.sismember(RedisKeys::PERIODIC_DISABLED, entry.pjid) }
       end
@@ -101,8 +131,10 @@ module Cogworker
         @cron_cache[entry.pjid] ||= Fugit::Cron.parse(entry.cron)
       end
 
-      def claim?(entry, slot, jid)
-        return false if !@catch_up && priming_first_slot?(entry, slot)
+      # nil if this process didn't win the slot; otherwise the previous
+      # `last_slot` value ("" if none), for #rollback_claim.
+      def claim(entry, slot, jid)
+        return nil if !@catch_up && priming_first_slot?(entry, slot)
 
         result = Cogworker.config.redis do |c|
           c.eval(CLAIM_SCRIPT,
@@ -110,7 +142,7 @@ module Cogworker
                         RedisKeys.periodic_lock(entry.pjid, slot)],
                  argv: [slot, entry.unique.to_s, LOCK_TTL, jid, RunningLock.queued_ttl])
         end
-        result == 1
+        result.is_a?(Array) ? result[1].to_s : nil
       end
 
       # With catch-up disabled, an entry's very first tick — ever, across
@@ -140,15 +172,19 @@ module Cogworker
       # Only undone here if the push didn't actually produce a job (raised,
       # or a client middleware swallowed it), so a job that never existed
       # can't hold the entry for the whole `RunningLock.queued_ttl`.
-      def enqueue(entry, slot, jid)
+      def enqueue(entry, slot, jid, previous_slot)
         job = {
           'class' => entry.class_name, 'args' => entry.args, 'retry' => entry.retry,
           'periodic_pjid' => entry.pjid, 'periodic_slot' => slot, 'jid' => jid
         }
+        # Lets a requeue after a crash/shutdown re-take this run's lock
+        # (Periodic::RunningLock::RETAKE_FUNCTION, in both fetches' requeue scripts).
+        job['periodic_until_executed'] = true if entry.until_executed?
         pushed = begin
           Client.push(job)
         rescue StandardError
           RunningLock.release(entry.pjid, jid) if entry.until_executed?
+          rollback_claim(entry, slot, previous_slot)
           raise
         end
         return unless entry.until_executed?

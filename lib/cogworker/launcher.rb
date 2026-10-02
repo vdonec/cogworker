@@ -23,7 +23,8 @@ module Cogworker
       Cogworker.reset_identity!
       install_signal_traps
       resolve_periodic_classes
-      @heartbeat.start! # first: see Heartbeat#start!
+      return unless start_heartbeat
+
       @manager.start!
       @scheduled.start!
       @ticker.start!
@@ -43,6 +44,23 @@ module Cogworker
     end
 
     private
+
+    # First, and blocking until it succeeds: see Heartbeat#start!. A stop
+    # signal arriving while Redis is still unreachable ends the wait (and
+    # the process) without ever starting anything; a quiet one is applied
+    # and the wait goes on.
+    def start_heartbeat
+      until @heartbeat.start!(abort_if: -> { !@signal_queue.empty? })
+        case @signal_queue.pop
+        when :stop
+          Cogworker.logger.info { 'Received stop signal before startup completed' }
+          stop!
+          return false
+        when :quiet then quiet!
+        end
+      end
+      true
+    end
 
     # Resolves every periodic entry's class here, on the main thread, before
     # any processor thread exists. `Processor#build_worker` otherwise does

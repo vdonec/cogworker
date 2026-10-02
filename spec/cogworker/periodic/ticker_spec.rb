@@ -20,6 +20,7 @@ RSpec.describe Cogworker::Periodic::Ticker do
     expect(job['class']).to eq('TickerJob')
     expect(job['args']).to eq([{ 'a' => 1 }])
     expect(job['periodic_pjid']).to eq(entry.pjid)
+    expect(job['periodic_until_executed']).to be(true)
     expect(Cogworker.config.redis { |c| c.get("periodic:running:#{entry.pjid}") }).to eq(job['jid'])
   end
 
@@ -75,6 +76,36 @@ RSpec.describe Cogworker::Periodic::Ticker do
     described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
 
     expect(log.string).to include("changed the job's jid")
+  end
+
+  it 'does not lose the slot when the push fails after a won claim — the next tick fires it' do
+    ticker = described_class.new(double(stopping?: false, quiet?: false), [entry])
+    calls = 0
+    allow(Cogworker::Client).to receive(:push).and_wrap_original do |original, *args|
+      (calls += 1) == 1 ? raise(Redis::CannotConnectError, 'blip') : original.call(*args)
+    end
+
+    expect { ticker.send(:tick) }.to raise_error(Redis::CannotConnectError)
+    expect(Cogworker.config.redis { |c| c.get("periodic:running:#{entry.pjid}") }).to be_nil
+    ticker.send(:tick)
+
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+  end
+
+  it 'rolls a failed slot back to the previous last_slot, not past a later slot someone else claimed since' do
+    Cogworker.config.redis { |c| c.set("periodic:last_slot:#{entry.pjid}", 100) }
+    ticker = described_class.new(double(stopping?: false, quiet?: false), [entry])
+
+    ticker.send(:rollback_claim, entry, 200, '100')
+    expect(Cogworker.config.redis { |c| c.get("periodic:last_slot:#{entry.pjid}") }).to eq('100')
+
+    Cogworker.config.redis { |c| c.set("periodic:last_slot:#{entry.pjid}", 200) }
+    ticker.send(:rollback_claim, entry, 200, '')
+    expect(Cogworker.config.redis { |c| c.get("periodic:last_slot:#{entry.pjid}") }).to eq('199')
+
+    Cogworker.config.redis { |c| c.set("periodic:last_slot:#{entry.pjid}", 300) }
+    ticker.send(:rollback_claim, entry, 200, '100')
+    expect(Cogworker.config.redis { |c| c.get("periodic:last_slot:#{entry.pjid}") }).to eq('300')
   end
 
   it "skips claim/enqueue entirely for a disabled entry (Routes::Schedules' own \"Disable\") — no job, " \

@@ -64,37 +64,42 @@ module Cogworker
     # `queue` may be nil).
     def requeueable(raw)
       job = JSON.parse(raw)
-      job.is_a?(Hash) && job['queue'].is_a?(String) ? job : nil
+      job.is_a?(Hash) && job['queue'].is_a?(String) && !job['queue'].empty? ? job : nil
     rescue JSON::ParserError, TypeError
       nil
     end
 
-    # Validate, then claim, then requeue — in that order, so an entry that
-    # can't be requeued is never `zrem`'d and lost (it stays where it is for
-    # the caller to deal with). Returns `:requeued`, `:gone` (someone else
-    # won the `zrem` first) or `:invalid`. The one implementation behind
-    # `Scheduled#graduate` and every Web UI retry action.
+    # KEYS[1] = the ZSET, KEYS[2] = cogworker:queues, KEYS[3] = the queue;
+    # ARGV[1] = the entry as stored, ARGV[2] = queue name, ARGV[3] = the
+    # payload to push. Claim and push in one atomic step: as separate
+    # commands, a crash or dropped connection between the ZREM and the
+    # LPUSH lost the job. The new payload is built in Ruby, not re-encoded
+    # by Lua's cjson (which would round large integers in args).
+    CLAIM_AND_REQUEUE_SCRIPT = <<~LUA
+      if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then
+        return 0
+      end
+      redis.call("SADD", KEYS[2], ARGV[2])
+      redis.call("LPUSH", KEYS[3], ARGV[3])
+      return 1
+    LUA
+
+    # Validate, then (atomically) claim and requeue — an entry that can't be
+    # requeued is never removed and lost (it stays where it is for the
+    # caller to deal with). Returns `:requeued`, `:gone` (someone else
+    # claimed it first) or `:invalid`. The one implementation behind
+    # `Scheduled#graduate` and every Web UI retry action. Re-stamps
+    # `enqueued_at`: queue latency is measured from it, and a retried job
+    # still carried its original push time (a scheduled one, none at all).
     def claim_and_requeue(conn, set, raw)
       job = requeueable(raw)
       return :invalid unless job
-      return :gone unless conn.zrem(set, raw)
 
-      requeue(conn, job)
-      :requeued
-    end
-
-    # Puts a job taken off `cogworker:schedule`/`retry`/`dead` (the caller
-    # has already won its `zrem`) back onto its queue — the one shared
-    # implementation behind `Scheduled#graduate` and the Web UI's retry
-    # actions. Re-stamps `enqueued_at`: queue latency is measured from it,
-    # and a retried job still carried its original push time (a scheduled
-    # one, none at all), inflating the queue's latency by its whole history.
-    def requeue(conn, job)
       job['enqueued_at'] = Time.now.to_f
-      conn.multi do |tx|
-        tx.sadd?(RedisKeys::QUEUES, job['queue'])
-        tx.lpush(RedisKeys.queue(job['queue']), JSON.generate(job))
-      end
+      won = conn.eval(CLAIM_AND_REQUEUE_SCRIPT,
+                      keys: [set, RedisKeys::QUEUES, RedisKeys.queue(job['queue'])],
+                      argv: [raw, job['queue'], JSON.generate(job)])
+      won == 1 ? :requeued : :gone
     end
 
     UNPARSEABLE_CLASS = '(unparseable)'

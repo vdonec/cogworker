@@ -225,7 +225,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
 
   describe 'acknowledging a finished job' do
     let(:processor) { Cogworker::Processor.new(Cogworker::Manager.new) }
-    let(:fetcher) { processor.instance_variable_get(:@fetcher) }
+    let(:fetcher) { processor.send(:fetcher) }
     let(:work) { Cogworker::BasicFetch::UnitOfWork.new('default', JSON.generate('jid' => 'ackjid')) }
     let(:log) { StringIO.new }
 
@@ -241,7 +241,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
       processor.send(:acknowledge, work)
 
       expect(calls).to eq(3)
-      expect(log.string).to be_empty
+      expect(log.string).not_to include("couldn't acknowledge")
     end
 
     it 'logs the jid when every attempt fails, without raising' do
@@ -250,5 +250,22 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
       expect { processor.send(:acknowledge, work) }.not_to raise_error
       expect(log.string).to include("couldn't acknowledge finished job jid=ackjid after 3 attempts")
     end
+  end
+
+  it 'hands a job back to its queue, rather than acknowledging it away, when bookkeeping around it fails' do
+    stub_const('BookkeepingJob', Class.new { include Cogworker::Worker })
+    BookkeepingJob.define_method(:perform) { raise 'boom' }
+    jid = BookkeepingJob.perform_async
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+
+    manager = Cogworker::Manager.new
+    processor = Cogworker::Processor.new(manager)
+    allow(processor).to receive(:route_failure).and_raise(Redis::CannotConnectError, 'zadd failed')
+
+    expect { processor.send(:process_one) }.to raise_error(Redis::CannotConnectError)
+
+    expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') + c.zcard('cogworker:dead') }).to eq(0)
+    expect(queued_jobs.map { |j| j['jid'] }).to eq([jid])
+    expect(Cogworker.config.redis { |c| c.llen("cogworker:inprogress:#{Cogworker.identity}") }).to eq(0)
   end
 end

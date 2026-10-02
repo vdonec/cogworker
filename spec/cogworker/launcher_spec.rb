@@ -8,7 +8,8 @@ RSpec.describe Cogworker::Launcher do
 
   it 'resolves periodic job classes before starting any processor thread' do
     manager = launcher.instance_variable_get(:@manager)
-    %i[@scheduled @heartbeat @ticker].each { |ivar| allow(launcher.instance_variable_get(ivar)).to receive(:start!) }
+    %i[@scheduled @ticker].each { |ivar| allow(launcher.instance_variable_get(ivar)).to receive(:start!) }
+    allow(launcher.instance_variable_get(:@heartbeat)).to receive(:start!).and_return(true)
     allow(launcher).to receive(:install_signal_traps)
     allow(launcher).to receive(:watch_signals)
 
@@ -36,5 +37,18 @@ RSpec.describe Cogworker::Launcher do
 
     expect(resolved).to eq([['LauncherSpecPeriodicJob', Thread.current], ['NoSuchPeriodicJob', Thread.current]])
     expect(log.string).to include("periodic job class NoSuchPeriodicJob can't be resolved")
+  end
+
+  it 'never starts the Manager while the first heartbeat cannot be written, and still honors a stop signal' do
+    heartbeat = launcher.instance_variable_get(:@heartbeat)
+    manager = launcher.instance_variable_get(:@manager)
+    allow(heartbeat).to receive(:beat).and_raise(Redis::CannotConnectError, 'down')
+    allow(heartbeat).to receive(:sleep) { launcher.instance_variable_get(:@signal_queue) << :stop }
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    allow(launcher).to receive(:install_signal_traps)
+    expect(manager).not_to receive(:start!)
+    expect(launcher).to receive(:stop!)
+
+    launcher.run
   end
 end

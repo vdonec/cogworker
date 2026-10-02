@@ -55,6 +55,12 @@ RSpec.describe 'Cogworker::Heartbeat remote stop (end-to-end, real OS process)' 
       expect(identity).not_to be_nil, 'child process never published its heartbeat presence'
       expect(child_exited?).to be(false)
 
+      # Pub/sub doesn't queue messages: published before the child's
+      # SUBSCRIBE is live (its first beat, which makes it show up above,
+      # happens before the subscriber thread even starts), 'stop' would
+      # just be dropped.
+      channel = "cogworker:signal:#{identity}"
+      wait_for(timeout: 8) { Cogworker.config.redis { |c| c.pubsub(:numsub, channel) }.last.to_i == 1 }
       Cogworker::ProcessSet.new.find { |p| p.identity == identity }.stop!
 
       wait_for(timeout: 8) { child_exited? } # raises if it never exits — that's the actual assertion here
@@ -125,5 +131,32 @@ RSpec.describe Cogworker::Heartbeat do
     described_class.new(manager).send(:beat)
 
     expect(Cogworker.config.redis { |c| c.ttl(key) }).to be > 5
+  end
+
+  describe 'start! with Redis unreachable' do
+    subject(:heartbeat) { described_class.new(manager) }
+
+    before do
+      allow(heartbeat).to receive(:sleep)
+      allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    end
+
+    after { heartbeat.stop! }
+
+    it 'keeps retrying the first beat, and only starts its threads once one succeeds' do
+      calls = 0
+      allow(heartbeat).to receive(:beat) { raise Redis::CannotConnectError, 'down' if (calls += 1) < 3 }
+
+      expect(heartbeat.start!).to be(true)
+      expect(calls).to eq(3)
+      expect(heartbeat.instance_variable_get(:@beat_thread)).to be_alive
+    end
+
+    it 'gives up, starting nothing, as soon as abort_if says so' do
+      allow(heartbeat).to receive(:beat).and_raise(Redis::CannotConnectError, 'down')
+
+      expect(heartbeat.start!(abort_if: -> { true })).to be(false)
+      expect(heartbeat.instance_variable_get(:@beat_thread)).to be_nil
+    end
   end
 end

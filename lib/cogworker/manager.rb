@@ -4,11 +4,9 @@ module Cogworker
   # Owns the `concurrency`-sized thread pool of Processors for one OS
   # process, and the quiet/stop state they all poll.
   class Manager
-    attr_reader :fetch_class
-
     def initialize(config = Cogworker.config)
       @config = config
-      @fetch_class = resolve_fetch_class
+      @fetch_mutex = Mutex.new
       @processors = Array.new(config.concurrency) { Processor.new(self) }
       @quiet = false
       @stopping = false
@@ -18,6 +16,31 @@ module Cogworker
 
     def queues
       @config.queues
+    end
+
+    # Resolved on first use — from a processor thread's first fetch, after
+    # the Heartbeat's first beat proved Redis reachable — not in the
+    # constructor: that needed Redis just to build a Manager, and when
+    # Redis was unreachable at that moment, the version check couldn't run
+    # at all (see ReliableFetch.supported?).
+    def fetch_class
+      @fetch_mutex.synchronize { @fetch_class ||= resolve_fetch_class }
+    end
+
+    # The server turned out not to support ReliableFetch after all
+    # (ReliableFetch::UnsupportedError on a real fetch): every processor
+    # switches to BasicFetch from its next fetch on. Safe, since no job can
+    # be on the in-progress list — no LMOVE ever succeeded.
+    def fall_back_to_basic_fetch!(error)
+      @fetch_mutex.synchronize do
+        next if @fetch_class == BasicFetch
+
+        Cogworker.logger.warn do
+          "config.fetch = :reliable isn't supported by this Redis (#{error.message[0, 120]}); " \
+            'falling back to :basic (a job is lost if its process dies mid-job)'
+        end
+        @fetch_class = BasicFetch
+      end
     end
 
     def start!
@@ -87,7 +110,7 @@ module Cogworker
     end
 
     def requeue_unfinished
-      moved = @fetch_class.requeue_in_progress(Cogworker.identity)
+      moved = fetch_class.requeue_in_progress(Cogworker.identity)
       Cogworker.logger.warn { "requeued #{moved} job(s) unfinished at shutdown" } if moved.positive?
     rescue StandardError => e
       Cogworker.logger.error { "Requeueing unfinished jobs failed: #{e.class}: #{e.message}" }

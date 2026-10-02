@@ -1303,24 +1303,57 @@ RSpec.describe Cogworker::Web do
     it 'Dead-retry/retry-now on an entry with no queue of its own leaves it in place instead of losing it ' \
        '(regression: zrem ran first, then the requeue raised on the nil queue)' do
       buried = JSON.generate(Cogworker::JobUtil.unparseable_job('{not json', queue: nil,
-                                                                 error: JSON::ParserError.new('x')))
+                                                                             error: JSON::ParserError.new('x')))
       queueless = JSON.generate('jid' => 'noqueue', 'class' => 'X', 'args' => [])
       Cogworker.config.redis do |c|
         c.zadd('cogworker:dead', Time.now.to_f, buried)
         c.zadd('cogworker:retry', Time.now.to_f + 60, queueless)
       end
 
-      expect(hx_post('/jobs/dead/retry', 'raw' => buried).status).to eq(200)
-      expect(hx_post('/jobs/retrying/retry_now', 'raw' => queueless).status).to eq(200)
+      dead_resp = hx_post('/jobs/dead/retry', 'raw' => buried)
+      retry_resp = hx_post('/jobs/retrying/retry_now', 'raw' => queueless)
+      expect([dead_resp.status, retry_resp.status]).to eq([200, 200])
+      expect(dead_resp.body).to include('be put back on a queue')
+      expect(retry_resp.body).to include('be put back on a queue')
 
       expect(Cogworker.config.redis { |c| c.zrange('cogworker:dead', 0, -1) }).to eq([buried])
       expect(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, -1) }).to eq([queueless])
       expect(queued_jobs).to be_empty
     end
 
+    it 'without JS, an un-requeueable retry redirects back with a one-off notice the poll URL leaves out' do
+      queueless = JSON.generate('jid' => 'noqueue2', 'class' => 'X', 'args' => [])
+      Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, queueless) }
+
+      resp = mock.post('/jobs/dead/retry', params: { 'raw' => queueless, 'status' => 'Dead' },
+                                           'HTTP_SEC_FETCH_SITE' => 'same-origin')
+      expect(resp.status).to eq(302)
+      expect(resp.headers['location']).to end_with('/jobs?status=Dead&notice=not_requeueable')
+
+      page = mock.get('/jobs?status=Dead&notice=not_requeueable').body
+      expect(page).to include('be put back on a queue')
+      expect(page).to include('hx-get="/jobs?status=Dead"')
+    end
+
+    it 'shows a corrupt Retrying/Dead entry as an (unparseable) row — Delete only — instead of failing the tab' do
+      Cogworker.config.redis do |c|
+        c.zadd('cogworker:retry', Time.now.to_f + 3600, '{not json')
+        c.zadd('cogworker:dead', Time.now.to_f, '[1, 2]')
+      end
+
+      body = mock.get('/jobs').body
+
+      expect(body.scan('(unparseable)').size).to be >= 2
+      expect(body).not_to include('jobs/retrying/retry_now')
+      expect(body).not_to include('jobs/dead/retry"')
+      expect(hx_post('/jobs/retrying/delete', 'raw' => '{not json').status).to eq(200)
+      expect(hx_post('/jobs/dead/delete', 'raw' => '[1, 2]').status).to eq(200)
+      expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') + c.zcard('cogworker:dead') }).to eq(0)
+    end
+
     it 'offers only Delete, not Retry, for an unparseable Dead entry' do
       buried = JSON.generate(Cogworker::JobUtil.unparseable_job('{not json', queue: 'default',
-                                                                 error: JSON::ParserError.new('x')))
+                                                                             error: JSON::ParserError.new('x')))
       Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, buried) }
 
       body = Rack::MockRequest.new(Cogworker::Web).get('/jobs?status=Dead').body

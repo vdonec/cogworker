@@ -135,13 +135,27 @@ off their queues:
 - `:reliable` (default, needs Redis >= 6.2): a job is moved atomically onto
   the process's own in-progress list and stays there until it has finished.
   If the process dies mid-job (OOM, `SIGKILL`, a lost host), the job is put
-  back on its queue by another live process once the dead one's heartbeat
-  has expired, within about two minutes. Queues are polled rather than
-  blocked on, so an idle worker picks up a new job within 0.25 s.
+  back on its queue by another live process once the dead one has gone
+  `config.orphan_threshold` without a heartbeat (default 5 minutes, then up
+  to a minute until the next check). The threshold is deliberately well
+  above the heartbeat's own 60 s expiry: a process that is alive but
+  couldn't reach Redis for a while (an outage, a failover) mustn't have its
+  running jobs started a second time elsewhere. Lower it if crashed
+  processes' jobs must come back sooner; raise it if Redis blips longer
+  than that are expected. Queues are polled rather than
+  blocked on: while they stay empty, each worker thread waits 0.25 s, then
+  0.5 s, … up to `config.fetch_idle_max_interval` (default 1 s) between
+  polls, and goes back to 0.25 s as soon as it finds a job. That cap is the
+  longest an idle worker takes to notice a new job; lower it (e.g. `0.25`)
+  if that matters more than how often idle workers poll Redis.
 - `:basic`: a single blocking `BRPOP` across all queues, as in earlier
   versions. A job popped by a process that then dies is lost.
 
-On Redis older than 6.2, `:reliable` falls back to `:basic` with a warning.
+On Redis older than 6.2, `:reliable` falls back to `:basic` with a warning —
+checked when workers start, and again on the first fetch if the server turns
+out not to support it after all. A worker doesn't start taking jobs until it
+has registered itself in Redis, so with Redis unreachable at boot it waits
+(and still stops on `TERM`).
 Either way delivery is *at least once*: a job that was partly done when its
 process died or was stopped runs again from the start, so make jobs safe to
 repeat.
@@ -362,7 +376,10 @@ Unsafe methods (POST etc.) are accepted only with
 callback), override `Cogworker::Web.safe_request?(env)`.
 
 The Web UI's session cookie (used only by middleware you add with `.use`) is
-signed with a random per-process secret by default. When running several
+skipped automatically when the app mounting the Web UI already has a session
+(the middleware then reads and writes the app's own session), and can be
+turned off with `Cogworker::Web.builtin_session = false`. It is signed with a
+random per-process secret by default. When running several
 web processes (e.g. Puma workers), set the same secret for all of them —
 `Cogworker::Web.session_secret = '...'` (at least 64 characters) or the
 `COGWORKER_SESSION_SECRET` environment variable.

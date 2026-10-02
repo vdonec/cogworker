@@ -13,9 +13,27 @@ module Cogworker
     POLL_INTERVAL = 5
     # How often this poller also looks for jobs left in progress by a dead
     # process (ReliableFetch.recover_orphans) — the first time right away,
-    # at boot. Every live process does it; the requeue is atomic, so any
-    # number of them doing it at once is safe.
+    # at boot. Every live process does it, whatever its own fetch mode: in
+    # a mixed fleet, or after a runtime fall-back to `:basic`, the lists of
+    # crashed reliable processes still need someone to requeue them, and
+    # with nothing registered it's a single SMEMBERS. Only the one-off
+    # keyspace SCAN (for lists from before IN_PROGRESS_IDENTITIES existed)
+    # is limited to processes actually using ReliableFetch. The requeue is
+    # atomic, so any number of processes doing it at once is safe.
     ORPHAN_CHECK_INTERVAL = 60
+
+    # KEYS[1] = the ZSET, KEYS[2] = cogworker:dead, KEYS[3] = stats:failed;
+    # ARGV[1] = the entry, ARGV[2] = its dead-set score, ARGV[3] = the
+    # wrapper to store. Same claim-and-move-atomically shape as
+    # JobUtil::CLAIM_AND_REQUEUE_SCRIPT.
+    BURY_SCRIPT = <<~LUA
+      if redis.call("ZREM", KEYS[1], ARGV[1]) == 0 then
+        return 0
+      end
+      redis.call("ZADD", KEYS[2], ARGV[2], ARGV[3])
+      redis.call("INCR", KEYS[3])
+      return 1
+    LUA
 
     def initialize(manager)
       @manager = manager
@@ -58,8 +76,9 @@ module Cogworker
       now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
       return if @next_orphan_check && now < @next_orphan_check
 
+      scan = @next_orphan_check.nil? && @manager.fetch_class == ReliableFetch
       @next_orphan_check = now + ORPHAN_CHECK_INTERVAL
-      ReliableFetch.recover_orphans
+      ReliableFetch.recover_orphans(scan: scan)
     end
 
     def enqueue_due_jobs
@@ -78,16 +97,18 @@ module Cogworker
       Cogworker.config.redis do |c|
         next unless JobUtil.claim_and_requeue(c, set, raw) == :invalid
 
-        bury(c, set, raw) if c.zrem(set, raw)
+        bury(c, set, raw)
       end
     end
 
     def bury(conn, set, raw)
       error = JSON::ParserError.new("not a job (JSON object with a queue) in #{set}")
       job = JobUtil.unparseable_job(raw, queue: nil, error: error)
-      conn.zadd(RedisKeys::DEAD, job['failed_at'], JSON.generate(job))
-      conn.incr(RedisKeys::STATS_FAILED) # counted like Processor#bury_unparseable
-      Throughput.record('failed')
+      buried = conn.eval(BURY_SCRIPT, keys: [set, RedisKeys::DEAD, RedisKeys::STATS_FAILED],
+                                      argv: [raw, job['failed_at'], JSON.generate(job)])
+      return unless buried == 1
+
+      Throughput.record('failed') # counted like Processor#bury_unparseable
       Cogworker.logger.error { "unparseable entry in #{set} moved to dead: #{raw.to_s[0, 200]}" }
     end
   end

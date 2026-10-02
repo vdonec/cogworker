@@ -16,7 +16,6 @@ module Cogworker
       @manager = manager
       @busy = false
       @tid = SecureRandom.hex(6)
-      @fetcher = manager.fetch_class.new(manager.queues)
     end
 
     def start!
@@ -54,23 +53,46 @@ module Cogworker
         return
       end
 
-      work = @fetcher.retrieve_work
+      work = begin
+        fetcher.retrieve_work
+      rescue ReliableFetch::UnsupportedError => e
+        @manager.fall_back_to_basic_fetch!(e)
+        @fetcher = nil
+        return
+      end
       return unless work
 
       # Fetched after shutdown began (e.g. still blocked in BRPOP when
       # `Manager#stop!` requeued unfinished work, which it then popped right
       # back): hand it back rather than start it, since the process is about
       # to exit underneath it.
-      return @fetcher.give_back(work) if @manager.stopping?
+      return fetcher.give_back(work) if @manager.stopping?
 
       @manager.processor_busy!
       @busy = true
+      finished = false
       begin
         execute(work)
+        finished = true
       ensure
         @busy = false
         @manager.processor_idle!
-        acknowledge(work)
+        finished ? acknowledge(work) : give_back(work)
+      end
+    end
+
+    # `execute` raising means bookkeeping failed (Redis, mid-way through
+    # registering the job or routing its failure to retry/dead) — not the
+    # job itself, whose own errors `execute` always handles. Acknowledging
+    # here would drop a job that never made it to retry/dead; instead it
+    # goes straight back on its queue (it may run again: at-least-once). If
+    # even that fails, it simply stays on the in-progress list, which
+    # `Manager#stop!`/orphan recovery requeue later.
+    def give_back(work)
+      fetcher.give_back(work)
+    rescue StandardError => e
+      Cogworker.logger.error do
+        "couldn't hand back jid=#{jid_of(work)} after a failed run (left in progress): #{e.class}: #{e.message}"
       end
     end
 
@@ -82,7 +104,7 @@ module Cogworker
       attempts = 0
       begin
         attempts += 1
-        @fetcher.acknowledge(work)
+        fetcher.acknowledge(work)
       rescue StandardError => e
         if attempts < ACK_ATTEMPTS
           sleep(0.1 * attempts)
@@ -172,6 +194,12 @@ module Cogworker
       end
       Throughput.record('failed')
       Cogworker.logger.error { "unparseable job on queue #{work.queue} moved to dead: #{error.message}" }
+    end
+
+    # Built on first use, not in the constructor (see Manager#fetch_class),
+    # and rebuilt after a fall-back to BasicFetch.
+    def fetcher
+      @fetcher ||= @manager.fetch_class.new(@manager.queues)
     end
 
     def build_worker(job)

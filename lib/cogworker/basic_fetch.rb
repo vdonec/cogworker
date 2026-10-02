@@ -62,7 +62,7 @@ module Cogworker
       Cogworker.config.redis do |c|
         c.hvals(RedisKeys.workers(identity)).count do |raw|
           entry = JSON.parse(raw)
-          c.rpush(RedisKeys.queue(entry.fetch('queue')), JSON.generate(entry.fetch('payload')))
+          requeue_entry(c, entry.fetch('queue'), entry.fetch('payload'))
           true
         rescue StandardError => e
           Cogworker.logger.error { "couldn't requeue in-flight entry #{raw.to_s[0, 200]}: #{e.class}: #{e.message}" }
@@ -70,6 +70,16 @@ module Cogworker
         end
       end
     end
+
+    def self.requeue_entry(conn, queue, job)
+      queue_key = RedisKeys.queue(queue)
+      retake = job['periodic_until_executed'] && job['periodic_pjid'] && job['jid']
+      lock_key = retake ? RedisKeys.periodic_running(job['periodic_pjid']) : queue_key
+      conn.eval(REQUEUE_ENTRY_SCRIPT, keys: [queue_key, lock_key],
+                                      argv: [JSON.generate(job), retake ? '1' : '0', job['jid'].to_s,
+                                             Periodic::RunningLock.queued_ttl])
+    end
+    private_class_method :requeue_entry
 
     private
 
@@ -81,5 +91,18 @@ module Cogworker
     end
 
     UnitOfWork = Struct.new(:queue, :raw_job)
+
+    # KEYS[1] = the queue, KEYS[2] = the job's periodic running lock (or the
+    # queue again when there's none to take); ARGV[1] = payload, ARGV[2] =
+    # "1" to re-take that lock, ARGV[3] = jid, ARGV[4] = lock TTL. Requeue
+    # and lock in one step: as two commands, a failure in between left the
+    # job queued without its lock (and miscounted).
+    REQUEUE_ENTRY_SCRIPT = Periodic::RunningLock::RETAKE_FUNCTION + <<~LUA
+      redis.call("RPUSH", KEYS[1], ARGV[1])
+      if ARGV[2] == "1" then
+        retake_running_lock(KEYS[2], ARGV[3], ARGV[4])
+      end
+      return 1
+    LUA
   end
 end

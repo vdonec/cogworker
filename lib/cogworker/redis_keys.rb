@@ -10,6 +10,13 @@ module Cogworker
   module RedisKeys
     QUEUE_PREFIX = 'cogworker:queue:'
     IN_PROGRESS_PREFIX = 'cogworker:inprogress:'
+    # Every identity that has (or may have) an in-progress list — what
+    # orphan recovery walks instead of SCANning the whole keyspace.
+    IN_PROGRESS_IDENTITIES = 'cogworker:inprogress_identities'
+    # identity => Redis server time (epoch seconds) of its last heartbeat.
+    # No TTL, unlike `process(identity)`: it's what tells "dead for a
+    # while" apart from "missed a few beats" (Config#orphan_threshold).
+    LAST_BEAT = 'cogworker:last_beat'
     QUEUES = 'cogworker:queues'
     SCHEDULE = 'cogworker:schedule'
     RETRY = 'cogworker:retry'

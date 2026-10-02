@@ -45,7 +45,7 @@ RSpec.describe Cogworker::Periodic::ReleaseMiddleware do
     expect(Cogworker.config.redis { |c| c.get(running_key('p3')) }).to be_nil
   end
 
-  it 'shortens the lock to ACTIVE_TTL while the run is in progress' do
+  it 'shortens the lock to active_ttl while the run is in progress' do
     Cogworker.config.redis { |c| c.set(running_key('p4'), 'jid4', ex: 86_400) }
     ttl_during_run = nil
 
@@ -53,7 +53,7 @@ RSpec.describe Cogworker::Periodic::ReleaseMiddleware do
       ttl_during_run = Cogworker.config.redis { |c| c.ttl(running_key('p4')) }
     end
 
-    expect(ttl_during_run).to be_between(1, Cogworker::Periodic::RunningLock::ACTIVE_TTL)
+    expect(ttl_during_run).to be_between(1, Cogworker::Periodic::RunningLock.active_ttl)
   end
 
   it "never releases or re-times a lock owned by a different jid (a newer run's)" do
@@ -63,7 +63,7 @@ RSpec.describe Cogworker::Periodic::ReleaseMiddleware do
 
     expect(Cogworker.config.redis { |c| c.get(running_key('p6')) }).to eq('newer')
     expect(Cogworker.config.redis { |c| c.ttl(running_key('p6')) })
-      .to be > Cogworker::Periodic::RunningLock::ACTIVE_TTL
+      .to be > Cogworker::Periodic::RunningLock.active_ttl
   end
 
   it 'still runs the job when shortening the lock fails (best-effort; the heartbeat shortens it later)' do

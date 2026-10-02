@@ -18,7 +18,7 @@ def wait_for(timeout: 5)
 end
 
 # A queue's jobs as parsed Hashes, minus the `enqueued_at` every requeue
-# (`JobUtil.requeue`) re-stamps — for asserting "this job is back on its
+# (`JobUtil.claim_and_requeue`) re-stamps — for asserting "this job is back on its
 # queue" without depending on the exact moment it got there.
 def queued_jobs(queue = 'default')
   Cogworker.config.redis { |c| c.lrange("cogworker:queue:#{queue}", 0, -1) }
@@ -35,5 +35,15 @@ RSpec.configure do |config|
     Cogworker.config.redis(&:flushdb)
     Cogworker::Testing.disable!
     Cogworker::Testing.clear_jobs!
+  end
+
+  # `:reliable_fetch` examples need LMOVE (Redis >= 6.2); `:old_redis` ones
+  # only make sense without it (CI also runs the suite against Redis 6.0).
+  # Declared after the hook above, so they ask the test Redis, not a default.
+  config.before(:each, :reliable_fetch) do
+    skip 'needs Redis >= 6.2 (LMOVE)' unless Cogworker::ReliableFetch.supported?
+  end
+  config.before(:each, :old_redis) do
+    skip 'only meaningful on Redis < 6.2' if Cogworker::ReliableFetch.supported?
   end
 end

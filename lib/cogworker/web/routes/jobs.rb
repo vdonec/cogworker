@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'cgi'
+require 'digest/sha1'
 require 'json'
 
 module Cogworker
@@ -63,33 +64,30 @@ module Cogworker
           app.post('/jobs/retrying/delete') do
             raw = params['raw']
             Cogworker.config.redis { |c| c.zrem(RedisKeys::RETRY, raw) }
-            Cogworker::Attempts.clear(JSON.parse(raw)['jid'])
+            Cogworker::Attempts.clear(Jobs.parse_entry(raw)['jid'])
             Jobs.respond(self, params)
           end
 
           # Same "graduate back onto its queue" move `/jobs/dead/retry` below/
-          # `Cogworker::Scheduled#graduate` make — `zrem` winning (not
-          # losing) gates it so two tabs retrying the same entry at once
-          # can't both requeue it; the `redis` gem's `#zrem` returns a
-          # **Boolean** for a single member, so this checks truthiness, not
-          # `== 1` (`true == 1` is `false` in Ruby).
+          # `Cogworker::Scheduled#graduate` make (`JobUtil.claim_and_requeue`:
+          # validate, then claim + push atomically) — two tabs retrying the
+          # same entry at once can't both requeue it, and an entry that
+          # can't be requeued is left in place with a notice.
           app.post('/jobs/retrying/retry_now') do
             raw = params['raw']
-            Cogworker.config.redis do |c|
-              JobUtil.claim_and_requeue(c, RedisKeys::RETRY, raw)
-            end
-            Jobs.respond(self, params)
+            result = Cogworker.config.redis { |c| JobUtil.claim_and_requeue(c, RedisKeys::RETRY, raw) }
+            Jobs.respond(self, params, notice: result == :invalid ? 'not_requeueable' : nil)
           end
 
           app.post('/jobs/dead/delete') do
             raw = params['raw']
             Cogworker.config.redis { |c| c.zrem(RedisKeys::DEAD, raw) }
-            Cogworker::Attempts.clear(JSON.parse(raw)['jid'])
+            Cogworker::Attempts.clear(Jobs.parse_entry(raw)['jid'])
             Jobs.respond(self, params)
           end
 
           app.post('/jobs/dead/delete_all') do
-            jids = Cogworker.config.redis { |c| c.zrange(RedisKeys::DEAD, 0, -1) }.map { |raw| JSON.parse(raw)['jid'] }
+            jids = Cogworker.config.redis { |c| c.zrange(RedisKeys::DEAD, 0, -1) }.map { |raw| Jobs.parse_entry(raw)['jid'] }
             Cogworker.config.redis { |c| c.del(RedisKeys::DEAD) }
             jids.each { |jid| Cogworker::Attempts.clear(jid) }
             Jobs.respond(self, params)
@@ -97,10 +95,8 @@ module Cogworker
 
           app.post('/jobs/dead/retry') do
             raw = params['raw']
-            Cogworker.config.redis do |c|
-              JobUtil.claim_and_requeue(c, RedisKeys::DEAD, raw)
-            end
-            Jobs.respond(self, params)
+            result = Cogworker.config.redis { |c| JobUtil.claim_and_requeue(c, RedisKeys::DEAD, raw) }
+            Jobs.respond(self, params, notice: result == :invalid ? 'not_requeueable' : nil)
           end
 
           # Moves this one entry's score on its own ZSET — "run sooner" or
@@ -144,11 +140,16 @@ module Cogworker
         # #jobs-content in place, keeping the same filter/search/selection;
         # a plain form submission (no JS) falls back to a normal redirect
         # to that same URL.
-        def respond(action, params)
+        # `notice:` is a key into NOTICES (never free text — it's echoed into
+        # the page). It shows once: the redirect carries it as `?notice=`,
+        # but `query_string` (and so every poll URL) leaves it out.
+        def respond(action, params, notice: nil)
           if action.hx_request?
-            render_content(action.request.script_name, params)
+            render_content(action.request.script_name, params.merge('notice' => notice))
           else
-            action.redirect(Layout.path(action.request.script_name, "jobs#{query_string(params)}"))
+            location = "jobs#{query_string(params)}"
+            location += "#{location.include?('?') ? '&' : '?'}notice=#{CGI.escape(notice)}" if notice
+            action.redirect(Layout.path(action.request.script_name, location))
           end
         end
 
@@ -163,6 +164,19 @@ module Cogworker
           parts.empty? ? '' : "?#{parts.join('&')}"
         end
 
+        NOTICES = {
+          'not_requeueable' => "This entry can't be put back on a queue — it's unreadable or has no queue " \
+                               'of its own. Delete it instead.'
+        }.freeze
+
+        def notice_banner(params)
+          text = NOTICES[params['notice'].to_s]
+          return '' unless text
+
+          style = 'padding: 10px 14px; border-left: 3px solid var(--color-danger);'
+          %(<div class="card" role="status" style="#{style}">#{Layout.h(text)}</div>)
+        end
+
         def render_content(script_name, params)
           status = STATUSES.include?(params['status']) ? params['status'] : 'All'
           query = params['q'].to_s
@@ -175,6 +189,7 @@ module Cogworker
 
           <<~HTML
             <div style="display: flex; flex-direction: column; gap: 16px;">
+              #{notice_banner(params)}
               #{page_header(script_name, status, query, filtered.size, rows.size)}
               <div style="display: grid; grid-template-columns: minmax(0, 1fr) #{selected ? 'minmax(320px, 400px)' : '0px'}; gap: 16px; align-items: start;">
                 #{jobs_table(filtered, script_name, params)}
@@ -259,8 +274,10 @@ module Cogworker
         # No Retry for an entry that can't go back on a queue (no queue of
         # its own) or that would only fail straight back into Dead (an
         # unparseable payload's wrapper) — Delete is all that makes sense.
+        # From the row's already-parsed fields — this runs for every row on
+        # every poll, so no re-parsing `raw` here.
         def requeueable?(row)
-          row[:klass] != JobUtil::UNPARSEABLE_CLASS && !JobUtil.requeueable(row[:raw].to_s).nil?
+          row[:klass] != JobUtil::UNPARSEABLE_CLASS && row[:queue].is_a?(String) && !row[:queue].empty?
         end
 
         def delete_button(bucket, script_name, row, params, extra: {})
@@ -430,10 +447,28 @@ module Cogworker
           end
         end
 
+        # A ZSET entry that isn't a job Hash (corrupt, or written by
+        # something else) shows up as an `(unparseable)` row — Delete is
+        # offered, Retry isn't (`requeueable?`) — instead of a JSON::ParserError
+        # taking the whole tab down.
+        def parse_entry(raw)
+          job = JSON.parse(raw)
+          return job if job.is_a?(Hash)
+
+          unparseable_entry(raw)
+        rescue JSON::ParserError
+          unparseable_entry(raw)
+        end
+
+        def unparseable_entry(raw)
+          { 'class' => JobUtil::UNPARSEABLE_CLASS, 'jid' => "unparseable-#{Digest::SHA1.hexdigest(raw.to_s)[0, 12]}",
+            'args' => [], 'error_message' => raw.to_s[0, 200] }
+        end
+
         def scheduled_rows
           entries = Cogworker.config.redis { |c| c.zrange(RedisKeys::SCHEDULE, 0, -1, withscores: true) }
           entries.map do |raw, score|
-            job = JSON.parse(raw)
+            job = parse_entry(raw)
             { jid: job['jid'], klass: job['class'], queue: job['queue'], status: 'Scheduled', attempt: '—',
               next_action: score, at: job['created_at'], args: job['args'], error_class: nil, error_message: nil,
               raw: raw, source: :scheduled }
@@ -443,7 +478,7 @@ module Cogworker
         def retrying_rows
           entries = Cogworker.config.redis { |c| c.zrange(RedisKeys::RETRY, 0, -1, withscores: true) }
           entries.map do |raw, score|
-            job = JSON.parse(raw)
+            job = parse_entry(raw)
             { jid: job['jid'], klass: job['class'], queue: job['queue'], status: 'Retrying',
               attempt: "#{job['retry_count'].to_i} of #{JobUtil.max_retries(job)}", next_action: score,
               at: job['failed_at'] || job['created_at'], args: job['args'], error_class: job['error_class'],
@@ -454,7 +489,7 @@ module Cogworker
         def dead_rows
           entries = Cogworker.config.redis { |c| c.zrevrange(RedisKeys::DEAD, 0, -1, withscores: true) }
           entries.map do |raw, score|
-            job = JSON.parse(raw)
+            job = parse_entry(raw)
             { jid: job['jid'], klass: job['class'], queue: job['queue'], status: 'Dead',
               attempt: "#{job['retry_count'].to_i} of #{JobUtil.max_retries(job)}", next_action: nil, at: score,
               args: job['args'], error_class: job['error_class'], error_message: job['error_message'], raw: raw,

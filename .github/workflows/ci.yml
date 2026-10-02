@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Ruby ${{ matrix.ruby }} / redis-rb ${{ matrix.redis }}.x
+    name: Ruby ${{ matrix.ruby }} / redis-rb ${{ matrix.redis }}.x / Redis ${{ matrix.server }}
     runs-on: ubuntu-latest
 
     # Covers the whole range cogworker.gemspec claims (Ruby >= 3.1,
@@ -20,13 +20,21 @@ jobs:
       matrix:
         ruby: ['3.1', '3.2', '3.3', '3.4', '4.0']
         redis: ['4', '5']
+        server: ['7']
+        # One run against a server without LMOVE (< 6.2): fetch: :reliable
+        # must fall back to :basic there (`:old_redis` specs), and the
+        # `:reliable_fetch` ones skip themselves.
+        include:
+          - ruby: '3.4'
+            redis: '5'
+            server: '6.0'
 
     env:
       BUNDLE_GEMFILE: ${{ github.workspace }}/gemfiles/redis_${{ matrix.redis }}.gemfile
 
     services:
       redis:
-        image: redis:7
+        image: redis:${{ matrix.server }}
         ports:
           - 6379:6379
         options: >-

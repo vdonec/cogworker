@@ -83,6 +83,17 @@ module Cogworker
       !!@server_process
     end
 
+    # Called right before every `Process.exit!` (which, unlike `exit`,
+    # flushes nothing): a custom `Cogworker.logger` writing to a buffered
+    # stdout/stderr would otherwise lose its last lines.
+    def flush_output!
+      [$stdout, $stderr].each do |io|
+        io.flush
+      rescue StandardError
+        nil
+      end
+    end
+
     def server_process!
       @server_process = true
     end

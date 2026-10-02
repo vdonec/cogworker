@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require 'rack'
-require 'rack/session/cookie'
 require 'rack/static'
 require 'securerandom'
 
@@ -103,6 +102,18 @@ module Cogworker
       # via `COGWORKER_SESSION_SECRET` for any multi-process deployment.
       def session_secret
         @session_secret ||= ENV.fetch('COGWORKER_SESSION_SECRET') { SecureRandom.hex(32) }
+      end
+
+      # `false` drops the built-in session cookie entirely (it's already
+      # skipped automatically whenever the host app provides a session —
+      # see OptionalSession). Default true.
+      def builtin_session
+        @builtin_session.nil? || @builtin_session
+      end
+
+      def builtin_session=(enabled)
+        @builtin_session = enabled
+        @app = nil
       end
 
       def session_secret=(secret)
@@ -247,7 +258,9 @@ module Cogworker
 
       def build_app
         builder = Rack::Builder.new
-        builder.use(Rack::Session::Cookie, secret: session_secret, key: 'cogworker.session')
+        if builtin_session
+          builder.use(Cogworker::Web::OptionalSession, secret: session_secret, key: 'cogworker.session')
+        end
         # No `cache_control:` (no `immutable`/long `max-age`): these files
         # are plain, unfingerprinted paths that *do* change — every time
         # a vendored stylesheet/script gets edited, or on any gem upgrade —

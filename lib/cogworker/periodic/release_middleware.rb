@@ -4,7 +4,7 @@ module Cogworker
   module Periodic
     # Drives the server side of the `periodic:running:<pjid>` lock (used
     # only for `unique: :until_executed` entries; see RunningLock for the
-    # whole lifecycle): shortens it to RunningLock::ACTIVE_TTL when the run
+    # whole lifecycle): shortens it to `RunningLock.active_ttl` when the run
     # starts, and releases it on success or on the terminal failed attempt
     # (a failure that will be retried is `Processor#route_failure`'s to
     # extend — only it knows the retry delay).
@@ -36,7 +36,7 @@ module Cogworker
       # the lock just keeps its longer queued TTL until this process's next
       # heartbeat shortens it — within Heartbeat::INTERVAL.
       def shorten_lock(pjid, jid)
-        RunningLock.touch(pjid, jid, RunningLock::ACTIVE_TTL)
+        RunningLock.touch(pjid, jid, RunningLock.active_ttl)
       rescue StandardError => e
         Cogworker.logger.warn { "couldn't shorten periodic lock for #{pjid}: #{e.class}: #{e.message}" }
       end
