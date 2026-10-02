@@ -20,14 +20,30 @@ module Cogworker
     # that never exits (a hung Redis call outliving even Manager#stop!'s
     # own 25s join, or anything else) must not be able to wedge the whole
     # restart cycle, and the supervisor's entire signal-handling loop with
-    # it, forever.
-    GRACEFUL_STOP_TIMEOUT = 20
+    # it, forever. Kept well above a child's own worst-case clean shutdown
+    # (Manager#stop!'s 25s drain + up to BasicFetch::TIMEOUT + 1 waiting out
+    # fetching threads + ~1s for Heartbeat#stop!) so a child is never killed
+    # mid-`requeue_unfinished` — for `:basic`, that would lose the jobs.
+    GRACEFUL_STOP_TIMEOUT = 35
+
+    # Respawn backoff for a child that exits unexpectedly: none for the
+    # first crash after a healthy run, then doubling from
+    # RESPAWN_BASE_DELAY up to RESPAWN_MAX_DELAY while the slot keeps dying
+    # within HEALTHY_UPTIME of starting. Without it, a child crashing during
+    # boot (bad deploy, Redis unreachable, a typo in the init file) made the
+    # supervisor fork/crash in a tight loop forever.
+    HEALTHY_UPTIME = 30
+    RESPAWN_BASE_DELAY = 1
+    RESPAWN_MAX_DELAY = 60
 
     def initialize(argv, count: ENV.fetch('COGWORKER_COUNT', 1).to_i, phased: ENV['PHASED_RESTART'] == 'true')
       @argv = argv
       @count = [count, 1].max
       @phased = phased
       @children = {} # pid => slot index
+      @started_at = {} # slot => monotonic time of its current child's fork
+      @crash_streak = Hash.new(0) # slot => consecutive quick crashes
+      @pending_respawns = {} # slot => monotonic time it may be forked again
       @signal_queue = ::Queue.new
       @stopping = false
     end
@@ -56,6 +72,7 @@ module Cogworker
         ::Process.exit!(true)
       end
       @children[pid] = slot
+      @started_at[slot] = monotonic_now
       Cogworker.logger.info { "swarm: started child pid=#{pid} slot=#{slot}" }
     end
 
@@ -70,13 +87,16 @@ module Cogworker
       until @stopping && @children.empty?
         drain_signals
         reap_children
+        respawn_due_children
+        kill_stragglers
         sleep 0.2
       end
     end
 
     def drain_signals
       until @signal_queue.empty?
-        case @signal_queue.pop
+        signal = @signal_queue.pop
+        case signal
         when :quiet then relay(Signals::QUIET)
         when :stop then initiate_stop
         when :restart
@@ -93,7 +113,23 @@ module Cogworker
 
     def initiate_stop
       @stopping = true
+      @stop_deadline = monotonic_now + GRACEFUL_STOP_TIMEOUT
+      @pending_respawns.clear
       relay(Signals::STOP)
+    end
+
+    # Same bound as a phased restart's `wait_for_exit`: a child that hasn't
+    # exited GRACEFUL_STOP_TIMEOUT after the stop was relayed is
+    # force-killed (once), so one hung child can't keep the supervisor —
+    # and whatever is waiting on it — alive forever.
+    def kill_stragglers
+      return unless @stop_deadline && monotonic_now > @stop_deadline
+
+      @stop_deadline = nil
+      @children.each_key do |pid|
+        Cogworker.logger.warn { "swarm: child pid=#{pid} didn't stop within #{GRACEFUL_STOP_TIMEOUT}s, killing" }
+        safe_kill(pid, 'KILL')
+      end
     end
 
     # Non-phased: signal every child at once; the normal reap/respawn path
@@ -155,7 +191,31 @@ module Cogworker
       if @stopping
         Cogworker.logger.info { "swarm: child pid=#{pid} slot=#{slot} exited" }
       else
-        Cogworker.logger.warn { "swarm: child pid=#{pid} slot=#{slot} exited unexpectedly, respawning" }
+        schedule_respawn(pid, slot)
+      end
+    end
+
+    def schedule_respawn(pid, slot)
+      uptime = monotonic_now - @started_at.fetch(slot, monotonic_now)
+      @crash_streak[slot] = uptime < HEALTHY_UPTIME ? @crash_streak[slot] + 1 : 0
+      delay = respawn_delay(@crash_streak[slot])
+      Cogworker.logger.warn do
+        "swarm: child pid=#{pid} slot=#{slot} exited unexpectedly after #{uptime.round(1)}s, " \
+          "respawning in #{delay}s"
+      end
+      @pending_respawns[slot] = monotonic_now + delay
+    end
+
+    def respawn_delay(streak)
+      return 0 if streak <= 1
+
+      [RESPAWN_BASE_DELAY * (2**(streak - 2)), RESPAWN_MAX_DELAY].min
+    end
+
+    def respawn_due_children
+      now = monotonic_now
+      @pending_respawns.select { |_slot, at| at <= now }.each_key do |slot|
+        @pending_respawns.delete(slot)
         fork_child(slot)
       end
     end

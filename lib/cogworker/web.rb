@@ -94,8 +94,20 @@ module Cogworker
         @tabs ||= {}
       end
 
+      # The built-in session cookie's signing secret. The gem itself never
+      # reads the session — it's there for an auth middleware added via
+      # `.use` — but a random per-process default means each Puma worker
+      # signs with its own key, so that middleware's session doesn't survive
+      # a request landing on a different worker. Set it explicitly
+      # (`Cogworker::Web.session_secret = ...`, at least 64 characters) or
+      # via `COGWORKER_SESSION_SECRET` for any multi-process deployment.
       def session_secret
-        @session_secret ||= SecureRandom.hex(32)
+        @session_secret ||= ENV.fetch('COGWORKER_SESSION_SECRET') { SecureRandom.hex(32) }
+      end
+
+      def session_secret=(secret)
+        @session_secret = secret
+        @app = nil
       end
 
       # How every `Layout.time_tag` timestamp is rendered — a Ruby

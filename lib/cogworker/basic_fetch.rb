@@ -1,8 +1,16 @@
 # frozen_string_literal: true
 
+require 'json'
+
 module Cogworker
-  # Pops jobs off Redis lists. Queue names repeated in the process's queue
-  # list represent weight; since BRPOP itself scans its key list
+  # `config.fetch = :basic`: pops jobs off Redis lists with one blocking
+  # `BRPOP`. Once popped, a job exists only in the processor's memory (and
+  # its `cogworker:workers:<identity>` entry, which expires with the
+  # process), so a process that dies mid-job loses it — see ReliableFetch,
+  # the default, for the alternative.
+  #
+  # Queue names repeated in the process's queue list represent weight;
+  # since BRPOP itself scans its key list
   # strictly left-to-right, weighting is implemented by shuffling the
   # (already-expanded, so repeats survive) key list before every fetch cycle
   # — the more often a name appears, the more likely it lands first.
@@ -34,6 +42,33 @@ module Cogworker
 
       queue_key, raw_job = result
       UnitOfWork.new(queue_key.delete_prefix(RedisKeys::QUEUE_PREFIX), raw_job)
+    end
+
+    # Nothing to do: BRPOP already removed the job from Redis.
+    def acknowledge(_work); end
+
+    # Returns a fetched-but-unstarted job to the end of its queue that's
+    # popped next.
+    def give_back(work)
+      Cogworker.config.redis { |c| c.rpush(RedisKeys.queue(work.queue), work.raw_job) }
+    end
+
+    # Shutdown past the drain timeout (`Manager#stop!`): the only record of
+    # a still-running job is its `cogworker:workers:<identity>` entry, so
+    # that's what gets pushed back — onto the end its queue is popped from,
+    # so it runs next. Returns how many. One entry that can't be read is
+    # logged and skipped, never allowed to cost the others their requeue.
+    def self.requeue_in_progress(identity)
+      Cogworker.config.redis do |c|
+        c.hvals(RedisKeys.workers(identity)).count do |raw|
+          entry = JSON.parse(raw)
+          c.rpush(RedisKeys.queue(entry.fetch('queue')), JSON.generate(entry.fetch('payload')))
+          true
+        rescue StandardError => e
+          Cogworker.logger.error { "couldn't requeue in-flight entry #{raw.to_s[0, 200]}: #{e.class}: #{e.message}" }
+          false
+        end
+      end
     end
 
     private

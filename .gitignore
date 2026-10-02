@@ -9,3 +9,6 @@
 # RVM (per-machine, not portable)
 .ruby-gemset
 .ruby-version
+
+# CI matrix lockfiles (resolved per Ruby version, never committed)
+gemfiles/*.gemfile.lock

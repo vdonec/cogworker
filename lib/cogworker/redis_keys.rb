@@ -9,6 +9,7 @@ module Cogworker
   # that nothing else reads.
   module RedisKeys
     QUEUE_PREFIX = 'cogworker:queue:'
+    IN_PROGRESS_PREFIX = 'cogworker:inprogress:'
     QUEUES = 'cogworker:queues'
     SCHEDULE = 'cogworker:schedule'
     RETRY = 'cogworker:retry'
@@ -26,6 +27,7 @@ module Cogworker
     def job_attempts(jid) = "cogworker:job_attempts:#{jid}"
     def process(identity) = "cogworker:process:#{identity}"
     def workers(identity) = "cogworker:workers:#{identity}"
+    def in_progress(identity) = "#{IN_PROGRESS_PREFIX}#{identity}"
     def signal(identity) = "cogworker:signal:#{identity}"
     def periodic_running(pjid) = "periodic:running:#{pjid}"
     def periodic_last_slot(pjid) = "periodic:last_slot:#{pjid}"

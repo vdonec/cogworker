@@ -50,7 +50,7 @@ module Cogworker
           else
             job['enqueued_at'] = Time.now.to_f
             conn.multi do |pipeline|
-              pipeline.sadd(RedisKeys::QUEUES, job['queue'])
+              pipeline.sadd?(RedisKeys::QUEUES, job['queue'])
               pipeline.lpush(RedisKeys.queue(job['queue']), JSON.generate(job))
             end
           end

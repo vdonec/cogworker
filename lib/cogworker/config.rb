@@ -6,7 +6,9 @@ module Cogworker
   # `configure_client` calls, so every block sees and extends the same
   # server/client middleware chains.
   class Config
-    attr_reader :server_chain, :client_chain, :periodic_manager, :redis_options
+    FETCH_MODES = %i[reliable basic].freeze
+
+    attr_reader :server_chain, :client_chain, :periodic_manager, :redis_options, :fetch
     attr_accessor :concurrency, :queues, :periodic_catch_up, :unique_lock_ttl
 
     def initialize
@@ -31,11 +33,34 @@ module Cogworker
       # set higher/lower to match how long a unique job might legitimately
       # run plus however long its retries can take.
       @unique_lock_ttl = 24 * 60 * 60
+      # How processors take jobs off their queues — `:reliable` (ReliableFetch,
+      # needs Redis >= 6.2; a job survives its process dying) or `:basic`
+      # (BasicFetch, one blocking BRPOP; a job is lost if its process dies).
+      # On an older Redis, `:reliable` falls back to `:basic` with a warning
+      # (Manager#resolve_fetch_class).
+      @fetch = :reliable
       register_default_middleware
     end
 
+    def fetch=(mode)
+      resolved = mode.to_s.to_sym
+      unless FETCH_MODES.include?(resolved)
+        raise ArgumentError, "fetch must be one of #{FETCH_MODES.join(', ')}, got #{mode.inspect}"
+      end
+
+      @fetch = resolved
+    end
+
+    # Also drops an already-built pool: `redis_pool` is memoized on first
+    # use, so without this a `redis =` after anything had touched Redis
+    # (an init file configuring twice, a test switching databases) was
+    # silently ignored. The old pool's connections are closed as they're
+    # checked back in, so a caller still holding one finishes normally.
     def redis=(options)
       @redis_options = options
+      old_pool = @redis_pool
+      @redis_pool = nil
+      old_pool&.shutdown(&:close)
     end
 
     def redis_pool

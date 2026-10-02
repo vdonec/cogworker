@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'json'
 require 'securerandom'
 
 module Cogworker
@@ -55,6 +56,61 @@ module Cogworker
     # of this same check, two of which had the `max_retries` bug above.
     def terminal_failure?(job)
       job['retry_count'].to_i >= max_retries(job)
+    end
+
+    # The job Hash a raw `schedule`/`retry`/`dead` entry would requeue as —
+    # or `nil` if it can't be: not JSON, not an object, or no String
+    # `queue` to push it onto (e.g. an `unparseable_job` wrapper, whose
+    # `queue` may be nil).
+    def requeueable(raw)
+      job = JSON.parse(raw)
+      job.is_a?(Hash) && job['queue'].is_a?(String) ? job : nil
+    rescue JSON::ParserError, TypeError
+      nil
+    end
+
+    # Validate, then claim, then requeue — in that order, so an entry that
+    # can't be requeued is never `zrem`'d and lost (it stays where it is for
+    # the caller to deal with). Returns `:requeued`, `:gone` (someone else
+    # won the `zrem` first) or `:invalid`. The one implementation behind
+    # `Scheduled#graduate` and every Web UI retry action.
+    def claim_and_requeue(conn, set, raw)
+      job = requeueable(raw)
+      return :invalid unless job
+      return :gone unless conn.zrem(set, raw)
+
+      requeue(conn, job)
+      :requeued
+    end
+
+    # Puts a job taken off `cogworker:schedule`/`retry`/`dead` (the caller
+    # has already won its `zrem`) back onto its queue — the one shared
+    # implementation behind `Scheduled#graduate` and the Web UI's retry
+    # actions. Re-stamps `enqueued_at`: queue latency is measured from it,
+    # and a retried job still carried its original push time (a scheduled
+    # one, none at all), inflating the queue's latency by its whole history.
+    def requeue(conn, job)
+      job['enqueued_at'] = Time.now.to_f
+      conn.multi do |tx|
+        tx.sadd?(RedisKeys::QUEUES, job['queue'])
+        tx.lpush(RedisKeys.queue(job['queue']), JSON.generate(job))
+      end
+    end
+
+    UNPARSEABLE_CLASS = '(unparseable)'
+
+    # A payload that isn't a JSON object can't be run, retried or even
+    # attributed to a class. Wrapped into a regular job Hash (the Web UI
+    # parses every Dead entry as one) that keeps the original bytes under
+    # `raw_payload`, for whoever finds one to bury it in `dead`.
+    def unparseable_job(raw, queue:, error:)
+      now = Time.now.to_f
+      {
+        'class' => UNPARSEABLE_CLASS, 'args' => [], 'queue' => queue, 'jid' => SecureRandom.hex(12),
+        'retry' => false, 'retry_count' => 0, 'enqueued_at' => now, 'failed_at' => now,
+        'error_class' => error.class.name, 'error_message' => error.message.to_s[0, 10_000],
+        'raw_payload' => raw.to_s[0, 100_000]
+      }
     end
   end
 end

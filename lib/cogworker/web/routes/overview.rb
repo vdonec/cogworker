@@ -167,15 +167,9 @@ module Cogworker
         def retry_all(name)
           entries = Cogworker.config.redis { |c| c.zrange(RedisKeys::RETRY, 0, -1) }
           entries.each do |raw|
-            job = JSON.parse(raw)
-            next unless job['queue'] == name
+            next unless JobUtil.requeueable(raw)&.fetch('queue') == name
 
-            Cogworker.config.redis do |c|
-              if c.zrem(RedisKeys::RETRY, raw)
-                c.sadd(RedisKeys::QUEUES, job['queue'])
-                c.lpush(RedisKeys.queue(job['queue']), raw)
-              end
-            end
+            Cogworker.config.redis { |c| JobUtil.claim_and_requeue(c, RedisKeys::RETRY, raw) }
           end
         end
 

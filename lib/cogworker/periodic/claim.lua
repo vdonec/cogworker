@@ -4,12 +4,18 @@
 -- ARGV[1] = slot (epoch int)
 -- ARGV[2] = unique mode ("until_executed" or "")
 -- ARGV[3] = lock TTL (seconds)
+-- ARGV[4] = jid the caller will push this slot's job under
+-- ARGV[5] = running-lock TTL (seconds)
 --
 -- Returns 1 if this call won the claim for this slot (the caller should
 -- enqueue the job), 0 otherwise. Composes two guards: `last_slot` stops a
 -- process re-firing the same (or an earlier) slot on a later tick, and the
 -- NX lock breaks the narrow race where two processes both pass the
 -- `last_slot` check before either has written it back.
+--
+-- For `until_executed`, the running lock is written here, in the same
+-- atomic step as the claim and before the job exists anywhere — see
+-- Periodic::RunningLock for why it must never be written after the push.
 if ARGV[2] == "until_executed" and redis.call("GET", KEYS[1]) then
   return 0
 end
@@ -24,4 +30,7 @@ if not redis.call("SET", KEYS[3], "1", "NX", "EX", ARGV[3]) then
 end
 
 redis.call("SET", KEYS[2], ARGV[1])
+if ARGV[2] == "until_executed" then
+  redis.call("SET", KEYS[1], ARGV[4], "EX", ARGV[5])
+end
 return 1

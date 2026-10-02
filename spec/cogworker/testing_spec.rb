@@ -109,4 +109,50 @@ RSpec.describe Cogworker::Testing do
       expect(described_class).to be_fake
     end
   end
+
+  describe 'running fake-mode jobs' do
+    before { described_class.fake! }
+
+    it 'perform_one runs the oldest recorded job for that class and removes it' do
+      TestingJob.perform_async(1)
+      TestingJob.perform_async(2)
+
+      TestingJob.perform_one
+
+      expect(TestingJob.calls).to eq([[1]])
+      expect(TestingJob.jobs.size).to eq(1)
+    end
+
+    it 'perform_one raises when nothing is recorded' do
+      expect { TestingJob.perform_one }.to raise_error(Cogworker::Testing::EmptyQueueError)
+    end
+
+    it 'drain runs every recorded job, including ones pushed while draining' do
+      TestingJob.define_method(:perform) do |n|
+        self.class.calls << [n]
+        self.class.perform_async(n + 1) if n < 3
+      end
+      TestingJob.perform_async(1)
+
+      TestingJob.drain
+
+      expect(TestingJob.calls).to eq([[1], [2], [3]])
+      expect(TestingJob.jobs).to be_empty
+    end
+
+    it 'drain_all drains every class' do
+      stub_const('OtherTestingJob', Class.new do
+        include Cogworker::Worker
+
+        define_method(:perform) { |*args| TestingJob.calls << [:other, *args] }
+      end)
+      TestingJob.perform_async(1)
+      OtherTestingJob.perform_async(2)
+
+      described_class.drain_all
+
+      expect(TestingJob.calls).to contain_exactly([1], [:other, 2])
+      expect(TestingJob.jobs + OtherTestingJob.jobs).to be_empty
+    end
+  end
 end

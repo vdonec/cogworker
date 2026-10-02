@@ -17,8 +17,15 @@ RSpec.describe 'Cogworker::Status' do
 
     jid = StatusJob.perform_async
 
-    expect(Cogworker::Status.status(jid)).to eq('queued')
+    expect(Cogworker::Status.status(jid)).to eq(:queued)
     expect(Cogworker.config.redis { |c| c.ttl("status:#{jid}") }).to be > 0
+  end
+
+  it 'returns nil for an unknown jid, while Status.get keeps the raw string-valued Hash' do
+    expect(Cogworker::Status.status('no-such-jid')).to be_nil
+
+    Cogworker::Status::Storage.write('j', 60, 'status' => 'working')
+    expect(Cogworker::Status.get('j')['status']).to eq('working')
   end
 
   it 'goes working -> complete for a successful job' do
@@ -33,9 +40,9 @@ RSpec.describe 'Cogworker::Status' do
     manager = Cogworker::Manager.new
     manager.start!
 
-    wait_for { Cogworker::Status.status(jid) == 'working' }
+    wait_for { Cogworker::Status.status(jid) == :working }
     gate << :go
-    wait_for { Cogworker::Status.status(jid) == 'complete' }
+    wait_for { Cogworker::Status.status(jid) == :complete }
   ensure
     # Not just a trailing statement: a `wait_for` above timing out (real,
     # more likely on a loaded CI runner) would otherwise raise past it,
@@ -61,7 +68,7 @@ RSpec.describe 'Cogworker::Status' do
     manager = Cogworker::Manager.new
     manager.start!
 
-    wait_for { Cogworker::Status.status(jid) == 'retrying' }
+    wait_for { Cogworker::Status.status(jid) == :retrying }
     info = Cogworker::Status.get(jid)
     expect(info['error_class']).to eq('RuntimeError')
 
@@ -72,7 +79,7 @@ RSpec.describe 'Cogworker::Status' do
       c.lpush('cogworker:queue:default', raw)
     end
 
-    wait_for { Cogworker::Status.status(jid) == 'failed' }
+    wait_for { Cogworker::Status.status(jid) == :failed }
   ensure
     manager&.stop!(timeout: 2) # see the `ensure` comment in the example above
   end

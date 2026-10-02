@@ -49,11 +49,11 @@ module Cogworker
     # are untouched and keep arriving via `Client.push`, they just stop
     # being picked up until `resume!`.
     def pause!
-      Cogworker.config.redis { |c| c.sadd(RedisKeys::PAUSED_QUEUES, name) }
+      Cogworker.config.redis { |c| c.sadd?(RedisKeys::PAUSED_QUEUES, name) }
     end
 
     def resume!
-      Cogworker.config.redis { |c| c.srem(RedisKeys::PAUSED_QUEUES, name) }
+      Cogworker.config.redis { |c| c.srem?(RedisKeys::PAUSED_QUEUES, name) }
     end
 
     def paused?

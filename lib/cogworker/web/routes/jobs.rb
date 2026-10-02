@@ -76,11 +76,7 @@ module Cogworker
           app.post('/jobs/retrying/retry_now') do
             raw = params['raw']
             Cogworker.config.redis do |c|
-              if c.zrem(RedisKeys::RETRY, raw)
-                job = JSON.parse(raw)
-                c.sadd(RedisKeys::QUEUES, job['queue'])
-                c.lpush(RedisKeys.queue(job['queue']), raw)
-              end
+              JobUtil.claim_and_requeue(c, RedisKeys::RETRY, raw)
             end
             Jobs.respond(self, params)
           end
@@ -102,11 +98,7 @@ module Cogworker
           app.post('/jobs/dead/retry') do
             raw = params['raw']
             Cogworker.config.redis do |c|
-              if c.zrem(RedisKeys::DEAD, raw)
-                job = JSON.parse(raw)
-                c.sadd(RedisKeys::QUEUES, job['queue'])
-                c.lpush(RedisKeys.queue(job['queue']), raw)
-              end
+              JobUtil.claim_and_requeue(c, RedisKeys::DEAD, raw)
             end
             Jobs.respond(self, params)
           end
@@ -254,13 +246,21 @@ module Cogworker
           when :scheduled
             delete_button('scheduled', script_name, row, params)
           when :retrying
-            retry_now_button('retrying', script_name, row, params) + delete_button('retrying', script_name, row,
-                                                                                    params)
+            retry_html = requeueable?(row) ? retry_now_button('retrying', script_name, row, params) : ''
+            retry_html + delete_button('retrying', script_name, row, params)
           when :dead
-            retry_button('dead', script_name, row, params) + delete_button('dead', script_name, row, params)
+            retry_html = requeueable?(row) ? retry_button('dead', script_name, row, params) : ''
+            retry_html + delete_button('dead', script_name, row, params)
           else
             ''
           end
+        end
+
+        # No Retry for an entry that can't go back on a queue (no queue of
+        # its own) or that would only fail straight back into Dead (an
+        # unparseable payload's wrapper) — Delete is all that makes sense.
+        def requeueable?(row)
+          row[:klass] != JobUtil::UNPARSEABLE_CLASS && !JobUtil.requeueable(row[:raw].to_s).nil?
         end
 
         def delete_button(bucket, script_name, row, params, extra: {})

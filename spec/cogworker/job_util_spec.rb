@@ -35,4 +35,27 @@ RSpec.describe Cogworker::JobUtil do
       expect(described_class.terminal_failure?('retry' => false, 'retry_count' => 0)).to be(true)
     end
   end
+
+  describe '.claim_and_requeue' do
+    def zadd(raw) = Cogworker.config.redis { |c| c.zadd('cogworker:retry', 1, raw) }
+    def call(raw) = Cogworker.config.redis { |c| described_class.claim_and_requeue(c, 'cogworker:retry', raw) }
+
+    it 'requeues a valid entry, and reports :gone to whoever loses the zrem' do
+      raw = JSON.generate('jid' => 'a', 'queue' => 'default')
+      zadd(raw)
+
+      expect(call(raw)).to eq(:requeued)
+      expect(call(raw)).to eq(:gone)
+      expect(queued_jobs.map { |j| j['jid'] }).to eq(['a'])
+    end
+
+    it 'never claims an entry it could not requeue — no JSON object, or no String queue' do
+      ['{not json', '[1]', JSON.generate('jid' => 'b'), JSON.generate('jid' => 'c', 'queue' => nil)].each do |raw|
+        zadd(raw)
+        expect(call(raw)).to eq(:invalid)
+      end
+
+      expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(4)
+    end
+  end
 end

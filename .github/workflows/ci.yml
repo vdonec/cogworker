@@ -8,7 +8,21 @@ on:
 
 jobs:
   test:
+    name: Ruby ${{ matrix.ruby }} / redis-rb ${{ matrix.redis }}.x
     runs-on: ubuntu-latest
+
+    # Covers the whole range cogworker.gemspec claims (Ruby >= 3.1,
+    # redis >= 4.8, < 6): several real bugs only ever showed up on an older
+    # Ruby or on redis-rb 4.x (Time#iso8601 outside core before 3.4,
+    # unsubscribe deadlocking on 4.x, sadd/srem deprecation spam on 4.8).
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.1', '3.2', '3.3', '3.4', '4.0']
+        redis: ['4', '5']
+
+    env:
+      BUNDLE_GEMFILE: ${{ github.workspace }}/gemfiles/redis_${{ matrix.redis }}.gemfile
 
     services:
       redis:
@@ -26,7 +40,7 @@ jobs:
 
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.4'
+          ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
 
       - name: Run rspec

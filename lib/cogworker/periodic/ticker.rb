@@ -2,6 +2,7 @@
 
 require 'fugit'
 require 'json'
+require 'securerandom'
 
 module Cogworker
   module Periodic
@@ -54,13 +55,19 @@ module Cogworker
         Cogworker.config.redis { |c| c.hset(RedisKeys::PERIODIC_SCHEDULE, *payloads.to_a.flatten) }
       end
 
+      # A failed tick is logged and retried next interval rather than ending
+      # the thread — a single Redis blip used to silently stop every
+      # periodic entry in this process for good. A slot whose claim raised
+      # isn't recorded in `@last_checked_slot`, so the next tick retries it.
       def run
         until @manager.stopping?
-          tick unless @manager.quiet?
+          begin
+            tick unless @manager.quiet?
+          rescue StandardError => e
+            Cogworker.logger.error { "Periodic tick failed: #{e.class}: #{e.message}" }
+          end
           sleep(TICK_INTERVAL)
         end
-      rescue StandardError => e
-        Cogworker.logger.error { "Periodic ticker died: #{e.class}: #{e.message}" }
       end
 
       def tick
@@ -69,7 +76,8 @@ module Cogworker
           slot = cron_for(entry).previous_time(now).to_i
           next if @last_checked_slot[entry.pjid] == slot
 
-          enqueue(entry, slot) if !disabled?(entry) && claim?(entry, slot)
+          jid = SecureRandom.hex(12)
+          enqueue(entry, slot, jid) if !disabled?(entry) && claim?(entry, slot, jid)
           @last_checked_slot[entry.pjid] = slot
         end
       end
@@ -93,14 +101,14 @@ module Cogworker
         @cron_cache[entry.pjid] ||= Fugit::Cron.parse(entry.cron)
       end
 
-      def claim?(entry, slot)
+      def claim?(entry, slot, jid)
         return false if !@catch_up && priming_first_slot?(entry, slot)
 
         result = Cogworker.config.redis do |c|
           c.eval(CLAIM_SCRIPT,
                  keys: [RedisKeys.periodic_running(entry.pjid), RedisKeys.periodic_last_slot(entry.pjid),
                         RedisKeys.periodic_lock(entry.pjid, slot)],
-                 argv: [slot, entry.unique.to_s, LOCK_TTL])
+                 argv: [slot, entry.unique.to_s, LOCK_TTL, jid, RunningLock.queued_ttl])
         end
         result == 1
       end
@@ -123,15 +131,36 @@ module Cogworker
         Cogworker.config.redis { |c| c.set(RedisKeys.periodic_last_slot(entry.pjid), slot, nx: true) }
       end
 
-      def enqueue(entry, slot)
+      # The running lock (for `until_executed`) is already in place, set by
+      # the claim under this same `jid` — nothing to write after the push.
+      # That relies on the job keeping that jid: `JobUtil.normalize_item`
+      # only fills `jid` in when absent, but a custom client middleware that
+      # overwrites it would leave the lock owned by a jid no job carries —
+      # the entry then stays closed for `RunningLock.queued_ttl` (logged).
+      # Only undone here if the push didn't actually produce a job (raised,
+      # or a client middleware swallowed it), so a job that never existed
+      # can't hold the entry for the whole `RunningLock.queued_ttl`.
+      def enqueue(entry, slot, jid)
         job = {
           'class' => entry.class_name, 'args' => entry.args, 'retry' => entry.retry,
-          'periodic_pjid' => entry.pjid, 'periodic_slot' => slot
+          'periodic_pjid' => entry.pjid, 'periodic_slot' => slot, 'jid' => jid
         }
-        jid = Client.push(job)
+        pushed = begin
+          Client.push(job)
+        rescue StandardError
+          RunningLock.release(entry.pjid, jid) if entry.until_executed?
+          raise
+        end
         return unless entry.until_executed?
 
-        Cogworker.config.redis { |c| c.set(RedisKeys.periodic_running(entry.pjid), jid) }
+        if pushed.nil?
+          RunningLock.release(entry.pjid, jid)
+        elsif pushed != jid
+          Cogworker.logger.warn do
+            "periodic #{entry.pjid}: a client middleware changed the job's jid (#{jid} -> #{pushed}); its running " \
+              "lock won't be released by the job and keeps the entry closed for up to #{RunningLock.queued_ttl}s"
+          end
+        end
       end
     end
   end

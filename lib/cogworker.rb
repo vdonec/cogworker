@@ -2,6 +2,9 @@
 
 require 'socket'
 require 'securerandom'
+# `Time#iso8601` (Logging, Web::Layout.time_tag) only moved into core in
+# Ruby 3.4; on 3.1-3.3 it needs the stdlib extension loaded explicitly.
+require 'time'
 require 'zeitwerk'
 
 # Redis-backed background job processing: worker DSL, periodic (cron)
@@ -85,7 +88,8 @@ module Cogworker
     end
 
     # No-op: exists so calling code doesn't need to change, but this gem
-    # simply never coerces job args, so there is nothing to toggle.
+    # simply never coerces job args, so there is nothing to toggle — see
+    # README "Job arguments".
     def strict_args!(_value = true)
       true
     end

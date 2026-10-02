@@ -2,6 +2,7 @@
 
 require 'spec_helper'
 require 'tempfile'
+require 'stringio'
 
 # A real, separate OS process — deliberately not just an in-process
 # Heartbeat/Manager pair like other specs use. The one thing this test
@@ -62,5 +63,67 @@ RSpec.describe 'Cogworker::Heartbeat remote stop (end-to-end, real OS process)' 
       # `cleanup_presence!` ran (and completed) before the process exited.
       expect(Cogworker::ProcessSet.new.map(&:identity)).not_to include(identity)
     end
+  end
+end
+
+RSpec.describe Cogworker::Heartbeat do
+  let(:manager) { Cogworker::Manager.new }
+
+  it 'stop! returns promptly with the pub/sub subscriber blocked in its read (it used to hang forever on ' \
+     'redis-rb 4.x, where unsubscribe from another thread waits on the monitor the subscriber holds)' do
+    heartbeat = described_class.new(manager)
+    heartbeat.start!
+    channel = "cogworker:signal:#{Cogworker.identity}"
+    wait_for { Cogworker.config.redis { |c| c.pubsub(:numsub, channel) }.last.to_i == 1 }
+
+    finished = Thread.new { heartbeat.stop! }
+    expect(finished.join(5)).not_to be_nil
+    expect(heartbeat.instance_variable_get(:@signal_thread)).not_to be_alive
+    wait_for { Cogworker.config.redis { |c| c.pubsub(:numsub, channel) }.last.to_i.zero? }
+  end
+
+  it "keeps an in-flight periodic run's running lock alive on every beat" do
+    key = 'periodic:running:pj1'
+    Cogworker.config.redis do |c|
+      c.set(key, 'jid1', ex: 5)
+      c.hset("cogworker:workers:#{Cogworker.identity}", 'tid1',
+             JSON.generate('queue' => 'default', 'run_at' => Time.now.to_i,
+                           'payload' => { 'class' => 'X', 'jid' => 'jid1', 'periodic_pjid' => 'pj1' }))
+    end
+
+    described_class.new(manager).send(:beat)
+
+    expect(Cogworker.config.redis { |c| c.ttl(key) }).to be > 5
+  end
+
+  it 'keeps beating after a failed beat instead of letting the thread die' do
+    heartbeat = described_class.new(manager)
+    calls = 0
+    allow(heartbeat).to receive(:beat) do
+      calls += 1
+      raise Redis::CannotConnectError, 'blip' if calls == 1
+
+      throw :done if calls == 2
+    end
+    allow(heartbeat).to receive(:sleep)
+
+    catch(:done) { heartbeat.send(:beat_loop) }
+    expect(calls).to eq(2)
+  end
+
+  it "still refreshes the other in-flight periodic locks when one in-flight entry can't be read" do
+    key = 'periodic:running:pj2'
+    Cogworker.config.redis do |c|
+      c.set(key, 'jid2', ex: 5)
+      workers = "cogworker:workers:#{Cogworker.identity}"
+      c.hset(workers, 'bad', '{not json')
+      c.hset(workers, 'good', JSON.generate('queue' => 'default', 'run_at' => Time.now.to_i,
+                                            'payload' => { 'jid' => 'jid2', 'periodic_pjid' => 'pj2' }))
+    end
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+
+    described_class.new(manager).send(:beat)
+
+    expect(Cogworker.config.redis { |c| c.ttl(key) }).to be > 5
   end
 end

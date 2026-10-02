@@ -53,4 +53,27 @@ RSpec.describe 'Client.push unique: :until_executed integration' do
     expect(jids.compact.size).to eq(4)
     expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(4)
   end
+
+  it 'counts the lock TTL from when a scheduled job is due, not from when it was pushed' do
+    UniqueJob.perform_in(3 * 86_400, 1)
+
+    key = Cogworker.config.redis { |c| c.keys('cogworker:unique:*') }.first
+    expect(Cogworker.config.redis { |c| c.ttl(key) }).to be > (3 * 86_400)
+  end
+
+  it 'extends the lock over the retry backoff when an attempt fails and will be retried' do
+    Cogworker.config.unique_lock_ttl = 100
+    UniqueJob.define_method(:perform) { |*| raise 'boom' }
+    jid = UniqueJob.perform_async(1)
+    key = Cogworker.config.redis { |c| c.keys('cogworker:unique:*') }.first
+    raw = Cogworker.config.redis { |c| c.rpop('cogworker:queue:default') }
+
+    allow_any_instance_of(Cogworker::Processor).to receive(:retry_delay).and_return(10_000)
+    work = Cogworker::BasicFetch::UnitOfWork.new('default', raw)
+    Cogworker::Processor.new(Cogworker::Manager.new).send(:execute, work)
+
+    expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(1)
+    expect(Cogworker.config.redis { |c| c.get(key) }).to eq(jid)
+    expect(Cogworker.config.redis { |c| c.ttl(key) }).to be > 10_000
+  end
 end

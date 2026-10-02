@@ -16,8 +16,7 @@ module Cogworker
         return yield unless UniqueJobs.until_executed?(job)
 
         acquired = redis_pool.with do |c|
-          c.set(RedisKeys.unique_lock(UniqueJobs.digest(job)), job['jid'],
-                nx: true, ex: Cogworker.config.unique_lock_ttl)
+          c.set(RedisKeys.unique_lock(UniqueJobs.digest(job)), job['jid'], nx: true, ex: lock_ttl(job))
         end
 
         if acquired
@@ -25,6 +24,16 @@ module Cogworker
         else
           job['unique_skipped'] = true
         end
+      end
+
+      private
+
+      # Counted from when the job is due, not from now: a `perform_in`/
+      # `perform_at` further out than `unique_lock_ttl` used to lose its
+      # lock before it even ran, letting a duplicate in.
+      def lock_ttl(job)
+        wait = job['at'] ? [job['at'].to_f - Time.now.to_f, 0].max : 0
+        (Cogworker.config.unique_lock_ttl + wait).ceil
       end
     end
   end

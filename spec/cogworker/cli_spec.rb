@@ -47,4 +47,37 @@ RSpec.describe Cogworker::CLI do
       expect(launcher).to have_received(:run)
     end
   end
+
+  describe 'environment' do
+    around do |example|
+      saved = Cogworker::CLI::ENV_VARS.to_h { |k| [k, ENV.fetch(k, nil)] }
+      example.run
+    ensure
+      saved.each { |k, v| ENV[k] = v }
+    end
+
+    before { allow(Cogworker::Launcher).to receive(:new).and_return(instance_double(Cogworker::Launcher, run: nil)) }
+
+    it 'exports -e as APP_ENV/RAILS_ENV/RACK_ENV before requiring app code' do
+      seen = nil
+      Tempfile.create(%w[app .rb]) do |f|
+        f.write("$cli_spec_env = [ENV['APP_ENV'], ENV['RAILS_ENV'], ENV['RACK_ENV']]\n")
+        f.flush
+        described_class.new.run(['-e', 'staging', '-r', f.path])
+        seen = $cli_spec_env # rubocop:disable Style/GlobalVars
+      end
+
+      expect(seen).to eq(%w[staging staging staging])
+    end
+
+    it 'without -e, keeps an already-set RAILS_ENV rather than overriding it with the development default' do
+      ENV.delete('APP_ENV')
+      ENV.delete('RACK_ENV')
+      ENV['RAILS_ENV'] = 'production'
+
+      described_class.new.run([])
+
+      expect(ENV.values_at(*Cogworker::CLI::ENV_VARS)).to eq(%w[production production production])
+    end
+  end
 end

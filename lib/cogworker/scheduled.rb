@@ -11,6 +11,11 @@ module Cogworker
   class Scheduled
     SETS = [RedisKeys::SCHEDULE, RedisKeys::RETRY].freeze
     POLL_INTERVAL = 5
+    # How often this poller also looks for jobs left in progress by a dead
+    # process (ReliableFetch.recover_orphans) — the first time right away,
+    # at boot. Every live process does it; the requeue is atomic, so any
+    # number of them doing it at once is safe.
+    ORPHAN_CHECK_INTERVAL = 60
 
     def initialize(manager)
       @manager = manager
@@ -34,13 +39,27 @@ module Cogworker
 
     private
 
+    # A failed poll is logged and retried next interval rather than ending
+    # the thread — a single Redis blip used to stop every scheduled/retry
+    # job in this process from ever reaching its queue again.
     def run
       until @manager.stopping?
-        enqueue_due_jobs unless @manager.quiet?
+        begin
+          recover_orphans_if_due
+          enqueue_due_jobs unless @manager.quiet?
+        rescue StandardError => e
+          Cogworker.logger.error { "Scheduled poll failed: #{e.class}: #{e.message}" }
+        end
         sleep(POLL_INTERVAL)
       end
-    rescue StandardError => e
-      Cogworker.logger.error { "Scheduled poller died: #{e.class}: #{e.message}" }
+    end
+
+    def recover_orphans_if_due
+      now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+      return if @next_orphan_check && now < @next_orphan_check
+
+      @next_orphan_check = now + ORPHAN_CHECK_INTERVAL
+      ReliableFetch.recover_orphans
     end
 
     def enqueue_due_jobs
@@ -51,17 +70,25 @@ module Cogworker
       end
     end
 
+    # An entry that can't be requeued (not JSON, no queue) is buried in
+    # `dead` instead: left in place it would sit first by score, failing
+    # every poll and starving everything behind it; raising after the
+    # `zrem` used to lose it silently (and cut the rest of this poll short).
     def graduate(set, raw)
       Cogworker.config.redis do |c|
-        won = c.zrem(set, raw)
-        next unless won
+        next unless JobUtil.claim_and_requeue(c, set, raw) == :invalid
 
-        job = JSON.parse(raw)
-        c.multi do |pipeline|
-          pipeline.sadd(RedisKeys::QUEUES, job['queue'])
-          pipeline.lpush(RedisKeys.queue(job['queue']), raw)
-        end
+        bury(c, set, raw) if c.zrem(set, raw)
       end
+    end
+
+    def bury(conn, set, raw)
+      error = JSON::ParserError.new("not a job (JSON object with a queue) in #{set}")
+      job = JobUtil.unparseable_job(raw, queue: nil, error: error)
+      conn.zadd(RedisKeys::DEAD, job['failed_at'], JSON.generate(job))
+      conn.incr(RedisKeys::STATS_FAILED) # counted like Processor#bury_unparseable
+      Throughput.record('failed')
+      Cogworker.logger.error { "unparseable entry in #{set} moved to dead: #{raw.to_s[0, 200]}" }
     end
   end
 end

@@ -20,8 +20,13 @@ module Cogworker
       @manager = manager
     end
 
+    # The first beat is synchronous, before any processor fetches a job:
+    # ReliableFetch.recover_orphans treats an in-progress list with no live
+    # heartbeat behind it as a dead process's, so this process must be
+    # visibly alive before its own list can have anything on it.
     def start!
       @stopping = false
+      beat_safely
       @beat_thread = Thread.new { beat_loop }
       @signal_thread = Thread.new { subscribe_loop }
     end
@@ -29,11 +34,18 @@ module Cogworker
     # Tears down both background threads, not just the Redis keys — leaving
     # them running would leak a thread (and a dedicated pub/sub connection)
     # per Heartbeat instance for the remaining life of the process.
+    #
+    # The subscriber thread is killed *before* its connection is closed, and
+    # never via `unsubscribe`: on redis-rb 4.x, `unsubscribe` from another
+    # thread waits on the client's monitor, which the subscriber thread
+    # holds for as long as it sits in its blocking read — so it hung
+    # forever, and with it every `TERM`. Killing the thread releases the
+    # monitor; closing the now-idle connection afterwards is safe on both
+    # 4.x and 5.x.
     def stop!
       @stopping = true
       @beat_thread&.kill
-      @subscribe_client&.unsubscribe
-      @signal_thread&.kill
+      stop_subscriber!
       cleanup_presence!
     rescue StandardError
       nil
@@ -41,20 +53,38 @@ module Cogworker
 
     private
 
+    def stop_subscriber!
+      if @signal_thread && @signal_thread != Thread.current
+        @signal_thread.kill
+        @signal_thread.join(1)
+      end
+      @subscribe_client&.close
+    rescue StandardError
+      nil
+    end
+
     def cleanup_presence!
       Cogworker.config.redis do |c|
         c.del(RedisKeys.process(Cogworker.identity), RedisKeys.workers(Cogworker.identity))
-        c.srem(RedisKeys::PROCESSES, Cogworker.identity)
+        c.srem?(RedisKeys::PROCESSES, Cogworker.identity)
       end
     end
 
+    # A failed beat (Redis blip, failover) is logged and retried on the next
+    # interval, never allowed to end the loop: a dead heartbeat thread
+    # meant this process silently vanished from ProcessSet/the Workers tab
+    # once its TTL ran out, while still running jobs.
     def beat_loop
       loop do
-        beat
         sleep(INTERVAL)
+        beat_safely
       end
+    end
+
+    def beat_safely
+      beat
     rescue StandardError => e
-      Cogworker.logger.error { "Heartbeat died: #{e.class}: #{e.message}" }
+      Cogworker.logger.error { "Heartbeat failed: #{e.class}: #{e.message}" }
     end
 
     def beat
@@ -69,13 +99,31 @@ module Cogworker
       }
 
       Cogworker.config.redis do |c|
-        c.sadd(RedisKeys::PROCESSES, identity)
+        c.sadd?(RedisKeys::PROCESSES, identity)
         c.hset(RedisKeys.process(identity),
                'info', JSON.generate(info),
                'busy', @manager.busy_count.to_s,
                'quiet', @manager.quiet?.to_s)
         c.expire(RedisKeys.process(identity), TTL)
         c.expire(RedisKeys.workers(identity), TTL)
+        touch_running_periodic_locks(c, identity)
+      end
+    end
+
+    # Keeps every in-flight `until_executed` periodic run's
+    # `periodic:running:<pjid>` lock alive for as long as this process is —
+    # see Periodic::RunningLock. Reads the same `cogworker:workers:<identity>`
+    # Hash the Workers tab does, so it covers exactly the jobs actually
+    # executing here right now.
+    def touch_running_periodic_locks(conn, identity)
+      conn.hvals(RedisKeys.workers(identity)).each do |raw|
+        job = JSON.parse(raw)['payload']
+        next unless job.is_a?(Hash) && job['periodic_pjid']
+
+        Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], Periodic::RunningLock::ACTIVE_TTL, conn)
+      rescue StandardError => e
+        # Per entry: one bad entry mustn't leave the others' locks to expire.
+        Cogworker.logger.error { "couldn't refresh periodic lock for #{raw.to_s[0, 200]}: #{e.class}: #{e.message}" }
       end
     end
 

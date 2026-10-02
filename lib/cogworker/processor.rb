@@ -7,43 +7,104 @@ module Cogworker
   # One thread of a Manager's pool: fetch -> register in-flight -> run the
   # server middleware chain around perform -> stats/retry -> deregister.
   class Processor
+    ERROR_BACKOFF = 1 # seconds
+    ACK_ATTEMPTS = 3
+
     attr_reader :thread, :tid
 
     def initialize(manager)
       @manager = manager
+      @busy = false
       @tid = SecureRandom.hex(6)
-      @fetcher = BasicFetch.new(manager.queues)
+      @fetcher = manager.fetch_class.new(manager.queues)
     end
 
     def start!
       @thread = Thread.new { run }
     end
 
+    # True while executing a job (as opposed to fetching or idle) — what
+    # `Manager#stop!` uses to tell a thread that will exit on its own within
+    # one fetch timeout from one stuck in a long job.
+    def busy?
+      @busy
+    end
+
     private
 
+    # An error escaping one iteration (a Redis blip in `retrieve_work` or
+    # the in-flight bookkeeping) is logged and the loop carries on after
+    # ERROR_BACKOFF — it used to end the thread for good, with nothing ever
+    # restarting it, so the process silently lost capacity one slot at a
+    # time.
     def run
       until @manager.stopping?
-        if @manager.quiet?
-          sleep(0.5)
-          next
-        end
-
-        work = @fetcher.retrieve_work
-        next unless work
-
-        @manager.processor_busy!
         begin
-          execute(work)
-        ensure
-          @manager.processor_idle!
+          process_one
+        rescue StandardError => e
+          Cogworker.logger.error { "Processor error: #{e.class}: #{e.message}" }
+          sleep(ERROR_BACKOFF)
         end
       end
-    rescue StandardError => e
-      Cogworker.logger.error { "Processor thread died: #{e.class}: #{e.message}" }
+    end
+
+    def process_one
+      if @manager.quiet?
+        sleep(0.5)
+        return
+      end
+
+      work = @fetcher.retrieve_work
+      return unless work
+
+      # Fetched after shutdown began (e.g. still blocked in BRPOP when
+      # `Manager#stop!` requeued unfinished work, which it then popped right
+      # back): hand it back rather than start it, since the process is about
+      # to exit underneath it.
+      return @fetcher.give_back(work) if @manager.stopping?
+
+      @manager.processor_busy!
+      @busy = true
+      begin
+        execute(work)
+      ensure
+        @busy = false
+        @manager.processor_idle!
+        acknowledge(work)
+      end
+    end
+
+    # A failed ack leaves an already-finished job on this process's own
+    # in-progress list, where `Manager#stop!` would later requeue it — a
+    # silent second run. Retried briefly, then logged with the jid so that
+    # duplicate can at least be traced.
+    def acknowledge(work)
+      attempts = 0
+      begin
+        attempts += 1
+        @fetcher.acknowledge(work)
+      rescue StandardError => e
+        if attempts < ACK_ATTEMPTS
+          sleep(0.1 * attempts)
+          retry
+        end
+        Cogworker.logger.error do
+          "couldn't acknowledge finished job jid=#{jid_of(work)} after #{attempts} attempts " \
+            "(it may run again on shutdown): #{e.class}: #{e.message}"
+        end
+      end
+    end
+
+    def jid_of(work)
+      JSON.parse(work.raw_job)['jid']
+    rescue StandardError
+      '?'
     end
 
     def execute(work)
-      job = JSON.parse(work.raw_job)
+      job = parse_job(work)
+      return unless job
+
       register_in_workers(work.queue, job)
       Cogworker.logger.info { "start: #{job['class']} jid=#{job['jid']}" }
 
@@ -89,6 +150,30 @@ module Cogworker
       deregister_from_workers
     end
 
+    # A payload that isn't a JSON object goes straight to `dead`
+    # (`JobUtil.unparseable_job`), and `nil` tells `execute` to skip it.
+    # Before this, `JSON.parse` raised outside any rescue: the job was lost
+    # and the processor thread died with it.
+    def parse_job(work)
+      job = JSON.parse(work.raw_job)
+      raise JSON::ParserError, "expected a JSON object, got #{job.class}" unless job.is_a?(Hash)
+
+      job
+    rescue JSON::ParserError => e
+      bury_unparseable(work, e)
+      nil
+    end
+
+    def bury_unparseable(work, error)
+      job = JobUtil.unparseable_job(work.raw_job, queue: work.queue, error: error)
+      Cogworker.config.redis do |c|
+        c.zadd(RedisKeys::DEAD, job['failed_at'], JSON.generate(job))
+        c.incr(RedisKeys::STATS_FAILED)
+      end
+      Throughput.record('failed')
+      Cogworker.logger.error { "unparseable job on queue #{work.queue} moved to dead: #{error.message}" }
+    end
+
     def build_worker(job)
       klass = Object.const_get(job['class'])
       worker = klass.new
@@ -108,10 +193,27 @@ module Cogworker
       if new_count <= max_retries
         delay = retry_delay(new_count)
         Cogworker.config.redis { |c| c.zadd(RedisKeys::RETRY, Time.now.to_f + delay, JSON.generate(job)) }
+        extend_locks_for_retry(job, delay)
         Attempts.record(job['jid'], attempt: new_count, error: error, outcome: 'retrying')
       else
         Cogworker.config.redis { |c| c.zadd(RedisKeys::DEAD, Time.now.to_f, JSON.generate(job)) }
         Attempts.record(job['jid'], attempt: new_count, error: error, outcome: 'dead')
+      end
+    end
+
+    # A job waiting out its retry backoff still holds its `until_executed`
+    # lock(s) — extended here to cover that whole wait plus the usual
+    # `unique_lock_ttl`, since a fixed TTL counted from the original push
+    # ran out during a long retry series (the delay grows as `count**4`)
+    # and let a duplicate in. Owner-checked, so a lock that has since
+    # passed to another jid is left alone.
+    def extend_locks_for_retry(job, delay)
+      ttl = delay + Cogworker.config.unique_lock_ttl
+      Cogworker.config.redis do |c|
+        if UniqueJobs.until_executed?(job)
+          OwnedKey.expire(RedisKeys.unique_lock(UniqueJobs.digest(job)), job['jid'], ttl, c)
+        end
+        Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], ttl, c) if job['periodic_pjid']
       end
     end
 

@@ -29,8 +29,12 @@ module Cogworker
       config.server_middleware { |chain| chain.add(ServerMiddleware, expiration.to_i) }
     end
 
+    # A Symbol (`:queued`, `:working`, `:retrying`, `:complete`, `:failed`,
+    # or `:stopped`/`:interrupted` if something external wrote those), or
+    # `nil` for an unknown/expired jid. `get` below stays the raw stored
+    # Hash, string values and all.
     def status(jid)
-      Storage.read(jid)&.fetch('status', nil)
+      Storage.read(jid)&.fetch('status', nil)&.to_sym
     end
 
     def get(jid)

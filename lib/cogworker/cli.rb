@@ -8,8 +8,15 @@ module Cogworker
   # `-r/--require <file>`, `-C/--config <file>`, `-L/--logfile <file>`,
   # `-q/--queue <name>[,<weight>]` (repeatable).
   class CLI
+    # Read (first set wins) for the default environment, and all written
+    # back with the resolved one — whichever of them the app's own boot
+    # code reads (Rails: RAILS_ENV, then RACK_ENV; Rack apps: RACK_ENV/
+    # APP_ENV) sees the same value `-e` asked for.
+    ENV_VARS = %w[APP_ENV RAILS_ENV RACK_ENV].freeze
+
     def self.parse(argv)
-      options = { queues: [], require_path: nil, environment: ENV['APP_ENV'] || ENV['RACK_ENV'] || 'development' }
+      environment = ENV_VARS.filter_map { |k| ENV.fetch(k, nil) }.first || 'development'
+      options = { queues: [], require_path: nil, environment: environment }
 
       OptionParser.new do |o|
         o.on('-e ENV', '--environment ENV') { |v| options[:environment] = v }
@@ -34,11 +41,14 @@ module Cogworker
     # forked child with the exact same flags it was started with.
     def run(argv)
       options = self.class.parse(argv)
+      # Before the config file (its ERB may read these) and the app code.
+      ENV_VARS.each { |k| ENV[k] = options[:environment] }
       file_config = ConfigLoader.load(options[:config_path])
 
       Cogworker.server_process!
       Cogworker.config.concurrency = options[:concurrency] || file_config[:concurrency]&.to_i || Cogworker.config.concurrency
       Cogworker.config.queues = options[:queues].any? ? options[:queues] : (file_config[:queues] || Cogworker.config.queues)
+      Cogworker.config.fetch = file_config[:fetch] if file_config[:fetch]
 
       redirect_logfile(options[:logfile]) if options[:logfile]
       require_app_code(options[:require_path]) if options[:require_path]

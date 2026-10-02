@@ -52,12 +52,12 @@ module Cogworker
           end
 
           app.post('/schedules/:pjid/disable') do
-            Cogworker.config.redis { |c| c.sadd(RedisKeys::PERIODIC_DISABLED, url_params('pjid')) }
+            Cogworker.config.redis { |c| c.sadd?(RedisKeys::PERIODIC_DISABLED, url_params('pjid')) }
             Routes::Schedules.respond(self)
           end
 
           app.post('/schedules/:pjid/enable') do
-            Cogworker.config.redis { |c| c.srem(RedisKeys::PERIODIC_DISABLED, url_params('pjid')) }
+            Cogworker.config.redis { |c| c.srem?(RedisKeys::PERIODIC_DISABLED, url_params('pjid')) }
             Routes::Schedules.respond(self)
           end
         end

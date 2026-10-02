@@ -1,0 +1,11 @@
+# frozen_string_literal: true
+
+# CI matrix gemfile (see .github/workflows/ci.yml): the gem's own
+# dependencies, with redis-rb pinned to the 4.x line. No lockfile is
+# committed for it, so bundler resolves dependencies against whichever Ruby
+# runs it — e.g. zeitwerk 2.6.x on Ruby 3.1, which newer zeitwerk drops.
+source 'https://rubygems.org'
+
+gemspec path: '..'
+
+gem 'redis', '~> 4.8.0'

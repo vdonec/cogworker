@@ -22,8 +22,11 @@ module Cogworker
 
       private
 
+      # Owner-checked: if this job's lock already expired and passed to a
+      # newer copy, this must not release *that* one's lock (which would let
+      # a third copy in while the newer one is still running).
       def release(job)
-        Cogworker.config.redis { |c| c.del(RedisKeys.unique_lock(UniqueJobs.digest(job))) }
+        OwnedKey.delete(RedisKeys.unique_lock(UniqueJobs.digest(job)), job['jid'])
       end
     end
   end

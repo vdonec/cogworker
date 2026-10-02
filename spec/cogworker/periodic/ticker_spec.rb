@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'stringio'
 
 RSpec.describe Cogworker::Periodic::Ticker do
   let(:entry) do
@@ -22,9 +23,63 @@ RSpec.describe Cogworker::Periodic::Ticker do
     expect(Cogworker.config.redis { |c| c.get("periodic:running:#{entry.pjid}") }).to eq(job['jid'])
   end
 
+  it 'gives the running lock a TTL, so a run whose process dies cannot hold the entry forever' do
+    described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
+
+    ttl = Cogworker.config.redis { |c| c.ttl("periodic:running:#{entry.pjid}") }
+    expect(ttl).to be_between(1, Cogworker.config.unique_lock_ttl)
+  end
+
+  it 'does not leave the running lock behind when the job finishes before Client.push even returns ' \
+     '(regression: the lock used to be written after the push, resurrecting a lock the job had already released)' do
+    TickerJob.define_method(:perform) { |*| nil }
+    Cogworker::Testing.inline! do
+      described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
+    end
+
+    expect(Cogworker.config.redis { |c| c.get("periodic:running:#{entry.pjid}") }).to be_nil
+  end
+
+  it 'releases the running lock when the push produced no job' do
+    allow(Cogworker::Client).to receive(:push).and_return(nil)
+    described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
+
+    expect(Cogworker.config.redis { |c| c.get("periodic:running:#{entry.pjid}") }).to be_nil
+  end
+
+  it 'keeps ticking after a failed tick instead of letting the thread die' do
+    manager = double(quiet?: false)
+    allow(manager).to receive(:stopping?).and_return(false, false, true)
+    ticker = described_class.new(manager, [entry])
+    calls = 0
+    allow(ticker).to receive(:tick) { (calls += 1) == 1 ? raise(Redis::CannotConnectError, 'blip') : nil }
+    allow(ticker).to receive(:sleep)
+
+    expect { ticker.send(:run) }.not_to raise_error
+    expect(calls).to eq(2)
+  end
+
+  it 'still claims with a fractional unique_lock_ttl (SET ... EX only takes whole seconds)' do
+    Cogworker.config.unique_lock_ttl = 3600.5
+    described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
+
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+    expect(Cogworker.config.redis { |c| c.ttl("periodic:running:#{entry.pjid}") }).to be_between(3600, 3601)
+  end
+
+  it 'warns when a client middleware changed the jid the running lock was claimed under' do
+    allow(Cogworker::Client).to receive(:push).and_return('rewritten-jid')
+    log = StringIO.new
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(log))
+
+    described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
+
+    expect(log.string).to include("changed the job's jid")
+  end
+
   it "skips claim/enqueue entirely for a disabled entry (Routes::Schedules' own \"Disable\") — no job, " \
      "no running lock, and periodic:last_slot doesn't advance either" do
-    Cogworker.config.redis { |c| c.sadd('periodic:disabled', entry.pjid) }
+    Cogworker.config.redis { |c| c.sadd?('periodic:disabled', entry.pjid) }
     ticker = described_class.new(double(stopping?: false, quiet?: false), [entry])
 
     ticker.send(:tick)
@@ -39,12 +94,12 @@ RSpec.describe Cogworker::Periodic::Ticker do
      "still succeeds (a *second* Ticker instance here, matching this spec's own race test just below: " \
      'the first instance\'s own in-memory @last_checked_slot would otherwise mask this, since — exactly ' \
      'like a lost claim race already does — it dedups a slot it saw at all, disabled or not, and doesn\'t ' \
-     "re-check it again until the cron rolls over to a new one)" do
-    Cogworker.config.redis { |c| c.sadd('periodic:disabled', entry.pjid) }
+     're-check it again until the cron rolls over to a new one)' do
+    Cogworker.config.redis { |c| c.sadd?('periodic:disabled', entry.pjid) }
     described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
     expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(0)
 
-    Cogworker.config.redis { |c| c.srem('periodic:disabled', entry.pjid) }
+    Cogworker.config.redis { |c| c.srem?('periodic:disabled', entry.pjid) }
     described_class.new(double(stopping?: false, quiet?: false), [entry]).send(:tick)
 
     expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)

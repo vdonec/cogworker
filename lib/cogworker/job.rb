@@ -50,6 +50,15 @@ module Cogworker
         Testing.jobs_for(name).clear
       end
 
+      # Run this class's recorded fake-mode jobs — see `Testing.perform_one`.
+      def perform_one
+        Testing.perform_one(name)
+      end
+
+      def drain
+        Testing.drain(name)
+      end
+
       private
 
       def job_payload(extra)

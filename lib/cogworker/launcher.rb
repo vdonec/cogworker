@@ -22,9 +22,10 @@ module Cogworker
     def run
       Cogworker.reset_identity!
       install_signal_traps
+      resolve_periodic_classes
+      @heartbeat.start! # first: see Heartbeat#start!
       @manager.start!
       @scheduled.start!
-      @heartbeat.start!
       @ticker.start!
       log_startup_info
       watch_signals
@@ -42,6 +43,24 @@ module Cogworker
     end
 
     private
+
+    # Resolves every periodic entry's class here, on the main thread, before
+    # any processor thread exists. `Processor#build_worker` otherwise does
+    # the first `const_get` lazily on whichever processor thread picks the
+    # job up — and with an app autoloader that isn't thread-safe, two
+    # threads racing to autoload the same class (or its base class) can see
+    # it half-defined (`undefined method 'perform'`). A class that can't be
+    # resolved is only logged: every run of that entry will fail the same
+    # way (and show up in Dead/History), but it shouldn't keep the rest of
+    # the process from booting. Regular job classes aren't known up front —
+    # eager-load the app in the init file for those (see README).
+    def resolve_periodic_classes
+      @config.periodic_manager.entries.map(&:class_name).uniq.each do |name|
+        Object.const_get(name)
+      rescue NameError => e
+        Cogworker.logger.warn { "periodic job class #{name} can't be resolved: #{e.message}" }
+      end
+    end
 
     # Logged once all components are up, so the operator's console shows a
     # single summary (version/identity/pid/concurrency/queues/redis target)

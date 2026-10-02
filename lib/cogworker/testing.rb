@@ -14,8 +14,9 @@ module Cogworker
   #   but the normalized job hash is appended to `jobs_for(klass_name)`
   #   instead of touching Redis — nothing is scheduled or executed. Use
   #   `SomeJob.jobs` (added to `Job::ClassMethods`) to assert what got
-  #   pushed, `SomeJob.clear`/`Testing.clear_jobs!` to reset between
-  #   examples.
+  #   pushed, `SomeJob.perform_one`/`SomeJob.drain`/`Testing.drain_all` to
+  #   then actually run them, `SomeJob.clear`/`Testing.clear_jobs!` to reset
+  #   between examples.
   # - `:inline` — the job runs synchronously, right here in the calling
   #   thread, through the real server middleware chain
   #   (`Cogworker.config.server_chain`) — same as `Processor#execute`, minus
@@ -75,8 +76,31 @@ module Cogworker
         registry.clear
       end
 
+      # Fake mode's "now run them": `perform_one` takes the oldest recorded
+      # job for a class off its fake queue and runs it via `perform_inline`
+      # (real server middleware chain, errors propagate); `drain` repeats
+      # until that class's queue is empty, `drain_all` until every class's
+      # is — both also running whatever those jobs push in turn. Also
+      # reachable as `SomeJob.perform_one`/`SomeJob.drain`.
+      def perform_one(klass_name)
+        job = jobs_for(klass_name).shift
+        raise EmptyQueueError, "no #{klass_name} jobs recorded" unless job
+
+        perform_inline(job)
+      end
+
+      def drain(klass_name)
+        perform_one(klass_name) until jobs_for(klass_name).empty?
+      end
+
+      def drain_all
+        while (klass_name = registry.find { |_name, jobs| jobs.any? }&.first)
+          drain(klass_name)
+        end
+      end
+
       # Runs one job synchronously through the real server middleware chain.
-      # Only ever called from `Client.push` while `inline?`.
+      # Called from `Client.push` while `inline?`, and by `perform_one`.
       def perform_inline(job)
         klass = Object.const_get(job['class'])
         worker = klass.new

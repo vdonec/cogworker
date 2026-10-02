@@ -195,7 +195,7 @@ RSpec.describe 'Web UI (real browser)' do
 
     expect(page).to have_no_content('SystemDeadJob')
     expect(page.current_path).to eq('/jobs')
-    expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw])
+    expect(queued_jobs).to eq([JSON.parse(raw)])
   end
 
   it 'renders scheduled times in the browser timezone, not server UTC, per the configured format' do

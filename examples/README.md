@@ -72,7 +72,7 @@ triggers a phased (one-at-a-time) restart of its children when
 Check a job's status from any Ruby console that requires `./init.rb`:
 
 ```ruby
-Cogworker::Status.status(jid)  # "queued" / "working" / "retrying" / "complete" / "failed"
+Cogworker::Status.status(jid)  # :queued / :working / :retrying / :complete / :failed
 ```
 
 The **Schedules** tab lists every `config.periodic { |mgr|

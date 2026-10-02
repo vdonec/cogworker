@@ -2,6 +2,7 @@
 
 require 'spec_helper'
 require 'json'
+require 'stringio'
 
 RSpec.describe 'Manager + Processor end-to-end execution' do
   after do
@@ -113,7 +114,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     raw = JSON.generate('jid' => 'ghostjid', 'class' => 'TotallyUndefinedGhostJob', 'args' => [],
                         'queue' => 'default', 'retry' => 0)
     Cogworker.config.redis do |c|
-      c.sadd('cogworker:queues', 'default')
+      c.sadd?('cogworker:queues', 'default')
       c.lpush('cogworker:queue:default', raw)
     end
 
@@ -127,7 +128,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     expect(entry).not_to be_nil, 'expected the History entry for the unresolvable class to exist'
     expect(entry['error_class']).to eq('NameError')
 
-    expect(Cogworker::Status.status('ghostjid')).to eq('failed')
+    expect(Cogworker::Status.status('ghostjid')).to eq(:failed)
   end
 
   it "a job with retry: false (the literal boolean, not 0) doesn't crash Status middleware — " \
@@ -152,7 +153,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     wait_for { Cogworker::Stats.new.dead_size == 1 }
     jid = Cogworker.config.redis { |c| c.zrange('cogworker:dead', 0, 0) }.first
                    .then { |raw| JSON.parse(raw)['jid'] }
-    expect(Cogworker::Status.status(jid)).to eq('failed')
+    expect(Cogworker::Status.status(jid)).to eq(:failed)
   end
 
   it 'registers and deregisters in-flight jobs in the WorkSet while running' do
@@ -177,5 +178,77 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
 
     gate << :go
     wait_for { Cogworker::WorkSet.new.size == 0 } # rubocop:disable Style/ZeroLengthPredicate -- WorkSet has no #empty? (Enumerable doesn't provide one)
+  end
+
+  it 'moves an unparseable payload to dead and keeps processing the next job on the same thread' do
+    executed = Queue.new
+    stub_const('AfterJunkJob', Class.new do
+      include Cogworker::Worker
+    end)
+    AfterJunkJob.define_method(:perform) { executed << :ok }
+
+    Cogworker.config.concurrency = 1
+    Cogworker.config.redis { |c| c.lpush('cogworker:queue:default', '{not json') }
+    AfterJunkJob.perform_async
+
+    @manager = Cogworker::Manager.new
+    @manager.start!
+
+    expect(wait_for { executed.pop(true) rescue nil }).to eq(:ok) # rubocop:disable Style/RescueModifier
+    dead = Cogworker.config.redis { |c| c.zrange('cogworker:dead', 0, -1) }.map { |raw| JSON.parse(raw) }
+    expect(dead.size).to eq(1)
+    expect(dead.first).to include('class' => '(unparseable)', 'queue' => 'default',
+                                  'error_class' => 'JSON::ParserError', 'raw_payload' => '{not json')
+    expect(Cogworker::Stats.new.failed).to eq(1)
+  end
+
+  it 'survives an error while fetching instead of the thread dying for good' do
+    executed = Queue.new
+    stub_const('AfterBlipJob', Class.new do
+      include Cogworker::Worker
+    end)
+    AfterBlipJob.define_method(:perform) { executed << :ok }
+    AfterBlipJob.perform_async
+
+    Cogworker.config.concurrency = 1
+    @manager = Cogworker::Manager.new
+    fetcher_calls = 0
+    original = @manager.fetch_class.instance_method(:retrieve_work)
+    allow_any_instance_of(@manager.fetch_class).to receive(:retrieve_work) do |fetcher|
+      (fetcher_calls += 1) == 1 ? raise(Redis::CannotConnectError, 'blip') : original.bind_call(fetcher)
+    end
+    @manager.start!
+
+    expect(wait_for { executed.pop(true) rescue nil }).to eq(:ok) # rubocop:disable Style/RescueModifier
+    expect(fetcher_calls).to be >= 2
+  end
+
+  describe 'acknowledging a finished job' do
+    let(:processor) { Cogworker::Processor.new(Cogworker::Manager.new) }
+    let(:fetcher) { processor.instance_variable_get(:@fetcher) }
+    let(:work) { Cogworker::BasicFetch::UnitOfWork.new('default', JSON.generate('jid' => 'ackjid')) }
+    let(:log) { StringIO.new }
+
+    before do
+      allow(processor).to receive(:sleep)
+      allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(log))
+    end
+
+    it 'retries a failed ack' do
+      calls = 0
+      allow(fetcher).to receive(:acknowledge) { (calls += 1) < 3 ? raise(Redis::CannotConnectError, 'blip') : nil }
+
+      processor.send(:acknowledge, work)
+
+      expect(calls).to eq(3)
+      expect(log.string).to be_empty
+    end
+
+    it 'logs the jid when every attempt fails, without raising' do
+      allow(fetcher).to receive(:acknowledge).and_raise(Redis::CannotConnectError, 'blip')
+
+      expect { processor.send(:acknowledge, work) }.not_to raise_error
+      expect(log.string).to include("couldn't acknowledge finished job jid=ackjid after 3 attempts")
+    end
   end
 end

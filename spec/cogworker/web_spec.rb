@@ -725,7 +725,7 @@ RSpec.describe Cogworker::Web do
       # background threads just to get a second identity into the set.
       Cogworker.config.redis do |c|
         %w[proc-a proc-b].each do |identity|
-          c.sadd(Cogworker::RedisKeys::PROCESSES, identity)
+          c.sadd?(Cogworker::RedisKeys::PROCESSES, identity)
           c.hset(Cogworker::RedisKeys.process(identity),
                  'info', JSON.generate('concurrency' => 3, 'queues' => ['default'], 'started_at' => Time.now.to_f),
                  'busy', '0', 'quiet', 'false')
@@ -1224,7 +1224,7 @@ RSpec.describe Cogworker::Web do
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('HxRetryNowJob') # gone from the Retrying-filtered view
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(0)
-      expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw])
+      expect(queued_jobs).to eq([JSON.parse(raw)])
     end
 
     it 'Jobs retrying/reschedule moves the entry to a new score, in-place — same raw payload/attempt count' do
@@ -1297,7 +1297,37 @@ RSpec.describe Cogworker::Web do
       expect(resp.status).to eq(200)
       expect(resp.body).not_to include('HxDeadRetryJob') # gone from the Dead-filtered view
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(0)
-      expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw])
+      expect(queued_jobs).to eq([JSON.parse(raw)])
+    end
+
+    it 'Dead-retry/retry-now on an entry with no queue of its own leaves it in place instead of losing it ' \
+       '(regression: zrem ran first, then the requeue raised on the nil queue)' do
+      buried = JSON.generate(Cogworker::JobUtil.unparseable_job('{not json', queue: nil,
+                                                                 error: JSON::ParserError.new('x')))
+      queueless = JSON.generate('jid' => 'noqueue', 'class' => 'X', 'args' => [])
+      Cogworker.config.redis do |c|
+        c.zadd('cogworker:dead', Time.now.to_f, buried)
+        c.zadd('cogworker:retry', Time.now.to_f + 60, queueless)
+      end
+
+      expect(hx_post('/jobs/dead/retry', 'raw' => buried).status).to eq(200)
+      expect(hx_post('/jobs/retrying/retry_now', 'raw' => queueless).status).to eq(200)
+
+      expect(Cogworker.config.redis { |c| c.zrange('cogworker:dead', 0, -1) }).to eq([buried])
+      expect(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, -1) }).to eq([queueless])
+      expect(queued_jobs).to be_empty
+    end
+
+    it 'offers only Delete, not Retry, for an unparseable Dead entry' do
+      buried = JSON.generate(Cogworker::JobUtil.unparseable_job('{not json', queue: 'default',
+                                                                 error: JSON::ParserError.new('x')))
+      Cogworker.config.redis { |c| c.zadd('cogworker:dead', Time.now.to_f, buried) }
+
+      body = Rack::MockRequest.new(Cogworker::Web).get('/jobs?status=Dead').body
+
+      expect(body).to include('(unparseable)')
+      expect(body).to include('jobs/dead/delete')
+      expect(body).not_to include('jobs/dead/retry')
     end
 
     it "retrying the same Dead entry twice doesn't double-enqueue it — zrem returning 0 the second time gates it" do
@@ -1306,7 +1336,7 @@ RSpec.describe Cogworker::Web do
 
       2.times { hx_post('/jobs/dead/retry', 'raw' => raw) }
 
-      expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw])
+      expect(queued_jobs).to eq([JSON.parse(raw)])
     end
 
     it 'Jobs Dead-delete-all via hx-post clears every dead entry (and its attempt log) at once' do
@@ -1431,7 +1461,7 @@ RSpec.describe Cogworker::Web do
 
       expect(resp.status).to eq(200)
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(1) # only the "low" entry remains
-      expect(Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }).to eq([raw_default])
+      expect(queued_jobs).to eq([JSON.parse(raw_default)])
       expect(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, -1) }).to eq([raw_low])
       # Nothing left retrying on "default" any more — the button disappears.
       expect(resp.body).not_to include('>retry all<')

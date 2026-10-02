@@ -11,7 +11,7 @@ module Cogworker
       identities.each do |identity|
         info = Cogworker.config.redis { |c| c.hgetall(RedisKeys.process(identity)) }
         if info.empty?
-          Cogworker.config.redis { |c| c.srem(RedisKeys::PROCESSES, identity) }
+          Cogworker.config.redis { |c| c.srem?(RedisKeys::PROCESSES, identity) }
           next
         end
 

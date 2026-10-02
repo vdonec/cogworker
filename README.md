@@ -75,6 +75,16 @@ both places.
 Redis options are `url:`, or `host:`/`port:`/`password:`/`db:`. On the
 server, the connection pool size is `concurrency + 5`.
 
+Load your job classes up front, in the init file, rather than leaving them to
+an autoloader. A worker resolves a job's class on whichever of its threads
+picks the job up, so with an autoloader that isn't thread-safe, two threads
+can race to load the same class and one of them sees it half-defined
+(`undefined method 'perform'`). With Rails, keep `config.eager_load = true`
+in the environment the worker runs in; with Zeitwerk on its own, call
+`loader.eager_load` after `loader.setup`. Classes named in
+`config.periodic` are resolved on the main thread at boot either way, and one
+that can't be found is logged as a warning.
+
 ### 4. Start a worker
 
 ```sh
@@ -92,7 +102,7 @@ bundle exec cogworker -r ./config/cogworker.rb -C ./config/cogworker.yml
 | `-c, --concurrency N` | number of worker threads (default 10) |
 | `-q, --queue NAME[,WEIGHT]` | a queue with an optional weight; repeatable; overrides `:queues:` from the config file |
 | `-L, --logfile PATH` | write the log to a file |
-| `-e, --environment ENV` | environment (default `APP_ENV`/`RACK_ENV`/`development`) |
+| `-e, --environment ENV` | environment (default `APP_ENV`/`RAILS_ENV`/`RACK_ENV`/`development`); exported as `APP_ENV`, `RAILS_ENV` and `RACK_ENV` before the config file and app code are loaded |
 
 ### YAML config
 
@@ -105,6 +115,7 @@ The file is rendered through ERB before it is parsed:
   - default
   - default   # repeating a queue sets its weight: default is polled twice as often as low
   - low
+:fetch: reliable   # or basic — see "Fetch modes" below
 ```
 
 CLI flags take precedence over the file.
@@ -114,7 +125,26 @@ CLI flags take precedence over the file.
 | Signal | Effect |
 |---|---|
 | `TSTP` | quiet: stop fetching new jobs; jobs already running are finished |
-| `TERM` / `INT` | graceful stop: wait for running jobs (up to 25 s), then exit |
+| `TERM` / `INT` | graceful stop: wait for running jobs (up to 25 s), put any still unfinished back on their queues, then exit |
+
+### Fetch modes
+
+`config.fetch` (or `:fetch:` in the YAML file) picks how workers take jobs
+off their queues:
+
+- `:reliable` (default, needs Redis >= 6.2): a job is moved atomically onto
+  the process's own in-progress list and stays there until it has finished.
+  If the process dies mid-job (OOM, `SIGKILL`, a lost host), the job is put
+  back on its queue by another live process once the dead one's heartbeat
+  has expired, within about two minutes. Queues are polled rather than
+  blocked on, so an idle worker picks up a new job within 0.25 s.
+- `:basic`: a single blocking `BRPOP` across all queues, as in earlier
+  versions. A job popped by a process that then dies is lost.
+
+On Redis older than 6.2, `:reliable` falls back to `:basic` with a warning.
+Either way delivery is *at least once*: a job that was partly done when its
+process died or was stopped runs again from the start, so make jobs safe to
+repeat.
 
 ### Multiple processes (swarm)
 
@@ -124,7 +154,9 @@ COGWORKER_COUNT=4 PHASED_RESTART=true \
 ```
 
 `cogworkerswarm` accepts the same flags as `cogworker`. It forks
-`COGWORKER_COUNT` child processes and restarts any that die. With
+`COGWORKER_COUNT` child processes and restarts any that die. A child that
+keeps crashing within 30 s of starting is restarted with an exponential
+backoff (1 s, 2 s, 4 s, … up to 60 s) instead of in a tight loop. With
 `PHASED_RESTART=true`, sending `USR2` to the parent restarts the children one
 at a time, so processing never stops. `TERM`/`INT` are forwarded to all
 children.
@@ -149,6 +181,19 @@ Subclasses inherit options. Any other keys (for example
 `lock_run: :while_executing`) are copied unchanged into the job hash, where
 your own middleware can read them.
 
+### Job arguments
+
+Arguments are stored as JSON and are neither validated nor coerced on the
+way in, so `perform` receives whatever survives a JSON round trip: Symbols
+come back as Strings, Hash keys as Strings, and objects like `Time` as their
+`to_s`. Pass plain JSON types (String, Integer, Float, `true`/`false`/`nil`,
+Array, Hash with String keys) to get back exactly what you pushed.
+`Cogworker.strict_args!` is accepted but does nothing: since there's no
+coercion, there's nothing to make stricter.
+
+`Testing.fake!`/`inline!` skip that round trip, so a test can pass while a
+real worker would receive Strings instead of Symbols.
+
 ### Retries and Dead
 
 A failed job moves to the Retry set with a growing delay
@@ -161,7 +206,9 @@ With `unique: :until_executed`, calling `perform_async` again with the same
 arguments returns `nil` instead of a jid while the original job is still
 enqueued or running. The lock is released when the job succeeds or fails for
 the last time. In case a process crashes, the lock also has a safety TTL,
-`config.unique_lock_ttl` (default 24 h).
+`config.unique_lock_ttl` (default 24 h), counted from when the job is due (so
+a `perform_in` further out than that keeps its lock) and extended by the
+backoff each time an attempt fails and will be retried.
 
 ## Middleware
 
@@ -214,7 +261,9 @@ end
 Each schedule slot runs **exactly once**, no matter how many processes are
 running. Processes claim a slot atomically in Redis, with no leader. With
 `unique: :until_executed`, a new slot is skipped while the previous run is
-still in progress.
+still in progress. If the process running it dies (OOM, `SIGKILL`), the entry
+frees itself within a minute, since that lock is kept alive by the running
+process's heartbeat.
 
 On first start against an empty Redis, each entry's most recent due slot
 fires right away. To turn that off, set `config.periodic_catch_up = false`.
@@ -239,7 +288,7 @@ class ImportJob
   end
 end
 
-Cogworker::Status.status(jid) # => "queued" | "working" | "retrying" | "complete" | "failed"
+Cogworker::Status.status(jid) # => :queued | :working | :retrying | :complete | :failed (nil if unknown)
 Cogworker::Status.get(jid)    # => the full hash: status, pct, message, ...
 ```
 
@@ -312,6 +361,12 @@ Unsafe methods (POST etc.) are accepted only with
 `Sec-Fetch-Site: same-origin`. To allow an exception (for example, an SSO
 callback), override `Cogworker::Web.safe_request?(env)`.
 
+The Web UI's session cookie (used only by middleware you add with `.use`) is
+signed with a random per-process secret by default. When running several
+web processes (e.g. Puma workers), set the same secret for all of them —
+`Cogworker::Web.session_secret = '...'` (at least 64 characters) or the
+`COGWORKER_SESSION_SECRET` environment variable.
+
 ### Extensions
 
 ```ruby
@@ -371,6 +426,9 @@ Cogworker::Testing.fake!   # jobs are collected in memory; Redis isn't touched
 GreetingJob.perform_async('bob')
 expect(GreetingJob.jobs.size).to eq(1)
 expect(GreetingJob.jobs.first['args']).to eq(['bob'])
+GreetingJob.perform_one    # run the oldest recorded job (raises Testing::EmptyQueueError if none)
+GreetingJob.drain          # run them all, including jobs they enqueue
+Cogworker::Testing.drain_all   # the same, for every job class
 GreetingJob.clear          # or Cogworker::Testing.clear_jobs!
 
 Cogworker::Testing.inline! do
@@ -401,6 +459,15 @@ bundle exec rubocop
 To use a different test Redis, set `COGWORKER_TEST_REDIS_URL`. The browser
 tests (`spec/cogworker/web_system_spec.rb`) need Chrome or Chromium
 installed.
+
+CI runs the suite on Ruby 3.1–4.0 against both redis-rb 4.8 and 5.x, via
+`gemfiles/redis_4.gemfile` / `gemfiles/redis_5.gemfile`. To reproduce one
+combination locally:
+
+```sh
+BUNDLE_GEMFILE=gemfiles/redis_4.gemfile bundle install
+BUNDLE_GEMFILE=gemfiles/redis_4.gemfile bundle exec rspec
+```
 
 `COGWORKER_RELOAD=true` hot-reloads the code (via Zeitwerk) on every Web UI
 request. Use it only in development, and only for the web process:
