@@ -36,12 +36,14 @@ module Cogworker
         return 1
       LUA
 
-      def initialize(manager, entries, catch_up: true)
+      def initialize(manager, entries, catch_up: true, ready: -> { true })
         @manager = manager
         @entries = entries
         @catch_up = catch_up
+        @ready = ready
         @last_checked_slot = {}
         @cron_cache = {}
+        @pending_rollbacks = []
       end
 
       def start!
@@ -82,7 +84,7 @@ module Cogworker
       def run
         until @manager.stopping?
           begin
-            tick unless @manager.quiet?
+            tick unless @manager.quiet? || !@ready.call
           rescue StandardError => e
             Cogworker.logger.error { "Periodic tick failed: #{e.class}: #{e.message}" }
           end
@@ -91,6 +93,7 @@ module Cogworker
       end
 
       def tick
+        retry_pending_rollbacks
         now = Time.now
         @entries.each do |entry|
           slot = cron_for(entry).previous_time(now).to_i
@@ -114,13 +117,28 @@ module Cogworker
       # persisted last_slot) still advances either way, exactly as it
       # already did before this entry ever had a disabled state — it only
       # stops this same tick loop from re-evaluating the same slot twice.
+      # The usual reason a push fails — Redis unreachable — makes this fail
+      # too; it's then kept and retried at the start of every tick until it
+      # goes through (before that tick looks at the slot again), rather than
+      # just logged and the slot lost. (A push that timed out *after* Redis
+      # had applied it is the one case this turns into a second run of the
+      # slot: indistinguishable from one that never arrived.)
       def rollback_claim(entry, slot, previous_slot)
         Cogworker.config.redis do |c|
           keys = [RedisKeys.periodic_last_slot(entry.pjid), RedisKeys.periodic_lock(entry.pjid, slot)]
-          c.eval(ROLLBACK_SCRIPT, keys: keys, argv: [slot, previous_slot])
+          LuaScript.run(c, ROLLBACK_SCRIPT, keys: keys, argv: [slot, previous_slot])
         end
+        true
       rescue StandardError => e
-        Cogworker.logger.error { "periodic #{entry.pjid}: couldn't roll back slot #{slot}: #{e.class}: #{e.message}" }
+        Cogworker.logger.error { "periodic #{entry.pjid}: couldn't roll back slot #{slot} (will retry): #{e.class}: #{e.message}" }
+        @pending_rollbacks << [entry, slot, previous_slot]
+        false
+      end
+
+      def retry_pending_rollbacks
+        pending = @pending_rollbacks
+        @pending_rollbacks = []
+        pending.each { |args| rollback_claim(*args) }
       end
 
       def disabled?(entry)
@@ -137,7 +155,7 @@ module Cogworker
         return nil if !@catch_up && priming_first_slot?(entry, slot)
 
         result = Cogworker.config.redis do |c|
-          c.eval(CLAIM_SCRIPT,
+          LuaScript.run(c, CLAIM_SCRIPT,
                  keys: [RedisKeys.periodic_running(entry.pjid), RedisKeys.periodic_last_slot(entry.pjid),
                         RedisKeys.periodic_lock(entry.pjid, slot)],
                  argv: [slot, entry.unique.to_s, LOCK_TTL, jid, RunningLock.queued_ttl])

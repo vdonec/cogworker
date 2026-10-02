@@ -17,8 +17,12 @@ module Cogworker
   class BasicFetch
     TIMEOUT = 2 # seconds; also how often a stopped/quieted processor notices and exits its fetch loop.
 
-    def initialize(queues)
+    # `stopping:` lets a fetcher cut its own waits short once shutdown has
+    # begun (Processor passes the Manager's `stopping?`), so a long idle
+    # pause can't hold up `Manager#stop!`.
+    def initialize(queues, stopping: -> { false })
       @queue_keys = Array(queues).map { |q| RedisKeys.queue(q) }
+      @stopping = stopping
     end
 
     # Re-reads `cogworker:paused_queues` on every single fetch (not once at
@@ -33,7 +37,7 @@ module Cogworker
     def retrieve_work
       keys = active_keys
       if keys.empty?
-        sleep(TIMEOUT)
+        interruptible_sleep(TIMEOUT)
         return nil
       end
 
@@ -46,6 +50,12 @@ module Cogworker
 
     # Nothing to do: BRPOP already removed the job from Redis.
     def acknowledge(_work); end
+
+    # `Processor#interrupt`: the job ran, recording its failure failed —
+    # file it under `set` (retry/dead) at `score` instead.
+    def interrupt(_work, set, score, payload)
+      Cogworker.config.redis { |c| c.zadd(set, score, payload) }
+    end
 
     # Returns a fetched-but-unstarted job to the end of its queue that's
     # popped next.
@@ -75,13 +85,23 @@ module Cogworker
       queue_key = RedisKeys.queue(queue)
       retake = job['periodic_until_executed'] && job['periodic_pjid'] && job['jid']
       lock_key = retake ? RedisKeys.periodic_running(job['periodic_pjid']) : queue_key
-      conn.eval(REQUEUE_ENTRY_SCRIPT, keys: [queue_key, lock_key],
-                                      argv: [JSON.generate(job), retake ? '1' : '0', job['jid'].to_s,
+      LuaScript.run(conn, REQUEUE_ENTRY_SCRIPT, keys: [queue_key, lock_key],
+                                               argv: [JSON.generate(job), retake ? '1' : '0', job['jid'].to_s,
                                              Periodic::RunningLock.queued_ttl])
     end
     private_class_method :requeue_entry
 
     private
+
+    def interruptible_sleep(seconds)
+      deadline = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC) + seconds
+      until @stopping.call
+        left = deadline - ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        break if left <= 0
+
+        sleep([left, 0.25].min)
+      end
+    end
 
     def active_keys
       paused = Cogworker.config.redis { |c| c.smembers(RedisKeys::PAUSED_QUEUES) }

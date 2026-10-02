@@ -268,4 +268,93 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     expect(queued_jobs.map { |j| j['jid'] }).to eq([jid])
     expect(Cogworker.config.redis { |c| c.llen("cogworker:inprogress:#{Cogworker.identity}") }).to eq(0)
   end
+
+  describe 'what happens to a job after it has run' do
+    let(:manager) { Cogworker::Manager.new }
+    let(:processor) { Cogworker::Processor.new(manager) }
+    let(:log) { StringIO.new }
+
+    before { allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(log)) }
+
+    def counts
+      Cogworker.config.redis do |c|
+        { retry: c.zcard('cogworker:retry'), dead: c.zcard('cogworker:dead'), queued: c.llen('cogworker:queue:default'),
+          in_progress: c.llen("cogworker:inprogress:#{Cogworker.identity}") }
+      end
+    end
+
+    def define_job(name, &perform)
+      stub_const(name, Class.new { include Cogworker::Worker })
+      Object.const_get(name).define_method(:perform, &perform)
+    end
+
+    it 'records a failure whose message is not valid UTF-8 (it used to loop forever, re-running every second)' do
+      runs = 0
+      define_job('PoisonJob') { |*| (runs += 1) && raise("bad \xff".b) }
+      PoisonJob.perform_async
+
+      processor.send(:process_one)
+
+      expect(runs).to eq(1)
+      expect(counts).to eq(retry: 1, dead: 0, queued: 0, in_progress: 0)
+      retried = JSON.parse(Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, 0) }.first)
+      expect(retried['error_message']).to eq("bad \uFFFD")
+    end
+
+    it 'never re-runs a job that succeeded, when deregistering it or counting it fails afterwards' do
+      runs = 0
+      define_job('DoneJob') { |*| runs += 1 }
+      DoneJob.perform_async
+      allow(processor).to receive(:deregister_from_workers).and_raise(Redis::CannotConnectError, 'hdel failed')
+      allow(Cogworker::Throughput).to receive(:record).and_raise(Redis::CannotConnectError, 'incr failed')
+
+      processor.send(:process_one)
+
+      expect(runs).to eq(1)
+      expect(counts).to eq(retry: 0, dead: 0, queued: 0, in_progress: 0)
+      expect(log.string).to include('deregister failed (ignored)', 'stats failed (ignored)')
+    end
+
+    it 'leaves a failure that made it into retry there, even if what comes after (attempts log) fails' do
+      define_job('FlakyAfterJob') { |*| raise 'boom' }
+      FlakyAfterJob.perform_async
+      allow(Cogworker::Attempts).to receive(:record).and_raise(Redis::CannotConnectError, 'rpush failed')
+
+      processor.send(:process_one)
+
+      expect(counts).to eq(retry: 1, dead: 0, queued: 0, in_progress: 0)
+    end
+
+    it "interrupts a job whose failure can't be recorded into retry, with a delay and a count — never the queue" do
+      define_job('UnrecordableJob') { |*| raise 'boom' }
+      nan = Class.new do
+        def call(_worker, job, _queue)
+          job['poisoned'] = Float::NAN # makes JSON.generate(job) raise, every time
+          yield
+        end
+      end
+      Cogworker.config.server_middleware { |chain| chain.add(nan) }
+      UnrecordableJob.perform_async
+
+      processor.send(:process_one)
+
+      expect(counts).to eq(retry: 1, dead: 0, queued: 0, in_progress: 0)
+      raw, score = Cogworker.config.redis { |c| c.zrange('cogworker:retry', 0, 0, withscores: true) }.first
+      job = JSON.parse(raw)
+      expect(job).to include('interrupted_count' => 1, 'retry_count' => 1, 'error_class' => 'RuntimeError')
+      expect(job).not_to have_key('poisoned')
+      expect(score).to be_within(5).of(Time.now.to_f + Cogworker::Processor::INTERRUPT_DELAY)
+    end
+
+    it 'sends a job to dead once it has been interrupted more than MAX_INTERRUPTS times' do
+      raw = JSON.generate('jid' => 'int', 'class' => 'X', 'queue' => 'default', 'args' => [],
+                          'interrupted_count' => Cogworker::Processor::MAX_INTERRUPTS)
+      work = Cogworker::BasicFetch::UnitOfWork.new('default', raw)
+      Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw) } # as fetched
+
+      processor.send(:interrupt, work, { 'retry_count' => 4 }, RuntimeError.new('boom'))
+
+      expect(counts).to include(retry: 0, dead: 1)
+    end
+  end
 end

@@ -96,10 +96,32 @@ module Cogworker
       return :invalid unless job
 
       job['enqueued_at'] = Time.now.to_f
-      won = conn.eval(CLAIM_AND_REQUEUE_SCRIPT,
-                      keys: [set, RedisKeys::QUEUES, RedisKeys.queue(job['queue'])],
-                      argv: [raw, job['queue'], JSON.generate(job)])
+      won = LuaScript.run(conn, CLAIM_AND_REQUEUE_SCRIPT,
+                          keys: [set, RedisKeys::QUEUES, RedisKeys.queue(job['queue'])],
+                          argv: [raw, job['queue'], JSON.generate(job)])
       won == 1 ? :requeued : :gone
+    end
+
+    ERROR_MESSAGE_LIMIT = 10_000
+
+    # Valid UTF-8, whatever came in — every string this gem stores from
+    # outside its control (an exception's message, a raw payload) goes
+    # through here before `JSON.generate`, which raises on invalid UTF-8.
+    # An unchecked `raise "bad \xff".b` used to make every attempt to record
+    # the failure itself raise, deterministically. Strings in another
+    # (valid) encoding are transcoded; binary/broken ones are scrubbed.
+    def safe_string(value, limit = nil)
+      str = value.to_s
+      str = if [Encoding::UTF_8, Encoding::BINARY, Encoding::US_ASCII].include?(str.encoding)
+              str.dup.force_encoding(Encoding::UTF_8).scrub
+            else
+              str.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+            end
+      limit ? str[0, limit] : str
+    end
+
+    def error_message(error)
+      safe_string(error.message, ERROR_MESSAGE_LIMIT)
     end
 
     UNPARSEABLE_CLASS = '(unparseable)'
@@ -113,8 +135,8 @@ module Cogworker
       {
         'class' => UNPARSEABLE_CLASS, 'args' => [], 'queue' => queue, 'jid' => SecureRandom.hex(12),
         'retry' => false, 'retry_count' => 0, 'enqueued_at' => now, 'failed_at' => now,
-        'error_class' => error.class.name, 'error_message' => error.message.to_s[0, 10_000],
-        'raw_payload' => raw.to_s[0, 100_000]
+        'error_class' => error.class.name, 'error_message' => error_message(error),
+        'raw_payload' => safe_string(raw, 100_000)
       }
     end
   end

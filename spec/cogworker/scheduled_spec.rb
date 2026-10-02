@@ -77,4 +77,17 @@ RSpec.describe Cogworker::Scheduled do
 
     expect(scans).to eq([false, true])
   end
+
+  it 'reports its first orphan check done only once one has completed, and retries a failed one on the next poll' do
+    scheduled = described_class.new(double(fetch_class: Cogworker::BasicFetch))
+    calls = 0
+    allow(Cogworker::ReliableFetch).to receive(:recover_orphans) { raise Redis::CannotConnectError, 'down' if (calls += 1) == 1 }
+
+    expect { scheduled.send(:recover_orphans_if_due) }.to raise_error(Redis::CannotConnectError)
+    expect(scheduled).not_to be_recovered_once
+    scheduled.send(:recover_orphans_if_due)
+
+    expect(calls).to eq(2)
+    expect(scheduled).to be_recovered_once
+  end
 end

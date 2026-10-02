@@ -30,8 +30,8 @@ module Cogworker
         }
         if error
           entry['error_class'] = error.class.name
-          entry['error_message'] = error.message.to_s[0, 10_000]
-          entry['backtrace'] = (error.backtrace || []).first(200)
+          entry['error_message'] = JobUtil.error_message(error)
+          entry['backtrace'] = (error.backtrace || []).first(200).map { |line| JobUtil.safe_string(line) }
         end
 
         raw = JSON.generate(entry)

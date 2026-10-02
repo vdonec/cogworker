@@ -58,4 +58,14 @@ RSpec.describe 'Cogworker::Web built-in session' do
     expect(response.status).to eq(200)
     expect(cookie_names(response)).to be_empty
   end
+
+  it 'leaves the session to one added via Web.use, instead of a second cookie copying its data' do
+    Cogworker::Web.instance_variable_set(:@middlewares, [])
+    Cogworker::Web.use(Rack::Session::Cookie, secret: 'u' * 64, key: 'app.session')
+    Cogworker::Web.use(session_writer)
+
+    response = Rack::MockRequest.new(Cogworker::Web).get('/jobs')
+
+    expect(cookie_names(response)).to eq(['app.session'])
+  end
 end

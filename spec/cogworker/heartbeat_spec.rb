@@ -159,4 +159,12 @@ RSpec.describe Cogworker::Heartbeat do
       expect(heartbeat.instance_variable_get(:@beat_thread)).to be_nil
     end
   end
+
+  it "stamps its last beat with this host's clock where Redis refuses TIME, instead of never beating" do
+    heartbeat = described_class.new(manager)
+    conn = double
+    allow(conn).to receive(:time).and_raise(Redis::CommandError, "ERR unknown command 'TIME'")
+
+    expect(heartbeat.send(:redis_now, conn)).to be_within(2).of(Time.now.to_i)
+  end
 end

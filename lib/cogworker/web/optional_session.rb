@@ -20,6 +20,13 @@ module Cogworker
       def call(env)
         env['rack.session'] ? @app.call(env) : @with_session.call(env)
       end
+
+      # A session middleware added via `Web.use` sits *after* this one in
+      # the stack, so it can't be detected per request the way an upstream
+      # one is — `Web.build_app` checks for one up front instead.
+      def self.session_middleware?(middleware)
+        middleware.is_a?(Class) && middleware <= Rack::Session::Abstract::Persisted
+      end
     end
   end
 end

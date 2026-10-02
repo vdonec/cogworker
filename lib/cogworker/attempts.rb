@@ -24,7 +24,7 @@ module Cogworker
     def record(jid, attempt:, error:, outcome:)
       entry = JSON.generate(
         'attempt' => attempt, 'failed_at' => Time.now.to_f, 'outcome' => outcome,
-        'error_class' => error.class.name, 'error_message' => error.message.to_s[0, 10_000]
+        'error_class' => error.class.name, 'error_message' => JobUtil.error_message(error)
       )
       key = RedisKeys.job_attempts(jid)
       Cogworker.config.redis do |c|

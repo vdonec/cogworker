@@ -49,7 +49,7 @@ RSpec.describe Cogworker::ReliableFetch do
      'and starts over once it finds a job', :reliable_fetch do
     fetch = described_class.new(%w[default low])
     pauses = []
-    allow(fetch).to receive(:sleep) { |s| pauses << s }
+    allow(fetch).to receive(:interruptible_sleep) { |s| pauses << s }
 
     4.times { expect(fetch.retrieve_work).to be_nil }
     push('default', 'a')
@@ -63,18 +63,51 @@ RSpec.describe Cogworker::ReliableFetch do
 
   it 'never pauses longer than a smaller fetch_idle_max_interval', :reliable_fetch do
     Cogworker.config.fetch_idle_max_interval = 0.1
-    fetch = described_class.new(%w[default])
+    fetch = described_class.new(%w[default low])
     pauses = []
-    allow(fetch).to receive(:sleep) { |s| pauses << s }
+    allow(fetch).to receive(:interruptible_sleep) { |s| pauses << s }
 
     3.times { fetch.retrieve_work }
 
+    expect(pauses.size).to eq(3)
     expect(pauses).to all(be <= 0.1)
   end
 
+  it 'blocks on the server (BLMOVE) instead of polling when it has a single queue, and still lands in progress', :reliable_fetch do
+    fetch = described_class.new(%w[default default])
+    expect(fetch).not_to receive(:interruptible_sleep)
+    pusher = Thread.new do
+      sleep 0.3
+      push('default', 'late')
+    end
+
+    started = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+    work = fetch.retrieve_work
+    pusher.join
+
+    expect(JSON.parse(work.raw_job)['jid']).to eq('late')
+    expect(::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - started).to be < 1.5
+    expect(in_progress.size).to eq(1)
+  end
+
+  it 'cuts an idle pause short as soon as shutdown begins', :reliable_fetch do
+    stopping = false
+    Cogworker.config.fetch_idle_max_interval = 30
+    fetch = described_class.new(%w[default low], stopping: -> { stopping })
+    fetch.instance_variable_set(:@idle_interval, 30)
+    Thread.new do
+      sleep 0.3
+      stopping = true
+    end
+
+    started = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+    fetch.retrieve_work
+    expect(::Process.clock_gettime(::Process::CLOCK_MONOTONIC) - started).to be < 1.5
+  end
+
   it 'runs the fetch script by hash once it is cached, instead of resending its text every poll', :reliable_fetch do
-    fetch = described_class.new(%w[default])
-    allow(fetch).to receive(:sleep)
+    fetch = described_class.new(%w[default low])
+    allow(fetch).to receive(:interruptible_sleep)
     Cogworker.config.redis { |c| c.script(:flush) }
     fetch.retrieve_work # NOSCRIPT -> EVAL, which caches it
 
@@ -124,6 +157,17 @@ RSpec.describe Cogworker::ReliableFetch do
       expect(ttl).to be > Cogworker::Periodic::RunningLock.active_ttl
     end
 
+    it 're-takes the lock on give_back too, not only on recovery' do
+      fetch = described_class.new(%w[default])
+      described_class.new(%w[default]) # (same identity)
+      work = Cogworker::BasicFetch::UnitOfWork.new('default', job)
+
+      fetch.give_back(work)
+
+      expect(lock_state.first).to eq('run1')
+      expect(queue_jids).to eq(['run1'])
+    end
+
     it "extends the run's own lock, and leaves alone one a newer run holds" do
       Cogworker.config.redis { |c| c.set(lock, 'run1', ex: 30) }
       described_class.requeue_in_progress(Cogworker.identity)
@@ -142,6 +186,35 @@ RSpec.describe Cogworker::ReliableFetch do
       Cogworker.config.orphan_threshold = 900
       expect(Cogworker::Periodic::RunningLock.active_ttl)
         .to be > Cogworker.config.orphan_threshold + Cogworker::Scheduled::ORPHAN_CHECK_INTERVAL
+    end
+  end
+
+  describe '.reconcile' do
+    let(:raw) { JSON.generate('jid' => 'stuck', 'queue' => 'default') }
+
+    before do
+      Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw) }
+      allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    end
+
+    it 'requeues an own in-progress job no thread is running, once it has been seen stray twice in a row' do
+      strays = described_class.reconcile(Cogworker.identity, [])
+      expect(strays).to eq([raw])
+      expect(queue_jids).to be_empty
+
+      expect(described_class.reconcile(Cogworker.identity, strays)).to be_empty
+      expect(queue_jids).to eq(['stuck'])
+      expect(in_progress).to be_empty
+    end
+
+    it 'leaves alone a job a processor thread is actually running' do
+      Cogworker.config.redis do |c|
+        c.hset("cogworker:workers:#{Cogworker.identity}", 't1',
+               JSON.generate('queue' => 'default', 'payload' => { 'jid' => 'stuck' }))
+      end
+
+      expect(described_class.reconcile(Cogworker.identity, [raw])).to be_empty
+      expect(in_progress).to eq([raw])
     end
   end
 
@@ -207,6 +280,15 @@ RSpec.describe Cogworker::ReliableFetch do
         expect(Cogworker.config.redis { |c| c.hget('cogworker:last_beat', 'dead-host:1:abc') }).to be_nil
       end
 
+      it "never forgets a live process's registration or last beat while checking it" do
+        record_last_beat(10)
+
+        described_class.recover_orphans
+
+        expect(Cogworker.config.redis { |c| c.hget('cogworker:last_beat', 'dead-host:1:abc') }).not_to be_nil
+        expect(Cogworker.config.redis { |c| c.smembers('cogworker:inprogress_identities') }).to include('dead-host:1:abc')
+      end
+
       it 'follows a configured threshold' do
         Cogworker.config.orphan_threshold = 60
         record_last_beat(90)
@@ -260,6 +342,7 @@ RSpec.describe Cogworker::ReliableFetch do
       allow_any_instance_of(Redis).to receive(:eval).and_wrap_original do |original, script, **kw|
         script == described_class::FETCH_SCRIPT ? raise(unsupported) : original.call(script, **kw)
       end
+      allow_any_instance_of(Redis).to receive(:blmove).and_raise(Redis::CommandError, "ERR unknown command 'BLMOVE'")
       log = StringIO.new
       allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(log))
       done = Queue.new
@@ -275,9 +358,36 @@ RSpec.describe Cogworker::ReliableFetch do
       expect(log.string.scan("isn't supported by this Redis").size).to eq(1)
     end
 
+    it "doesn't guess support while Redis is unreachable — it raises, so the choice is made again later" do
+      allow_any_instance_of(Redis).to receive(:info).and_raise(Redis::CannotConnectError, 'down')
+
+      expect { described_class.supported? }.to raise_error(Redis::CannotConnectError)
+      manager = Cogworker::Manager.new
+      expect { manager.fetch_class }.to raise_error(Redis::CannotConnectError)
+      allow_any_instance_of(Redis).to receive(:info).and_call_original
+      expect(manager.fetch_class).to eq(described_class.supported? ? described_class : Cogworker::BasicFetch)
+    end
+
     it "reports support from the server's real version" do
       version = Cogworker.config.redis { |c| c.info('server')['redis_version'] }
       expect(described_class.supported?).to eq(Gem::Version.new(version) >= described_class::MIN_REDIS_VERSION)
+    end
+
+    it 'on a Redis without LMOVE, falls back at runtime when the boot-time check got it wrong', :old_redis do
+      allow(described_class).to receive(:supported?).and_return(true) # e.g. Redis was unreachable at boot
+      done = Queue.new
+      stub_const('OldRedisRuntimeJob', Class.new { include Cogworker::Worker })
+      OldRedisRuntimeJob.define_method(:perform) { done << :ok }
+      OldRedisRuntimeJob.perform_async
+      log = StringIO.new
+      allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(log))
+
+      @manager = Cogworker::Manager.new
+      @manager.start!
+
+      expect(wait_for { done.pop(true) rescue nil }).to eq(:ok) # rubocop:disable Style/RescueModifier
+      expect(@manager.fetch_class).to eq(Cogworker::BasicFetch)
+      expect(log.string).to include("isn't supported by this Redis")
     end
 
     it 'on a Redis without LMOVE, still runs jobs with fetch: :reliable — via BasicFetch', :old_redis do

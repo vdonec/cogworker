@@ -142,8 +142,10 @@ off their queues:
   couldn't reach Redis for a while (an outage, a failover) mustn't have its
   running jobs started a second time elsewhere. Lower it if crashed
   processes' jobs must come back sooner; raise it if Redis blips longer
-  than that are expected. Queues are polled rather than
-  blocked on: while they stay empty, each worker thread waits 0.25 s, then
+  than that are expected. A worker with a single queue waits on Redis
+  for jobs (`BLMOVE`), picking a new one up immediately. With several
+  (weighted) queues they are polled instead: while they stay empty, each
+  worker thread waits 0.25 s, then
   0.5 s, … up to `config.fetch_idle_max_interval` (default 1 s) between
   polls, and goes back to 0.25 s as soon as it finds a job. That cap is the
   longest an idle worker takes to notice a new job; lower it (e.g. `0.25`)
@@ -158,7 +160,11 @@ has registered itself in Redis, so with Redis unreachable at boot it waits
 (and still stops on `TERM`).
 Either way delivery is *at least once*: a job that was partly done when its
 process died or was stopped runs again from the start, so make jobs safe to
-repeat.
+repeat. A job is never re-run because of a Redis error *after* it ran,
+though: once it has run, it is acknowledged (and on failure recorded in
+Retry/Dead); if even recording the failure fails, it goes to Retry with a
+short delay — to Dead after 3 such interruptions — never straight back onto
+its queue.
 
 ### Multiple processes (swarm)
 

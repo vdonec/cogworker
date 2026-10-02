@@ -108,6 +108,37 @@ RSpec.describe Cogworker::Periodic::Ticker do
     expect(Cogworker.config.redis { |c| c.get("periodic:last_slot:#{entry.pjid}") }).to eq('300')
   end
 
+  it "doesn't tick until it's ready (the process's first orphan check has run)" do
+    manager = double(quiet?: false)
+    allow(manager).to receive(:stopping?).and_return(false, false, true)
+    ready = false
+    ticker = described_class.new(manager, [entry], ready: -> { ready })
+    allow(ticker).to receive(:sleep) { ready = true }
+
+    ticker.send(:run)
+
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1) # second loop only
+  end
+
+  it 'retries a rollback that failed along with the push, so the slot still fires once Redis is back' do
+    ticker = described_class.new(double(stopping?: false, quiet?: false), [entry])
+    allow(Cogworker::Client).to receive(:push).and_raise(Redis::CannotConnectError, 'down')
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    rollbacks = 0
+    allow(Cogworker::LuaScript).to receive(:run).and_wrap_original do |original, conn, script, **kw|
+      raise Redis::CannotConnectError, 'down' if script == described_class::ROLLBACK_SCRIPT && (rollbacks += 1) == 1
+
+      original.call(conn, script, **kw)
+    end
+
+    expect { ticker.send(:tick) }.to raise_error(Redis::CannotConnectError)
+    allow(Cogworker::Client).to receive(:push).and_call_original
+    ticker.send(:tick)
+
+    expect(rollbacks).to eq(2)
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+  end
+
   it "skips claim/enqueue entirely for a disabled entry (Routes::Schedules' own \"Disable\") — no job, " \
      "no running lock, and periodic:last_slot doesn't advance either" do
     Cogworker.config.redis { |c| c.sadd?('periodic:disabled', entry.pjid) }

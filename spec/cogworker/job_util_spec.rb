@@ -58,4 +58,13 @@ RSpec.describe Cogworker::JobUtil do
       expect(Cogworker.config.redis { |c| c.zcard('cogworker:retry') }).to eq(4)
     end
   end
+
+  describe '.safe_string' do
+    it 'scrubs invalid UTF-8 and binary strings, transcodes other valid encodings, and truncates' do
+      expect(described_class.safe_string("bad \xff".b)).to eq("bad \uFFFD")
+      expect(described_class.safe_string('Привет'.encode('Windows-1251'))).to eq('Привет')
+      expect(described_class.safe_string('abcdef', 3)).to eq('abc')
+      expect(JSON.generate('m' => described_class.safe_string("\xff\xfe".b))).to be_a(String)
+    end
+  end
 end

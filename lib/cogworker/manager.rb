@@ -18,11 +18,11 @@ module Cogworker
       @config.queues
     end
 
-    # Resolved on first use — from a processor thread's first fetch, after
-    # the Heartbeat's first beat proved Redis reachable — not in the
-    # constructor: that needed Redis just to build a Manager, and when
-    # Redis was unreachable at that moment, the version check couldn't run
-    # at all (see ReliableFetch.supported?).
+    # Resolved on first use, not in the constructor (that needed Redis
+    # just to build a Manager). First use is normally the Heartbeat's first
+    # beat; if Redis can't be reached then, ReliableFetch.supported? raises
+    # and nothing is memoized — the beat fails and is retried, and this
+    # resolves again next time — rather than memoizing a guess.
     def fetch_class
       @fetch_mutex.synchronize { @fetch_class ||= resolve_fetch_class }
     end

@@ -13,8 +13,14 @@ module Cogworker
       @manager = Manager.new(config)
       @scheduled = Scheduled.new(@manager)
       @heartbeat = Heartbeat.new(@manager)
+      # The first tick waits for the first orphan check: after the whole
+      # fleet was down longer than a running `until_executed` job's lock
+      # lives, the ticker would otherwise claim that entry's next slot before
+      # recovery had requeued the interrupted run (and re-taken its lock) —
+      # two runs at once.
       @ticker = Periodic::Ticker.new(
-        @manager, config.periodic_manager.entries, catch_up: config.periodic_catch_up
+        @manager, config.periodic_manager.entries, catch_up: config.periodic_catch_up,
+                                                   ready: -> { @scheduled.recovered_once? }
       )
       @signal_queue = ::Queue.new
     end

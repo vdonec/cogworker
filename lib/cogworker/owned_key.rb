@@ -32,9 +32,9 @@ module Cogworker
     end
 
     def run(conn, script, key, argv)
-      return conn.eval(script, keys: [key], argv: argv) if conn
+      return LuaScript.run(conn, script, keys: [key], argv: argv) if conn
 
-      Cogworker.config.redis { |c| c.eval(script, keys: [key], argv: argv) }
+      Cogworker.config.redis { |c| LuaScript.run(c, script, keys: [key], argv: argv) }
     end
   end
 end

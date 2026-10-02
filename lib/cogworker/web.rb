@@ -104,9 +104,10 @@ module Cogworker
         @session_secret ||= ENV.fetch('COGWORKER_SESSION_SECRET') { SecureRandom.hex(32) }
       end
 
-      # `false` drops the built-in session cookie entirely (it's already
-      # skipped automatically whenever the host app provides a session —
-      # see OptionalSession). Default true.
+      # `false` drops the built-in session cookie entirely. It's already
+      # skipped automatically whenever the host app provides a session
+      # (OptionalSession) or one is added via `Web.use` (a
+      # `Rack::Session::*` class — see `build_app`). Default true.
       def builtin_session
         @builtin_session.nil? || @builtin_session
       end
@@ -258,7 +259,7 @@ module Cogworker
 
       def build_app
         builder = Rack::Builder.new
-        if builtin_session
+        if builtin_session && middlewares.none? { |mw, _| Cogworker::Web::OptionalSession.session_middleware?(mw) }
           builder.use(Cogworker::Web::OptionalSession, secret: session_secret, key: 'cogworker.session')
         end
         # No `cache_control:` (no `immutable`/long `max-age`): these files

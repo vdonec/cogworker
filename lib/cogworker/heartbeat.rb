@@ -127,10 +127,20 @@ module Cogworker
         c.expire(RedisKeys.workers(identity), TTL)
         if reliable
           c.sadd?(RedisKeys::IN_PROGRESS_IDENTITIES, identity)
-          c.hset(RedisKeys::LAST_BEAT, identity, c.time.first) # Redis's clock, not this host's
+          c.hset(RedisKeys::LAST_BEAT, identity, redis_now(c))
         end
         touch_running_periodic_locks(c, identity)
       end
+    end
+
+    # Redis's clock, not this host's (so host clock skew doesn't matter to
+    # orphan detection) — falling back to this host's where `TIME` isn't
+    # allowed (some proxies/managed services): better a skewed stamp than a
+    # process that can never complete its first beat.
+    def redis_now(conn)
+      conn.time.first
+    rescue Redis::CommandError
+      Time.now.to_i
     end
 
     # Keeps every in-flight `until_executed` periodic run's

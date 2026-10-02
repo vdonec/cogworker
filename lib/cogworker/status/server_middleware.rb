@@ -15,7 +15,7 @@ module Cogworker
         write(job, queue, 'complete')
       rescue Exception => e # rubocop:disable Lint/RescueException
         write(job, queue, JobUtil.terminal_failure?(job) ? 'failed' : 'retrying',
-              error_class: e.class.name, error_message: e.message.to_s[0, 10_000])
+              error_class: e.class.name, error_message: JobUtil.error_message(e))
         raise e
       end
 

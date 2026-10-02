@@ -55,6 +55,12 @@ module Cogworker
       @thread&.kill
     end
 
+    # True once the first orphan check has completed — what the periodic
+    # Ticker waits for before its first tick (see Launcher#initialize).
+    def recovered_once?
+      @recovered_once == true
+    end
+
     private
 
     # A failed poll is logged and retried next interval rather than ending
@@ -72,13 +78,17 @@ module Cogworker
       end
     end
 
+    # Next check scheduled only once this one has completed: a failed one
+    # (Redis down) is retried on the next poll rather than a minute later.
     def recover_orphans_if_due
       now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
       return if @next_orphan_check && now < @next_orphan_check
 
-      scan = @next_orphan_check.nil? && @manager.fetch_class == ReliableFetch
+      reliable = @manager.fetch_class == ReliableFetch
+      ReliableFetch.recover_orphans(scan: !@recovered_once && reliable)
+      @strays = ReliableFetch.reconcile(Cogworker.identity, @strays || []) if reliable
+      @recovered_once = true
       @next_orphan_check = now + ORPHAN_CHECK_INTERVAL
-      ReliableFetch.recover_orphans(scan: scan)
     end
 
     def enqueue_due_jobs
@@ -104,8 +114,8 @@ module Cogworker
     def bury(conn, set, raw)
       error = JSON::ParserError.new("not a job (JSON object with a queue) in #{set}")
       job = JobUtil.unparseable_job(raw, queue: nil, error: error)
-      buried = conn.eval(BURY_SCRIPT, keys: [set, RedisKeys::DEAD, RedisKeys::STATS_FAILED],
-                                      argv: [raw, job['failed_at'], JSON.generate(job)])
+      buried = LuaScript.run(conn, BURY_SCRIPT, keys: [set, RedisKeys::DEAD, RedisKeys::STATS_FAILED],
+                                               argv: [raw, job['failed_at'], JSON.generate(job)])
       return unless buried == 1
 
       Throughput.record('failed') # counted like Processor#bury_unparseable

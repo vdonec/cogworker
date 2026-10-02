@@ -6,9 +6,26 @@ require 'securerandom'
 module Cogworker
   # One thread of a Manager's pool: fetch -> register in-flight -> run the
   # server middleware chain around perform -> stats/retry -> deregister.
+  #
+  # What happens to the fetched job afterwards depends on how far it got —
+  # the one rule being that a job is never re-run because of a failure that
+  # happened *after* it ran:
+  # - failed before `perform` (registering it in `cogworker:workers`):
+  #   `give_back` — straight back on its queue, it hasn't run yet;
+  # - ran (succeeded, or failed and was recorded in retry/dead): acknowledge.
+  #   Everything after `perform` other than that one retry/dead write —
+  #   stats, throughput, deregistering, lock extension, the attempts log —
+  #   is best-effort: logged, never raised;
+  # - ran and failed, but the retry/dead write itself failed: `interrupt` —
+  #   into `retry` after INTERRUPT_DELAY, counting `interrupted_count`, and
+  #   into `dead` once that passes MAX_INTERRUPTS. Never straight back on
+  #   the queue: a write that fails deterministically used to make that
+  #   loop forever, re-running the job every second.
   class Processor
     ERROR_BACKOFF = 1 # seconds
     ACK_ATTEMPTS = 3
+    MAX_INTERRUPTS = 3
+    INTERRUPT_DELAY = 30 # seconds, times the interruption count
 
     attr_reader :thread, :tid
 
@@ -70,29 +87,58 @@ module Cogworker
 
       @manager.processor_busy!
       @busy = true
-      finished = false
+      disposition = :give_back
       begin
-        execute(work)
-        finished = true
+        disposition = execute(work)
       ensure
         @busy = false
         @manager.processor_idle!
-        finished ? acknowledge(work) : give_back(work)
+        settle(work, disposition)
       end
     end
 
-    # `execute` raising means bookkeeping failed (Redis, mid-way through
-    # registering the job or routing its failure to retry/dead) — not the
-    # job itself, whose own errors `execute` always handles. Acknowledging
-    # here would drop a job that never made it to retry/dead; instead it
-    # goes straight back on its queue (it may run again: at-least-once). If
-    # even that fails, it simply stays on the in-progress list, which
-    # `Manager#stop!`/orphan recovery requeue later.
+    def settle(work, disposition)
+      case disposition
+      when :acknowledge then acknowledge(work)
+      when :give_back then give_back(work)
+      else interrupt(work, *disposition.drop(1))
+      end
+    end
+
+    # Only for a job that hasn't run yet (see the class comment). If even
+    # this fails, it stays on the in-progress list, which `Manager#stop!` /
+    # orphan recovery / `ReliableFetch.reconcile` requeue later.
     def give_back(work)
       fetcher.give_back(work)
     rescue StandardError => e
       Cogworker.logger.error do
-        "couldn't hand back jid=#{jid_of(work)} after a failed run (left in progress): #{e.class}: #{e.message}"
+        "couldn't hand back jid=#{jid_of(work)} (left in progress): #{e.class}: #{e.message}"
+      end
+    end
+
+    # The job ran and failed, but recording that in retry/dead failed. Built
+    # from the original payload (always serializable — it came from JSON)
+    # plus the failure fields, never from the in-memory job hash: whatever
+    # made that one fail to serialize must not do it again here.
+    def interrupt(work, job, error)
+      payload = JSON.parse(work.raw_job)
+      count = payload['interrupted_count'].to_i + 1
+      payload.merge!('interrupted_count' => count, 'retry_count' => job['retry_count'],
+                     'error_class' => error.class.name, 'error_message' => JobUtil.error_message(error),
+                     'failed_at' => Time.now.to_f)
+      set, score = if count > MAX_INTERRUPTS
+                     [RedisKeys::DEAD, Time.now.to_f]
+                   else
+                     [RedisKeys::RETRY, Time.now.to_f + (INTERRUPT_DELAY * count)]
+                   end
+      fetcher.interrupt(work, set, score, JSON.generate(payload))
+      Cogworker.logger.error do
+        "couldn't record the failure of jid=#{payload['jid']} (#{error.class}); " \
+          "moved to #{set.delete_prefix('cogworker:')} (interruption #{count}/#{MAX_INTERRUPTS})"
+      end
+    rescue StandardError => e
+      Cogworker.logger.error do
+        "couldn't record or interrupt jid=#{jid_of(work)} (left in progress): #{e.class}: #{e.message}"
       end
     end
 
@@ -123,53 +169,80 @@ module Cogworker
       '?'
     end
 
+    # Returns how `settle` should dispose of the fetched job; raises only
+    # before the job has run (then `process_one`'s default, :give_back,
+    # applies).
     def execute(work)
       job = parse_job(work)
-      return unless job
+      return :acknowledge unless job
 
       register_in_workers(work.queue, job)
       Cogworker.logger.info { "start: #{job['class']} jid=#{job['jid']}" }
-
       begin
-        # `build_worker` itself can raise (most commonly `NameError`, e.g. a
-        # class the caller registered/enqueued but never actually defined —
-        # deliberately still routed through the *same* middleware chain
-        # below rather than caught here directly: `History::Middleware`/
-        # `Status::ServerMiddleware` (and any custom server middleware)
-        # only ever see a job by wrapping this `chain.invoke` call, so a
-        # resolution failure caught out here, before `invoke` ever runs,
-        # would never reach them — this job would fail/retry/die with no
-        # History entry and no status update at all, silently. Catching it
-        # here and re-raising it as the chain's own "final block" gives
-        # every middleware the same crack at observing this failure as any
-        # perform-time one, with `worker` as `nil` in that case (every
-        # built-in server middleware ignores the `worker` arg entirely
-        # already; a custom one that needs a real instance simply can't act
-        # on this failure either way — there's no worker to act on).
-        resolution_error = nil
-        worker = begin
-          build_worker(job)
-        rescue Exception => e # rubocop:disable Lint/RescueException
-          resolution_error = e
-          nil
-        end
+        error = run_job(work, job)
+        error ? finish_failure(job, error) : finish_success(job)
+      ensure
+        best_effort('deregister') { deregister_from_workers }
+      end
+    end
 
-        Cogworker.config.server_chain.invoke(worker, job, work.queue) do
-          raise resolution_error if resolution_error
+    # The job's own outcome: nil, or what it (or its middleware) raised.
+    def run_job(work, job)
+      # `build_worker` itself can raise (most commonly `NameError`, e.g. a
+      # class the caller registered/enqueued but never actually defined —
+      # deliberately still routed through the *same* middleware chain
+      # below rather than caught here directly: `History::Middleware`/
+      # `Status::ServerMiddleware` (and any custom server middleware)
+      # only ever see a job by wrapping this `chain.invoke` call, so a
+      # resolution failure caught out here, before `invoke` ever runs,
+      # would never reach them — this job would fail/retry/die with no
+      # History entry and no status update at all, silently. Catching it
+      # here and re-raising it as the chain's own "final block" gives
+      # every middleware the same crack at observing this failure as any
+      # perform-time one, with `worker` as `nil` in that case (every
+      # built-in server middleware ignores the `worker` arg entirely
+      # already; a custom one that needs a real instance simply can't act
+      # on this failure either way — there's no worker to act on).
+      resolution_error = nil
+      worker = begin
+        build_worker(job)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        resolution_error = e
+        nil
+      end
 
-          worker.perform(*job['args'])
-        end
+      Cogworker.config.server_chain.invoke(worker, job, work.queue) do
+        raise resolution_error if resolution_error
+
+        worker.perform(*job['args'])
+      end
+      nil
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      e
+    end
+
+    def finish_success(job)
+      best_effort('stats') do
         Cogworker.config.redis { |c| c.incr(RedisKeys::STATS_PROCESSED) }
         Throughput.record('processed')
-        Cogworker.logger.info { "done: #{job['class']} jid=#{job['jid']}" }
-      rescue Exception => e # rubocop:disable Lint/RescueException
+      end
+      Cogworker.logger.info { "done: #{job['class']} jid=#{job['jid']}" }
+      :acknowledge
+    end
+
+    def finish_failure(job, error)
+      best_effort('stats') do
         Cogworker.config.redis { |c| c.incr(RedisKeys::STATS_FAILED) }
         Throughput.record('failed')
-        route_failure(job, e)
-        Cogworker.logger.warn { "fail: #{job['class']} jid=#{job['jid']}: #{e.class}: #{e&.message}" }
       end
-    ensure
-      deregister_from_workers
+      Cogworker.logger.warn { "fail: #{job['class']} jid=#{job['jid']}: #{error.class}: #{JobUtil.error_message(error)}" }
+      route_failure(job, error) ? :acknowledge : [:interrupt, job, error]
+    end
+
+    def best_effort(what)
+      yield
+    rescue StandardError => e
+      Cogworker.logger.error { "#{what} failed (ignored): #{e.class}: #{e.message}" }
     end
 
     # A payload that isn't a JSON object goes straight to `dead`
@@ -199,7 +272,7 @@ module Cogworker
     # Built on first use, not in the constructor (see Manager#fetch_class),
     # and rebuilt after a fall-back to BasicFetch.
     def fetcher
-      @fetcher ||= @manager.fetch_class.new(@manager.queues)
+      @fetcher ||= @manager.fetch_class.new(@manager.queues, stopping: -> { @manager.stopping? })
     end
 
     def build_worker(job)
@@ -209,24 +282,35 @@ module Cogworker
       worker
     end
 
+    # True once the failure is recorded in retry/dead — the one write that
+    # must happen; everything after it is best-effort. False if that write
+    # failed (`finish_failure` then interrupts the job instead).
     def route_failure(job, error)
       job['error_class'] = error.class.name
-      job['error_message'] = error.message.to_s[0, 10_000]
+      job['error_message'] = JobUtil.error_message(error)
       job['failed_at'] ||= Time.now.to_f
 
       max_retries = JobUtil.max_retries(job)
       new_count = job['retry_count'].to_i + 1
       job['retry_count'] = new_count
+      retrying = new_count <= max_retries
+      delay = retry_delay(new_count) if retrying
 
-      if new_count <= max_retries
-        delay = retry_delay(new_count)
-        Cogworker.config.redis { |c| c.zadd(RedisKeys::RETRY, Time.now.to_f + delay, JSON.generate(job)) }
-        extend_locks_for_retry(job, delay)
-        Attempts.record(job['jid'], attempt: new_count, error: error, outcome: 'retrying')
-      else
-        Cogworker.config.redis { |c| c.zadd(RedisKeys::DEAD, Time.now.to_f, JSON.generate(job)) }
-        Attempts.record(job['jid'], attempt: new_count, error: error, outcome: 'dead')
+      begin
+        payload = JSON.generate(job)
+        Cogworker.config.redis do |c|
+          retrying ? c.zadd(RedisKeys::RETRY, Time.now.to_f + delay, payload) : c.zadd(RedisKeys::DEAD, Time.now.to_f, payload)
+        end
+      rescue StandardError => e
+        Cogworker.logger.error { "couldn't record failure of jid=#{job['jid']}: #{e.class}: #{e.message}" }
+        return false
       end
+
+      best_effort('lock extension') { extend_locks_for_retry(job, delay) } if retrying
+      best_effort('attempts log') do
+        Attempts.record(job['jid'], attempt: new_count, error: error, outcome: retrying ? 'retrying' : 'dead')
+      end
+      true
     end
 
     # A job waiting out its retry backoff still holds its `until_executed`

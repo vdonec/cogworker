@@ -51,4 +51,10 @@ RSpec.describe Cogworker::Launcher do
 
     launcher.run
   end
+
+  it "hands the Ticker a readiness check it can actually call (Scheduled#recovered_once? is public)" do
+    ready = launcher.instance_variable_get(:@ticker).instance_variable_get(:@ready)
+
+    expect(ready.call).to be(false)
+  end
 end
