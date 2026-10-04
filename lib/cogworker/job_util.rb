@@ -142,6 +142,23 @@ module Cogworker
       "#<#{error.class}>"
     end
 
+    # A job on its way to dead outside the usual path (no server middleware
+    # around it to do this): releases its `until_executed` locks, owner-
+    # checked, each on its own — so the entry / the unique key isn't blocked
+    # until the locks' TTL. Best-effort.
+    def release_terminal_locks(conn, job)
+      keys = []
+      keys << RedisKeys.unique_lock(UniqueJobs.digest(job)) if UniqueJobs.until_executed?(job)
+      keys << RedisKeys.periodic_running(job['periodic_pjid']) if job['periodic_pjid']
+      keys.each do |key|
+        released = BestEffort.call('Lock release') do
+          OwnedKey.delete(key, job['jid'], conn)
+          true
+        end
+        DeferredReleases.add(key, job['jid']) unless released
+      end
+    end
+
     UNPARSEABLE_CLASS = '(unparseable)'
 
     # A payload that isn't a JSON object can't be run, retried or even

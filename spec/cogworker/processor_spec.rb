@@ -386,7 +386,8 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
 
     it 'extends a unique job\'s lock over the interruption delay' do
       fields = { 'unique' => 'until_executed', 'retry' => 3 }
-      digest = Cogworker::UniqueJobs.digest(JSON.parse(JSON.generate({ 'class' => 'X', 'queue' => 'default', 'args' => [] })))
+      digest = Cogworker::UniqueJobs.digest(JSON.parse(JSON.generate({ 'class' => 'X', 'queue' => 'default',
+                                                                       'args' => [] })))
       Cogworker.config.redis { |c| c.set("cogworker:unique:#{digest}", 'i1', ex: 5) }
 
       expect(interrupt(fields, 1)).to eq([1, 0])
@@ -458,7 +459,7 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
       expect(counts).to eq([0, 0, 0, 0])
     end
 
-    it "still runs a job whose registration in cogworker:workers fails (the key holding the wrong type)" do
+    it 'still runs a job whose registration in cogworker:workers fails (the key holding the wrong type)' do
       stub_const('RegJob', Class.new { include Cogworker::Worker })
       runs = 0
       RegJob.define_method(:perform) { |*| runs += 1 }
@@ -486,16 +487,18 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     processor.send(:process_one)
     expect(manager.pending_settlements.size).to eq(1)
 
-    strays = []
-    2.times do
-      strays = Cogworker::ReliableFetch.reconcile(Cogworker.identity, strays, running: manager.running_jobs,
-                                                                              pending: manager.pending_settlements) { |raw| manager.settled(raw) }
+    reconcile = lambda do |strays|
+      Cogworker::ReliableFetch.reconcile(Cogworker.identity, strays, running: manager.running_jobs,
+                                                                     pending: manager.pending_settlements) do |raw|
+        manager.settled(raw)
+      end
     end
+    strays = []
+    2.times { strays = reconcile.call(strays) }
     expect(queued_jobs).to be_empty # not requeued as a stray
 
     Cogworker.config.redis { |c| c.del('cogworker:dead') } # Redis is fine again
-    Cogworker::ReliableFetch.reconcile(Cogworker.identity, strays, running: manager.running_jobs,
-                                                                   pending: manager.pending_settlements) { |raw| manager.settled(raw) }
+    reconcile.call(strays)
 
     expect(runs).to eq(1)
     expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(1)
@@ -514,7 +517,8 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     expect(manager.running_jobs).to be_empty
   end
 
-  it "hands an unfileable failure over to cogworker:unsettled on shutdown — never requeues it — and it's filed once possible",
+  it 'hands an unfileable failure over to cogworker:unsettled on shutdown — never requeues it — ' \
+     "and it's filed once possible",
      :reliable_fetch do
     manager = Cogworker::Manager.new
     raw = JSON.generate('jid' => 'pay1', 'class' => 'PaymentJob', 'queue' => 'default', 'args' => [], 'retry' => false)
@@ -550,5 +554,26 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
     set, _score, entry = manager.pending_settlements.fetch(raw)
     expect(set).to eq('cogworker:dead')
     expect(JSON.parse(entry)).to include('jid' => 'odd', 'error_class' => 'RuntimeError')
+  end
+
+  it 'releases the locks of a job that goes to dead by way of interrupt with retries still left', :reliable_fetch do
+    manager = Cogworker::Manager.new
+    processor = Cogworker::Processor.new(manager)
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    raw = JSON.generate('jid' => 'lk', 'class' => 'X', 'queue' => 'default', 'args' => [], 'retry' => 5,
+                        'unique' => 'until_executed', 'periodic_pjid' => 'pjl',
+                        'interrupted_count' => Cogworker::Processor::MAX_INTERRUPTS)
+    digest = Cogworker::UniqueJobs.digest(JSON.parse(raw))
+    Cogworker.config.redis do |c|
+      c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw)
+      c.set("cogworker:unique:#{digest}", 'lk')
+      c.set('periodic:running:pjl', 'lk')
+    end
+
+    processor.send(:interrupt, Cogworker::BasicFetch::UnitOfWork.new('default', raw), {}, RuntimeError.new('boom'))
+
+    expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(1)
+    expect(Cogworker.config.redis { |c| [c.get("cogworker:unique:#{digest}"), c.get('periodic:running:pjl')] })
+      .to eq([nil, nil])
   end
 end

@@ -46,8 +46,9 @@ module Cogworker
       file_config = ConfigLoader.load(options[:config_path])
 
       Cogworker.server_process!
-      Cogworker.config.concurrency = options[:concurrency] || file_config[:concurrency]&.to_i || Cogworker.config.concurrency
-      Cogworker.config.queues = options[:queues].any? ? options[:queues] : (file_config[:queues] || Cogworker.config.queues)
+      config = Cogworker.config
+      config.concurrency = options[:concurrency] || file_config[:concurrency]&.to_i || config.concurrency
+      config.queues = options[:queues].any? ? options[:queues] : (file_config[:queues] || config.queues)
       Cogworker.config.fetch = file_config[:fetch] if file_config[:fetch]
 
       redirect_logfile(options[:logfile]) if options[:logfile]

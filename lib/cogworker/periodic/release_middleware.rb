@@ -23,13 +23,24 @@ module Cogworker
         begin
           yield
         rescue Exception => e # rubocop:disable Lint/RescueException
-          RunningLock.release(pjid, job['jid']) if JobUtil.terminal_failure?(job)
+          release(pjid, job['jid']) if JobUtil.terminal_failure?(job)
           raise e
         end
-        RunningLock.release(pjid, job['jid'])
+        release(pjid, job['jid'])
       end
 
       private
+
+      # Best-effort — a release that fails (Redis away) never turns the
+      # finished run into a failure — and retried later (DeferredReleases)
+      # rather than left to the lock's TTL.
+      def release(pjid, jid)
+        released = BestEffort.call('Periodic lock') do
+          RunningLock.release(pjid, jid)
+          true
+        end
+        DeferredReleases.add(RedisKeys.periodic_running(pjid), jid) unless released
+      end
 
       # Best-effort: failing here must not stop the job from running (it
       # would be routed to retry/dead as if it had failed). If it does fail,

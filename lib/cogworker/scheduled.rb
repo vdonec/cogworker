@@ -97,16 +97,22 @@ module Cogworker
     # one of the same oldest 50 picked again on every poll, and enough of
     # them would starve everything behind them for good.
     def defer(set, raw, error)
-      Cogworker.logger.error { "Graduating an entry of #{set} failed (deferred #{DEFER_DELAY}s): #{error.class}: #{error.message}" }
+      Cogworker.logger.error do
+        "Graduating an entry of #{set} failed (deferred #{DEFER_DELAY}s): #{error.class}: #{error.message}"
+      end
       Cogworker.config.redis { |c| c.zadd(set, Time.now.to_f + DEFER_DELAY, raw, xx: true) }
     rescue StandardError => e
       Cogworker.logger.error { "Deferring it failed too: #{e.class}: #{e.message}" }
     end
 
+    # A block returning :skipped did nothing (not due yet): that proves
+    # nothing about Redis, so it doesn't end an outage report either.
     def guarded(what)
-      yield
+      result = yield
+      RedisErrors.recovered(what) unless result == :skipped
+      result
     rescue StandardError => e
-      Cogworker.logger.error { "#{what} failed: #{e.class}: #{e.message}" }
+      RedisErrors.report(what, e)
     end
 
     # The next check is scheduled before this one runs: one that keeps
@@ -116,7 +122,7 @@ module Cogworker
     # The one-off SCAN only counts as done once it has succeeded.
     def recover_orphans_if_due
       now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
-      return if @next_orphan_check && now < @next_orphan_check
+      return :skipped if @next_orphan_check && now < @next_orphan_check
 
       @next_orphan_check = now + ORPHAN_CHECK_INTERVAL
       reliable = @manager.fetch_class == ReliableFetch
@@ -125,8 +131,8 @@ module Cogworker
       # not a minute later — Redis coming back is when it matters most.
       begin
         ReliableFetch.recover_orphans(scan: reliable && !@scanned, report: report)
-      rescue Redis::BaseConnectionError
-        @next_orphan_check = now + POLL_INTERVAL
+      rescue StandardError => e
+        @next_orphan_check = now + POLL_INTERVAL if RedisErrors.unavailable?(e)
         raise
       end
       @next_orphan_check = now + POLL_INTERVAL if report[:connection_lost]
@@ -138,6 +144,7 @@ module Cogworker
 
       @scanned = true if report[:scan]
       @recovered_once = true if report[:registry] || report[:scan]
+      nil
     end
 
     # See KeyGuard. First thing on the first poll, then every
@@ -145,7 +152,7 @@ module Cogworker
     # would break them is already out of the way.
     def check_keys_if_due
       now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
-      return if @next_key_check && now < @next_key_check
+      return :skipped if @next_key_check && now < @next_key_check
 
       @next_key_check = now + KeyGuard::CHECK_INTERVAL
       KeyGuard.check(queues: @manager.queues)
@@ -191,7 +198,7 @@ module Cogworker
       error = JSON::ParserError.new("not a job (JSON object with a queue) in #{set}")
       job = JobUtil.unparseable_job(raw, queue: nil, error: error)
       buried = LuaScript.run(conn, BURY_SCRIPT, keys: [set, RedisKeys::DEAD, RedisKeys::STATS_FAILED],
-                                               argv: [raw, job['failed_at'], JSON.generate(job)])
+                                                argv: [raw, job['failed_at'], JSON.generate(job)])
       return unless buried == 1
 
       Throughput.record('failed') # counted like Processor#bury_unparseable

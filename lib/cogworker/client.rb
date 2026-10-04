@@ -43,16 +43,29 @@ module Cogworker
         end
       end
 
+      # The queue listing only feeds the Web UI/stats; failing to update it
+      # is logged, never raised — whatever the error, Redis being away
+      # included: the job is already queued by then, and raising would make
+      # the caller push it a second time (see raw_push).
+      def register_queue(conn, queue)
+        conn.sadd?(RedisKeys::QUEUES, queue)
+      rescue StandardError => e
+        RedisErrors.report("#{RedisKeys::QUEUES} not updated", e) { queue }
+      end
+
       def raw_push(job)
         Cogworker.config.redis do |conn|
           if job['at']
             conn.zadd(RedisKeys::SCHEDULE, job['at'].to_f, JSON.generate(job))
           else
             job['enqueued_at'] = Time.now.to_f
-            conn.multi do |pipeline|
-              pipeline.sadd?(RedisKeys::QUEUES, job['queue'])
-              pipeline.lpush(RedisKeys.queue(job['queue']), JSON.generate(job))
-            end
+            # The push is the one write that matters, and goes first, on its
+            # own. They used to share a MULTI — which doesn't roll back: with
+            # `cogworker:queues` unwritable the job was queued anyway but the
+            # whole push raised, so callers retried it (the cron ticker did,
+            # every tick) and queued it again and again.
+            conn.lpush(RedisKeys.queue(job['queue']), JSON.generate(job))
+            register_queue(conn, job['queue'])
           end
         end
       end

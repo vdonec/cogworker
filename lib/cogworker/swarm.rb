@@ -59,6 +59,8 @@ module Cogworker
     def fork_child(slot)
       pid = ::Process.fork do
         Cogworker.reset_identity!
+        RedisErrors.reset! # the parent's outage state isn't this child's
+        DeferredReleases.reset! # nor are its pending releases
         CLI.new.run(@argv.dup)
         # `exit!`, not plain `exit`: `Launcher#run` only returns once
         # `Manager#stop!` has had its bounded (default 25s) chance to join

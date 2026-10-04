@@ -6,13 +6,15 @@ Gem::Specification.new do |spec|
   spec.name          = 'cogworker'
   spec.version       = Cogworker::VERSION
   spec.authors       = ['vdonec']
-  spec.summary       = 'Redis-backed background job processing: worker DSL, periodic scheduling, and process introspection'
+  spec.summary       = 'Redis-backed background job processing: worker DSL, periodic scheduling, ' \
+                       'and process introspection'
   spec.license       = 'MIT'
   spec.homepage      = 'https://github.com/vdonec/cogworker'
   spec.metadata['source_code_uri'] = spec.homepage
   spec.required_ruby_version = '>= 3.1'
 
-  spec.files = Dir['lib/**/*.rb', 'lib/**/*.lua', 'lib/**/*.js', 'lib/**/*.css', 'lib/**/*.woff2', 'exe/*']
+  spec.files = Dir['lib/**/*.rb', 'lib/**/*.lua', 'lib/**/*.js', 'lib/**/*.css', 'lib/**/*.woff2', 'exe/*',
+                   'README.md', 'LICENSE.txt', 'CHANGELOG.md']
   spec.bindir = 'exe'
   spec.executables = Dir['exe/*'].map { |f| File.basename(f) }
   spec.require_paths = ['lib']

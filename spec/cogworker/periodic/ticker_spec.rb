@@ -162,7 +162,7 @@ RSpec.describe Cogworker::Periodic::Ticker do
 
   it 'keeps ticking the other entries when one fails, and starts even if publishing the schedule fails' do
     other = Cogworker::Periodic::Entry.new(cron: '* * * * *', class_name: 'TickerJob', retry: 0, unique: nil,
-                                          args: ['other'])
+                                           args: ['other'])
     Cogworker.config.redis do |c|
       c.set("periodic:last_slot:#{entry.pjid}", 'x')
       c.set('periodic:last_slot:x', 'x')
@@ -179,7 +179,7 @@ RSpec.describe Cogworker::Periodic::Ticker do
     ticker.send(:tick)
 
     expect(queued_jobs.map { |j| j['args'] }).to eq([['other']])
-    expect(ticker_log.string).to include("Periodic tick failed for #{entry.pjid}", 'Periodic schedule not published')
+    expect(ticker_log.string).to include("Periodic tick: #{entry.pjid} failed", 'Periodic schedule not published')
   end
 
   it "keeps cron running when periodic:disabled can't be read, treating entries as enabled" do
@@ -306,6 +306,9 @@ RSpec.describe Cogworker::Periodic::Ticker do
     allow(Cogworker::Client).to receive(:push).and_raise(Redis::CannotConnectError, 'gone')
 
     3.times { ticker.send(:tick) }
+    allow(Cogworker::Client).to receive(:push).and_raise(Redis::CommandError,
+                                                         "READONLY You can't write against a replica")
+    ticker.send(:tick) # a failover reply is Redis being away too
     expect(ticker.instance_variable_get(:@failures)[entry.pjid]).to eq(0)
 
     allow(Cogworker::Client).to receive(:push).and_raise(ArgumentError, 'broken entry')
@@ -323,5 +326,60 @@ RSpec.describe Cogworker::Periodic::Ticker do
 
     expect(ticker.send(:rollback_claim, entry, 200, '100', 'j')).to be(true)
     expect(Cogworker.config.redis { |c| c.get("periodic:last_slot:#{entry.pjid}") }).to eq('100')
+  end
+
+  it "counts a rollback as done even when the entry's last_slot key holds the wrong type" do
+    Cogworker.config.redis { |c| c.rpush("periodic:last_slot:#{entry.pjid}", 'a list') }
+    ticker = described_class.new(double(stopping?: false, quiet?: false), [entry])
+
+    expect(ticker.send(:rollback_claim, entry, 200, '100', 'j')).to be(true)
+  end
+
+  it "doesn't report Redis as back from a tick that skipped every entry without talking to it" do
+    ticker = described_class.new(double(stopping?: false, quiet?: false), [entry])
+    ticker.send(:tick) # checks this slot
+    Cogworker::RedisErrors.report('Periodic tick', Redis::CannotConnectError.new('gone'))
+
+    ticker.send(:tick) # same slot: skipped, no Redis call
+
+    expect(ticker_log.string).not_to include('available again')
+  end
+
+  describe 'a slot blocked by the running lock' do
+    let(:ticker) { described_class.new(double(stopping?: false, quiet?: false), [entry]) }
+    let(:slot) { Fugit::Cron.parse(entry.cron).previous_time(Time.now).to_i }
+
+    it 'keeps retrying it through BLOCKED_GRACE, and fires it once a delayed release goes through' do
+      Cogworker.config.redis { |c| c.set("periodic:running:#{entry.pjid}", 'finished-run') }
+      ticker.send(:tick)
+      expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(0)
+      expect(ticker.instance_variable_get(:@last_checked_slot)[entry.pjid]).to be_nil # not given up on
+
+      Cogworker.config.redis { |c| c.del("periodic:running:#{entry.pjid}") } # the deferred release lands
+      ticker.send(:tick)
+
+      expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+    end
+
+    it 'skips it once still blocked past the grace — a run genuinely still going' do
+      Cogworker.config.redis { |c| c.set("periodic:running:#{entry.pjid}", 'still-running') }
+      ticker.send(:tick)
+      since_slot, since = ticker.instance_variable_get(:@blocked_since)[entry.pjid]
+      ticker.instance_variable_get(:@blocked_since)[entry.pjid] = [since_slot, since - described_class::BLOCKED_GRACE]
+
+      ticker.send(:tick)
+
+      expect(ticker.instance_variable_get(:@last_checked_slot)[entry.pjid]).to eq(slot)
+      expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(0)
+    end
+
+    it "runs this process's own delayed lock releases before claiming" do
+      Cogworker.config.redis { |c| c.set("periodic:running:#{entry.pjid}", 'done-here') }
+      Cogworker::DeferredReleases.add("periodic:running:#{entry.pjid}", 'done-here')
+
+      ticker.send(:tick)
+
+      expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+    end
   end
 end

@@ -64,8 +64,9 @@ RSpec.describe 'Cogworker::History' do
       expect(entry['backtrace']).to be_an(Array)
       expect(entry['backtrace']).not_to be_empty
 
-      # the History middleware re-raises — the job still ends up dead (retry: false)
-      expect(Cogworker::Stats.new.dead_size).to eq(1)
+      # the History middleware re-raises — the job still ends up dead (retry: false). Waited for: History
+      # records the failure inside the chain, a moment *before* the Processor files the job in dead.
+      wait_for { Cogworker::Stats.new.dead_size == 1 }
     ensure
       manager&.stop!(timeout: 2) # see the `ensure` comment in the example above
     end

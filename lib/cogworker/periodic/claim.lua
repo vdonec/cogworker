@@ -10,7 +10,7 @@
 -- Returns {1, <previous last_slot, or "" if none>} if this call won the
 -- claim for this slot (the caller should enqueue the job — and, if that
 -- fails, roll the claim back with ROLLBACK_SCRIPT using that previous
--- value), 0 otherwise. Composes two guards: `last_slot` stops a
+-- value), 2 if blocked by the entry's running lock, 0 otherwise. Composes two guards: `last_slot` stops a
 -- process re-firing the same (or an earlier) slot on a later tick, and the
 -- NX lock breaks the narrow race where two processes both pass the
 -- `last_slot` check before either has written it back.
@@ -18,8 +18,11 @@
 -- For `until_executed`, the running lock is written here, in the same
 -- atomic step as the claim and before the job exists anywhere — see
 -- Periodic::RunningLock for why it must never be written after the push.
+-- Blocked by a run still holding the entry's lock: a distinct 2, so the
+-- caller can retry the slot briefly — the lock may only be waiting for a
+-- release delayed by an outage (see Ticker::BLOCKED_GRACE).
 if ARGV[2] == "until_executed" and redis.call("GET", KEYS[1]) then
-  return 0
+  return 2
 end
 
 local previous = redis.call("GET", KEYS[2])

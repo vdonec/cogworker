@@ -13,7 +13,7 @@ require_relative 'init'
 # COGWORKER_RELOAD=true, reloading) — a raw `require 'cogworker/web'` loads
 # the file fine, but bypasses Zeitwerk's own tracking of what it loaded, so
 # a later `Cogworker::LOADER.reload` can leave it in an inconsistent state.
-Cogworker::Web
+Cogworker::Web # rubocop:disable Lint/Void -- referenced only to autoload it
 # GET /metrics (Cogworker::Prometheus::Exporter) is mounted automatically by
 # Cogworker::Web.load_routes! — nothing to reference here. Opt out with
 # Cogworker::Web.prometheus_exporter_enabled = false if you don't want it.

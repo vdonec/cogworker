@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'stringio'
 
 RSpec.describe Cogworker::Testing do
   before do
@@ -22,6 +23,22 @@ RSpec.describe Cogworker::Testing do
 
     TestingJob.perform_async(1)
 
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+  end
+
+  it "pushes once, and doesn't raise, when the queue listing can't be updated (it used to queue the job and raise)" do
+    Cogworker.config.redis { |c| c.set('cogworker:queues', 'not a set') }
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+
+    expect { TestingJob.perform_async(1) }.not_to raise_error
+    expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
+  end
+
+  it "doesn't raise (and so isn't pushed again by the caller) when Redis drops right after the push" do
+    allow_any_instance_of(Redis).to receive(:sadd?).and_raise(Redis::TimeoutError, 'timed out')
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+
+    expect(TestingJob.perform_async(1)).to be_a(String)
     expect(Cogworker.config.redis { |c| c.llen('cogworker:queue:default') }).to eq(1)
   end
 

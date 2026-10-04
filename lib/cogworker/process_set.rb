@@ -3,6 +3,9 @@
 require 'json'
 
 module Cogworker
+  # Every live worker process, as published by its Heartbeat — one
+  # Cogworker::Process per `cogworker:processes` member whose presence key
+  # still exists (stale members are pruned while iterating).
   class ProcessSet
     include Enumerable
 

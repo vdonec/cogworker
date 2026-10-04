@@ -45,6 +45,9 @@ module Cogworker
 
     def stop!
       @manager.stop!
+      # Last chance for releases deferred by a recent outage — they live in
+      # this process's memory and would otherwise wait out their locks' TTL.
+      BestEffort.call('Deferred lock releases') { @config.redis { |c| DeferredReleases.retry_all(c) } }
       @scheduled.stop!
       @ticker.stop!
       @heartbeat.stop!

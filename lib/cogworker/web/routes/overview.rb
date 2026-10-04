@@ -613,7 +613,9 @@ module Cogworker
         def render_layout_b(script_name, selected_name)
           names = queue_names
           selected_name = names.first if (selected_name.nil? || selected_name.empty?) && !names.empty?
-          return %(<p class="text-muted">No queues yet — push a job to create one.</p>) if selected_name.nil? || selected_name.empty?
+          if selected_name.nil? || selected_name.empty?
+            return %(<p class="text-muted">No queues yet — push a job to create one.</p>)
+          end
 
           <<~HTML
             <div style="display: grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap: 16px; align-items: start;">
@@ -676,7 +678,7 @@ module Cogworker
           end.join
           paused_tag = q.paused? ? " #{Layout.badge('paused', variant: :warning)}" : ''
           header_actions = queue_pause_button(q, script_name, 'b') + retry_all_button(name, script_name,
-                                                                                       retrying_count)
+                                                                                      retrying_count)
           <<~HTML
             <section style="display: flex; flex-direction: column; gap: 16px; min-width: 0;">
               <div style="background: var(--color-surface); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); padding: 18px;">

@@ -22,6 +22,7 @@ module Cogworker
       RedisKeys::QUEUES => 'set', RedisKeys::PROCESSES => 'set', RedisKeys::PAUSED_QUEUES => 'set',
       RedisKeys::IN_PROGRESS_IDENTITIES => 'set', RedisKeys::LAST_BEAT => 'hash',
       RedisKeys::REPEAT_ORPHANS => 'list', RedisKeys::UNSETTLED => 'list', RedisKeys::PERIODIC_SCHEDULE => 'hash',
+      RedisKeys::LIVE_QUEUES => 'zset',
       RedisKeys::PERIODIC_DISABLED => 'set', RedisKeys::STATS_PROCESSED => 'string',
       RedisKeys::STATS_FAILED => 'string'
     }.freeze
@@ -65,7 +66,39 @@ module Cogworker
         types[RedisKeys.process(id)] = 'hash'
         types[RedisKeys.workers(id)] = 'hash'
       end
+      readable_fields(RedisKeys::PERIODIC_SCHEDULE).each do |pjid|
+        types[RedisKeys.periodic_running(pjid)] = 'string'
+        types[RedisKeys.periodic_last_slot(pjid)] = 'string'
+      end
       types
+    end
+
+    def readable_fields(hash)
+      Cogworker.config.redis { |c| c.hkeys(hash) }
+    rescue Redis::CommandError
+      []
+    end
+
+    MAX_COPIES = 5
+
+    # Keeps the newest MAX_COPIES quarantined copies of one key: something
+    # that keeps writing the wrong type would otherwise leave one more every
+    # CHECK_INTERVAL, for QUARANTINE_TTL. (A SCAN, but only on the rare
+    # occasion a key actually gets quarantined.)
+    def prune_copies(key)
+      prefix = "#{QUARANTINE_PREFIX}#{key}:"
+      exact = /\A#{Regexp.escape(prefix)}(\d+):\h{8}\z/ # this key's copies only — not `<key>:<more>:...`'s
+      Cogworker.config.redis do |c|
+        copies = c.scan_each(match: "#{glob_escape(prefix)}*").select { |name| name.match?(exact) }
+        stale = copies.sort_by { |name| name[exact, 1].to_i }.reverse.drop(MAX_COPIES)
+        c.del(*stale) unless stale.empty?
+      end
+    rescue StandardError => e
+      Cogworker.logger.error { "pruning quarantined copies of #{key} failed: #{e.class}: #{e.message}" }
+    end
+
+    def glob_escape(text)
+      text.gsub(/[*?\[\]\\]/) { |ch| "\\#{ch}" }
     end
 
     def readable_members(set)
@@ -77,12 +110,14 @@ module Cogworker
     def quarantine(key, expected, actual)
       # Unique per move: a second quarantine of the same key within the same
       # second must not overwrite (RENAME) the first one's copy.
-      target = "#{QUARANTINE_PREFIX}#{key}:#{Time.now.to_i}:#{SecureRandom.hex(4)}"
+      # Milliseconds, so copies made within one second still sort by age.
+      target = "#{QUARANTINE_PREFIX}#{key}:#{(Time.now.to_f * 1000).to_i}:#{SecureRandom.hex(4)}"
       moved = Cogworker.config.redis do |c|
         LuaScript.run(c, QUARANTINE_SCRIPT, keys: [key, target], argv: [expected, QUARANTINE_TTL])
       end
       return false unless moved == 1
 
+      prune_copies(key)
       Cogworker.logger.error do
         "#{key} held a #{actual}, not a #{expected}: moved to #{target} (kept #{QUARANTINE_TTL / 86_400} days)"
       end

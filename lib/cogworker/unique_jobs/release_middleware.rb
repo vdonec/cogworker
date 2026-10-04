@@ -12,12 +12,16 @@ module Cogworker
     # `unique: :until_executed`. Registered unconditionally in every
     # `Config`, same as `Periodic::ReleaseMiddleware`.
     class ReleaseMiddleware
+      # Releasing is best-effort (BestEffort): a failed release leaves the
+      # lock to its TTL, and only the job's own exception is re-raised.
       def call(_worker, job, _queue)
-        yield
+        begin
+          yield
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          release(job) if UniqueJobs.until_executed?(job) && JobUtil.terminal_failure?(job)
+          raise e
+        end
         release(job) if UniqueJobs.until_executed?(job)
-      rescue Exception => e # rubocop:disable Lint/RescueException
-        release(job) if UniqueJobs.until_executed?(job) && JobUtil.terminal_failure?(job)
-        raise e
       end
 
       private
@@ -25,8 +29,15 @@ module Cogworker
       # Owner-checked: if this job's lock already expired and passed to a
       # newer copy, this must not release *that* one's lock (which would let
       # a third copy in while the newer one is still running).
+      # Owner-checked; retried later (DeferredReleases) if it fails, rather
+      # than leaving duplicates blocked for the lock's whole TTL.
       def release(job)
-        OwnedKey.delete(RedisKeys.unique_lock(UniqueJobs.digest(job)), job['jid'])
+        key = RedisKeys.unique_lock(UniqueJobs.digest(job))
+        released = BestEffort.call('Unique lock') do
+          OwnedKey.delete(key, job['jid'])
+          true
+        end
+        DeferredReleases.add(key, job['jid']) unless released
       end
     end
   end

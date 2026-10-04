@@ -161,7 +161,7 @@ RSpec.describe Cogworker::Heartbeat do
     expect(heartbeat.send(:redis_now, conn)).to be_within(2).of(Time.now.to_i)
   end
 
-  it "still beats (and so a process can start) when a shared registry key holds the wrong type" do
+  it 'still beats (and so a process can start) when a shared registry key holds the wrong type' do
     Cogworker.config.redis do |c|
       c.set('cogworker:inprogress_identities', 'x')
       c.set('cogworker:last_beat', 'x')
@@ -176,5 +176,50 @@ RSpec.describe Cogworker::Heartbeat do
     expect(log.string).to include('process registry not written') # (written in any fetch mode)
   ensure
     heartbeat&.stop!
+  end
+
+  it "puts back a still-running until_executed run's lock that lapsed while Redis was away, " \
+     "but never takes another's" do
+    manager.job_started(JSON.generate('jid' => 'mine', 'periodic_pjid' => 'pjr', 'periodic_until_executed' => true))
+    manager.job_started(JSON.generate('jid' => 'mine2', 'periodic_pjid' => 'pjo', 'periodic_until_executed' => true))
+    Cogworker.config.redis { |c| c.set('periodic:running:pjo', 'newer-run') }
+    heartbeat = described_class.new(manager)
+    heartbeat.instance_variable_set(:@beat_failed, true) # Redis was away: the previous beat failed
+
+    heartbeat.send(:beat_safely)
+
+    expect(Cogworker.config.redis { |c| [c.get('periodic:running:pjr'), c.get('periodic:running:pjo')] })
+      .to eq(%w[mine newer-run])
+  end
+
+  it "never brings back a lock that was released — in normal operation, or once the job's perform has returned" do
+    running = JSON.generate('jid' => 'r1', 'periodic_pjid' => 'pjn', 'periodic_until_executed' => true)
+    finished = JSON.generate('jid' => 'f1', 'periodic_pjid' => 'pjf', 'periodic_until_executed' => true)
+    manager.job_started(running)
+    manager.job_started(finished)
+    manager.job_performed(finished) # its middleware released the lock; not acknowledged yet
+    heartbeat = described_class.new(manager)
+
+    heartbeat.send(:beat_safely) # a normal beat: nothing to re-take
+    heartbeat.instance_variable_set(:@beat_failed, true)
+    heartbeat.send(:beat_safely) # after an outage: only jobs still performing
+
+    expect(Cogworker.config.redis { |c| [c.get('periodic:running:pjn'), c.get('periodic:running:pjf')] })
+      .to eq(['r1', nil])
+  end
+
+  it "lists the process's own queues in cogworker:queues on every beat, even while they're empty" do
+    Cogworker.config.queues = %w[default default low]
+
+    described_class.new(Cogworker::Manager.new).send(:beat)
+
+    expect(Cogworker.config.redis { |c| c.smembers('cogworker:queues') }).to contain_exactly('default', 'low')
+  end
+
+  it 'stamps its queues as live on every beat' do
+    described_class.new(manager).send(:beat)
+
+    expect(Cogworker.config.redis { |c| c.zscore('cogworker:live_queues', 'default') }).to be_within(5)
+      .of(Cogworker.config.redis { |c| c.time.first })
   end
 end

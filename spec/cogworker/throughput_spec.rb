@@ -28,7 +28,7 @@ RSpec.describe Cogworker::Throughput do
     expect(series.map { |e| e['time'] }).to eq([hour1, hour2])
   end
 
-  it "fills in an hour with no activity as a real 0, not a skipped gap" do
+  it 'fills in an hour with no activity as a real 0, not a skipped gap' do
     now = Time.utc(2026, 1, 2, 12, 0, 0)
     described_class.record('processed', at: now)
 

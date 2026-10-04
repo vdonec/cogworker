@@ -87,8 +87,8 @@ module Cogworker
       retake = job['periodic_until_executed'] && job['periodic_pjid'] && job['jid']
       lock_key = retake ? RedisKeys.periodic_running(job['periodic_pjid']) : queue_key
       LuaScript.run(conn, REQUEUE_ENTRY_SCRIPT, keys: [queue_key, lock_key],
-                                               argv: [JSON.generate(job), retake ? '1' : '0', job['jid'].to_s,
-                                             Periodic::RunningLock.queued_ttl])
+                                                argv: [JSON.generate(job), retake ? '1' : '0', job['jid'].to_s,
+                                                       Periodic::RunningLock.queued_ttl])
     end
     private_class_method :requeue_entry
 

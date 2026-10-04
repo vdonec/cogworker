@@ -58,4 +58,45 @@ RSpec.describe Cogworker::KeyGuard do
 
     expect(Cogworker.config.redis { |c| c.keys('cogworker:quarantine:cogworker:dead:*') }.size).to eq(2)
   end
+
+  it "also checks each periodic entry's running lock and last slot" do
+    Cogworker.config.redis do |c|
+      c.hset('periodic:schedule', 'pj1', '{}')
+      c.rpush('periodic:running:pj1', 'x')
+      c.sadd?('periodic:last_slot:pj1', 'x')
+    end
+
+    expect(described_class.check).to contain_exactly('periodic:running:pj1', 'periodic:last_slot:pj1')
+  end
+
+  it 'keeps at most MAX_COPIES quarantined copies of one key' do
+    (described_class::MAX_COPIES + 2).times do |i|
+      Cogworker.config.redis do |c|
+        c.set('cogworker:dead', 'x')
+        c.set("cogworker:quarantine:cogworker:dead:#{1000 + i}:0000000#{i}", 'x') if i.zero?
+      end
+      described_class.check
+    end
+
+    expect(Cogworker.config.redis { |c| c.keys('cogworker:quarantine:cogworker:dead:*') }.size)
+      .to eq(described_class::MAX_COPIES)
+  end
+
+  it "prunes only one key's own copies — not those of a key whose name merely starts the same" do
+    Cogworker.config.redis do |c|
+      c.set('cogworker:quarantine:cogworker:queue:a:b:100:aaaaaaaa', 'other key')
+      c.rpush('cogworker:quarantine:cogworker:unsettled:records', 'kept records')
+    end
+    (described_class::MAX_COPIES + 1).times do
+      Cogworker.config.redis do |c|
+        c.set('cogworker:queue:a', 'x')
+        c.set('cogworker:unsettled', 'x')
+      end
+      described_class.check(queues: ['a'])
+    end
+
+    other_key_copy = 'cogworker:quarantine:cogworker:queue:a:b:100:aaaaaaaa'
+    expect(Cogworker.config.redis { |c| c.exists?(other_key_copy) }).to be(true)
+    expect(Cogworker.config.redis { |c| c.exists?('cogworker:quarantine:cogworker:unsettled:records') }).to be(true)
+  end
 end

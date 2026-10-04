@@ -30,7 +30,8 @@ RSpec.describe Cogworker::Scheduled do
   end
 
   it 'keeps polling after a failed poll instead of letting the thread die' do
-    manager = double(quiet?: false, fetch_class: Cogworker::ReliableFetch, running_jobs: [], pending_settlements: {}, queues: ["default"])
+    manager = double(quiet?: false, fetch_class: Cogworker::ReliableFetch, running_jobs: [], pending_settlements: {},
+                     queues: ['default'])
     allow(manager).to receive(:stopping?).and_return(false, false, true)
     scheduled = described_class.new(manager)
     calls = 0
@@ -73,12 +74,14 @@ RSpec.describe Cogworker::Scheduled do
     allow(Cogworker::ReliableFetch).to receive(:recover_orphans) { |scan:, **| scans << scan }
 
     described_class.new(double(fetch_class: Cogworker::BasicFetch)).send(:recover_orphans_if_due)
-    described_class.new(double(fetch_class: Cogworker::ReliableFetch, running_jobs: [], pending_settlements: {}, queues: ["default"])).send(:recover_orphans_if_due)
+    described_class.new(double(fetch_class: Cogworker::ReliableFetch, running_jobs: [], pending_settlements: {},
+                               queues: ['default'])).send(:recover_orphans_if_due)
 
     expect(scans).to eq([false, true])
   end
 
-  it 'reports its first orphan check done only once one has completed, and retries a failed one a check interval later' do
+  it 'reports its first orphan check done only once one has completed, ' \
+     'and retries a failed one a check interval later' do
     scheduled = described_class.new(double(fetch_class: Cogworker::BasicFetch))
     calls = 0
     allow(Cogworker::ReliableFetch).to receive(:recover_orphans) do |report:, **|
@@ -121,7 +124,8 @@ RSpec.describe Cogworker::Scheduled do
     it 'still graduates due scheduled jobs on the same poll, whatever recovery does' do
       Cogworker::Client.push('class' => 'X', 'args' => [], 'at' => Time.now.to_f - 5)
       allow(Cogworker::ReliableFetch).to receive(:recover_orphans).and_raise(Redis::CommandError, 'boom')
-      manager = double(quiet?: false, fetch_class: Cogworker::ReliableFetch, running_jobs: [], pending_settlements: {}, queues: ["default"])
+      manager = double(quiet?: false, fetch_class: Cogworker::ReliableFetch, running_jobs: [], pending_settlements: {},
+                       queues: ['default'])
       allow(manager).to receive(:stopping?).and_return(false, true)
       scheduled = described_class.new(manager)
       allow(scheduled).to receive(:sleep)

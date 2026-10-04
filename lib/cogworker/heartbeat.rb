@@ -99,9 +99,12 @@ module Cogworker
 
     def beat_safely
       beat
+      @beat_failed = false
+      RedisErrors.recovered('Heartbeat')
       true
     rescue StandardError => e
-      Cogworker.logger.error { "Heartbeat failed: #{e.class}: #{e.message}" }
+      @beat_failed = true
+      RedisErrors.report('Heartbeat', e)
       false
     end
 
@@ -128,21 +131,43 @@ module Cogworker
                'busy', @manager.busy_count.to_s,
                'quiet', @manager.quiet?.to_s)
         c.expire(RedisKeys.process(identity), TTL)
-        secondary('process registry') { c.sadd?(RedisKeys::PROCESSES, identity) }
-        secondary('workers expiry') { c.expire(RedisKeys.workers(identity), TTL) }
-        if reliable
-          secondary('in-progress registry') { c.sadd?(RedisKeys::IN_PROGRESS_IDENTITIES, identity) }
-          secondary('last-beat stamp') { c.hset(RedisKeys::LAST_BEAT, identity, redis_now(c)) }
-        end
+        write_registries(c, identity, reliable)
         touch_running_periodic_locks(c, identity)
+        # Not via #secondary: Redis failing here, after the presence key went
+        # through, doesn't make this beat a failed one.
+        BestEffort.call('Deferred lock releases') { DeferredReleases.retry_all(c) }
       end
+    end
+
+    # Everything a beat writes besides the presence key — each on its own,
+    # best-effort (see #secondary).
+    def write_registries(conn, identity, reliable)
+      secondary('process registry') { conn.sadd?(RedisKeys::PROCESSES, identity) }
+      # The queues this process reads are listed even while empty: the Web
+      # UI shows them, and recovery can tell a queue nobody reads from one
+      # that's merely had nothing pushed yet.
+      secondary('queue registry') { conn.sadd(RedisKeys::QUEUES, @manager.queues.uniq) }
+      secondary('live queue registry') { mark_queues_live(conn) }
+      secondary('workers expiry') { conn.expire(RedisKeys.workers(identity), TTL) }
+      return unless reliable
+
+      secondary('in-progress registry') { conn.sadd?(RedisKeys::IN_PROGRESS_IDENTITIES, identity) }
+      secondary('last-beat stamp') { conn.hset(RedisKeys::LAST_BEAT, identity, redis_now(conn)) }
+    end
+
+    # Stamps this process's queues as read right now, and drops ones no
+    # process has stamped for a day (only ever a listing, never data).
+    def mark_queues_live(conn)
+      now = redis_now(conn)
+      conn.zadd(RedisKeys::LIVE_QUEUES, @manager.queues.uniq.map { |q| [now, q] })
+      conn.zremrangebyscore(RedisKeys::LIVE_QUEUES, '-inf', now - 86_400)
     end
 
     def secondary(what)
       yield
-    rescue Redis::BaseConnectionError
-      raise # Redis itself is gone: the beat as a whole failed
     rescue StandardError => e
+      raise if RedisErrors.unavailable?(e) # Redis itself is away: the beat as a whole failed
+
       Cogworker.logger.error { "Heartbeat: #{what} not written: #{e.class}: #{e.message}" }
     end
 
@@ -161,12 +186,30 @@ module Cogworker
     # see Periodic::RunningLock. From the Manager's own in-memory record of
     # what's running here, not `cogworker:workers` in Redis: a failover that
     # lost that Hash would otherwise let a long run's lock lapse mid-run.
+    # (One narrow race remains: a release landing between this beat's
+    # snapshot of `performing_jobs` and its Lua call, on the first beat
+    # after a failed one, can be undone — the lock then lapses on
+    # `active_ttl`. Not worth a cross-thread lock on every beat.)
+    # Only jobs still inside `perform` (`performing_jobs`): once it returns,
+    # Periodic::ReleaseMiddleware has released the lock, and refreshing it
+    # again would bring it back. A missing lock is only *re-taken* on the
+    # first beat after a failed one — i.e. after Redis was away, possibly
+    # long enough for the lock to lapse; otherwise a missing lock means it
+    # was released, and stays released.
     def touch_running_periodic_locks(conn, _identity)
-      @manager.running_jobs.each do |raw|
+      recovering = @beat_failed
+      @manager.performing_jobs.each do |raw|
         job = JSON.parse(raw)
         next unless job.is_a?(Hash) && job['periodic_pjid']
 
-        Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], Periodic::RunningLock.active_ttl, conn)
+        if recovering && job['periodic_until_executed']
+          # Re-taken, not just extended: after Redis was away longer than
+          # `active_ttl`, the lock is gone while the run is still going, and
+          # the ticker could start the next slot alongside it.
+          Periodic::RunningLock.retake(job['periodic_pjid'], job['jid'], Periodic::RunningLock.active_ttl, conn)
+        else
+          Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], Periodic::RunningLock.active_ttl, conn)
+        end
       rescue StandardError => e
         # Per entry: one bad entry mustn't leave the others' locks to expire.
         Cogworker.logger.error { "couldn't refresh periodic lock for #{raw.to_s[0, 200]}: #{e.class}: #{e.message}" }
@@ -199,6 +242,7 @@ module Cogworker
     def subscribe_loop
       @subscribe_client = ::Redis.new(RedisConnection.client_options(Cogworker.config.redis_options))
       @subscribe_client.subscribe(RedisKeys.signal(Cogworker.identity)) do |on|
+        on.subscribe { |*| RedisErrors.recovered('Signal subscriber') }
         on.message do |_channel, message|
           dispatch(message)
         end
@@ -206,7 +250,7 @@ module Cogworker
     rescue StandardError => e
       return if @stopping
 
-      Cogworker.logger.error { "Signal subscriber died: #{e.class}: #{e.message}" }
+      RedisErrors.report('Signal subscriber', e)
       sleep(1)
       retry
     end

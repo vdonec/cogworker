@@ -52,7 +52,7 @@ RSpec.describe Cogworker::Launcher do
     launcher.run
   end
 
-  it "hands the Ticker a readiness check it can actually call (Scheduled#ready_for_ticker? is public)" do
+  it 'hands the Ticker a readiness check it can actually call (Scheduled#ready_for_ticker? is public)' do
     ready = launcher.instance_variable_get(:@ticker).instance_variable_get(:@ready)
 
     expect(ready.call).to be(false)

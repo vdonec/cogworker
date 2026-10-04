@@ -101,7 +101,7 @@ module Cogworker
     # No-op: exists so calling code doesn't need to change, but this gem
     # simply never coerces job args, so there is nothing to toggle — see
     # README "Job arguments".
-    def strict_args!(_value = true)
+    def strict_args!(_value = true) # rubocop:disable Style/OptionalBooleanParameter -- kept positional for calling-code compatibility
       true
     end
 

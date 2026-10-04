@@ -61,6 +61,18 @@ module Cogworker
         OwnedKey.expire(RedisKeys.periodic_running(pjid), jid, ttl, conn)
       end
 
+      RETAKE_SCRIPT = RETAKE_FUNCTION + <<~LUA
+        retake_running_lock(KEYS[1], ARGV[1], ARGV[2])
+        return 1
+      LUA
+
+      # Extends the lock if still `jid`'s, takes it if it's gone, leaves it
+      # if another run holds it — for a run still going whose lock may have
+      # lapsed (Redis away longer than `active_ttl`).
+      def retake(pjid, jid, ttl, conn)
+        LuaScript.run(conn, RETAKE_SCRIPT, keys: [RedisKeys.periodic_running(pjid)], argv: [jid, ttl.to_f.ceil])
+      end
+
       def release(pjid, jid, conn = nil)
         OwnedKey.delete(RedisKeys.periodic_running(pjid), jid, conn)
       end

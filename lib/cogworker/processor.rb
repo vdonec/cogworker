@@ -56,9 +56,9 @@ module Cogworker
     def run
       until @manager.stopping?
         begin
-          process_one
+          RedisErrors.recovered('Processor') unless process_one == :idle
         rescue StandardError => e
-          Cogworker.logger.error { "Processor error: #{e.class}: #{e.message}" }
+          RedisErrors.report('Processor', e)
           sleep(ERROR_BACKOFF)
         end
       end
@@ -67,7 +67,7 @@ module Cogworker
     def process_one
       if @manager.quiet?
         sleep(0.5)
-        return
+        return :idle # (no Redis call made)
       end
 
       work = begin
@@ -89,11 +89,13 @@ module Cogworker
       @manager.job_started(work.raw_job)
       @busy = true
       @ran = nil
+      @performed = false
       disposition = nil
       begin
         disposition = execute(work)
       ensure
         @busy = false
+        @manager.job_performed(work.raw_job) unless @performed
         @manager.processor_idle!
         # `execute` raising leaves `disposition` unset: before the job ran
         # that's a hand-back; once it ran, whatever its outcome dictates
@@ -155,7 +157,11 @@ module Cogworker
         @manager.settle_later(work.raw_job, [set, score, encoded]) if fetcher.is_a?(ReliableFetch)
         raise
       end
-      best_effort('lock extension') { extend_locks_for_retry(job, delay) } if set == RedisKeys::RETRY
+      if set == RedisKeys::RETRY
+        best_effort('lock extension') { extend_locks_for_retry(job, delay) }
+      else
+        best_effort('lock release') { release_locks(payload) }
+      end
       reason = if set == RedisKeys::RETRY
                  "retrying in #{delay}s (interruption #{count} of at most #{MAX_INTERRUPTS})"
                elsif out_of_retries
@@ -176,9 +182,11 @@ module Cogworker
     end
 
     def remember_for_dead(work, error)
-      entry = JSON.generate('jid' => jid_of(work), 'error_class' => error.class.name.to_s,
-                            'error_message' => JobUtil.error_message(error), 'failed_at' => Time.now.to_f,
-                            'raw_payload' => JobUtil.safe_string(work.raw_job, 100_000))
+      # The original job's own fields where readable (so filing it releases
+      # its locks); just enough to show in Dead otherwise.
+      base = ReliableFetch.parse_hash(work.raw_job) || { 'raw_payload' => JobUtil.safe_string(work.raw_job, 100_000) }
+      entry = JSON.generate(base.merge('jid' => jid_of(work), 'error_class' => error.class.name.to_s,
+                                       'error_message' => JobUtil.error_message(error), 'failed_at' => Time.now.to_f))
       @manager.settle_later(work.raw_job, [RedisKeys::DEAD, Time.now.to_f, entry])
     rescue StandardError
       nil
@@ -230,6 +238,8 @@ module Cogworker
       Cogworker.logger.info { "start: #{job['class']} jid=#{job['jid']}" }
       begin
         error = run_job(work, job)
+        @manager.job_performed(work.raw_job)
+        @performed = true
         @ran = error ? [:interrupt, job, error] : :acknowledge
         error ? finish_failure(job, error) : finish_success(job)
       ensure
@@ -286,7 +296,9 @@ module Cogworker
         Cogworker.config.redis { |c| c.incr(RedisKeys::STATS_FAILED) }
         Throughput.record('failed')
       end
-      Cogworker.logger.warn { "fail: #{job['class']} jid=#{job['jid']}: #{error.class}: #{JobUtil.error_message(error)}" }
+      Cogworker.logger.warn do
+        "fail: #{job['class']} jid=#{job['jid']}: #{error.class}: #{JobUtil.error_message(error)}"
+      end
       route_failure(job, error) ? :acknowledge : [:interrupt, job, error]
     end
 
@@ -350,7 +362,12 @@ module Cogworker
       begin
         payload = JSON.generate(job)
         Cogworker.config.redis do |c|
-          retrying ? c.zadd(RedisKeys::RETRY, Time.now.to_f + delay, payload) : c.zadd(RedisKeys::DEAD, Time.now.to_f, payload)
+          if retrying
+            c.zadd(RedisKeys::RETRY, Time.now.to_f + delay,
+                   payload)
+          else
+            c.zadd(RedisKeys::DEAD, Time.now.to_f, payload)
+          end
         end
       rescue StandardError => e
         Cogworker.logger.error { "couldn't record failure of jid=#{job['jid']}: #{e.class}: #{e.message}" }
@@ -378,6 +395,13 @@ module Cogworker
         end
         Periodic::RunningLock.touch(job['periodic_pjid'], job['jid'], ttl, c) if job['periodic_pjid']
       end
+    end
+
+    # Into dead by way of `interrupt` — possibly with retries still left,
+    # so the middleware that normally releases a terminal failure's locks
+    # didn't: release them here (owner-checked).
+    def release_locks(job)
+      Cogworker.config.redis { |c| JobUtil.release_terminal_locks(c, job) }
     end
 
     # Grows with the retry count, with jitter to avoid a thundering herd of

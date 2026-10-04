@@ -29,7 +29,7 @@ module Cogworker
       # separate call made first, its failure (Redis down — the usual reason
       # the push failed) skipped the rollback altogether.
       ROLLBACK_SCRIPT = <<~LUA
-        if redis.call("GET", KEYS[1]) == ARGV[1] then
+        if redis.pcall("GET", KEYS[1]) == ARGV[1] then
           if ARGV[2] == "" then
             redis.call("SET", KEYS[1], tostring(tonumber(ARGV[1]) - 1))
           else
@@ -54,6 +54,7 @@ module Cogworker
         @last_checked_slot = {}
         @cron_cache = {}
         @pending_rollbacks = []
+        @blocked_since = {} # pjid => [slot, monotonic time it was first found blocked]
         @failures = Hash.new(0) # pjid => consecutive failed ticks
         @retry_at = {}          # pjid => monotonic time it may be tried again
       end
@@ -113,12 +114,16 @@ module Cogworker
 
       def tick
         retry_pending_rollbacks
+        # This process's own delayed lock releases first (see BLOCKED_GRACE).
+        BestEffort.call('Deferred lock releases') { Cogworker.config.redis { |c| DeferredReleases.retry_all(c) } }
         now = Time.now
         @entries.each do |entry|
           next if backing_off?(entry.pjid)
 
-          tick_entry(entry, now)
+          next if tick_entry(entry, now) == :skipped # (no Redis call made: proves nothing)
+
           @failures.delete(entry.pjid)
+          RedisErrors.recovered('Periodic tick')
         rescue StandardError => e
           # Per entry: one entry failing (its keys of the wrong type, its
           # push failing) used to skip every entry after it, on every tick.
@@ -128,8 +133,8 @@ module Cogworker
           # a lost connection, though: that's Redis being away, not the
           # entry failing — backing off every entry on it left cron idle for
           # minutes after Redis came back.
-          delay = e.is_a?(Redis::BaseConnectionError) ? TICK_INTERVAL : back_off(entry.pjid)
-          Cogworker.logger.error { "Periodic tick failed for #{entry.pjid} (next try in #{delay}s): #{e.class}: #{e.message}" }
+          delay = RedisErrors.unavailable?(e) ? TICK_INTERVAL : back_off(entry.pjid)
+          RedisErrors.report('Periodic tick', e) { "#{entry.pjid} failed (next try in #{delay}s)" }
         end
       end
 
@@ -149,12 +154,32 @@ module Cogworker
 
       def tick_entry(entry, now)
         slot = cron_for(entry).previous_time(now).to_i
-        return if @last_checked_slot[entry.pjid] == slot
+        return :skipped if @last_checked_slot[entry.pjid] == slot
 
         jid = SecureRandom.hex(12)
         previous = claim(entry, slot, jid) unless disabled?(entry)
-        enqueue(entry, slot, jid, previous) if previous
+        return if previous == :blocked && still_blocked_in_grace?(entry.pjid, slot)
+
+        enqueue(entry, slot, jid, previous) if previous && previous != :blocked
         @last_checked_slot[entry.pjid] = slot
+        @blocked_since.delete(entry.pjid)
+      end
+
+      # A slot blocked by the entry's running lock is retried for
+      # BLOCKED_GRACE before it counts as skipped. After an outage, the lock
+      # may still be held only because its finished run's release was
+      # deferred (DeferredReleases — retried on the next heartbeat, in
+      # whichever process ran it); marking the slot checked straight away
+      # lost it, in every process, until the entry's next slot — an hour,
+      # for an hourly entry. A run genuinely still going keeps the lock past
+      # the grace, and its slot is skipped as `until_executed` intends.
+      BLOCKED_GRACE = 3 * Heartbeat::INTERVAL
+
+      def still_blocked_in_grace?(pjid, slot)
+        now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+        since_slot, since = @blocked_since[pjid]
+        @blocked_since[pjid] = [slot, since = now] unless since_slot == slot
+        now - since < BLOCKED_GRACE
       end
 
       # The usual reason a push fails — Redis unreachable — makes this fail
@@ -175,7 +200,7 @@ module Cogworker
         end
         true
       rescue StandardError => e
-        Cogworker.logger.error { "periodic #{entry.pjid}: couldn't roll back slot #{slot} (will retry): #{e.class}: #{e.message}" }
+        RedisErrors.report('Periodic rollback', e) { "#{entry.pjid}: couldn't roll back slot #{slot} (will retry)" }
         @pending_rollbacks << [entry, slot, previous_slot, jid]
         e # (truthy, but not `true`: the caller tells a lost connection from a failing rollback)
       end
@@ -194,7 +219,8 @@ module Cogworker
           if result == true
             @failures.delete(key)
             @retry_at.delete(key)
-          elsif !result.is_a?(Redis::BaseConnectionError)
+            RedisErrors.recovered('Periodic rollback')
+          elsif !RedisErrors.unavailable?(result)
             back_off(key) # only a rollback failing on its own backs off; see #tick
           end
         end
@@ -218,9 +244,9 @@ module Cogworker
       # connection still raises (the tick is then retried as a whole).
       def disabled?(entry)
         Cogworker.config.redis { |c| c.sismember(RedisKeys::PERIODIC_DISABLED, entry.pjid) }
-      rescue Redis::BaseConnectionError
-        raise
       rescue StandardError => e
+        raise if RedisErrors.unavailable?(e)
+
         Cogworker.logger.error { "Periodic: can't read #{RedisKeys::PERIODIC_DISABLED} (#{e.class}: #{e.message}); treating #{entry.pjid} as enabled" }
         false
       end
@@ -229,17 +255,20 @@ module Cogworker
         @cron_cache[entry.pjid] ||= Fugit::Cron.parse(entry.cron)
       end
 
-      # nil if this process didn't win the slot; otherwise the previous
-      # `last_slot` value ("" if none), for #rollback_claim.
+      # nil if this process didn't win the slot, :blocked if the entry's
+      # running lock stopped it; otherwise the previous `last_slot` value
+      # ("" if none), for #rollback_claim.
       def claim(entry, slot, jid)
         return nil if !@catch_up && priming_first_slot?(entry, slot)
 
         result = Cogworker.config.redis do |c|
           LuaScript.run(c, CLAIM_SCRIPT,
-                 keys: [RedisKeys.periodic_running(entry.pjid), RedisKeys.periodic_last_slot(entry.pjid),
-                        RedisKeys.periodic_lock(entry.pjid, slot)],
-                 argv: [slot, entry.unique.to_s, LOCK_TTL, jid, RunningLock.queued_ttl])
+                        keys: [RedisKeys.periodic_running(entry.pjid), RedisKeys.periodic_last_slot(entry.pjid),
+                               RedisKeys.periodic_lock(entry.pjid, slot)],
+                        argv: [slot, entry.unique.to_s, LOCK_TTL, jid, RunningLock.queued_ttl])
         end
+        return :blocked if result == 2
+
         result.is_a?(Array) ? result[1].to_s : nil
       end
 

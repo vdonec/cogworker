@@ -14,7 +14,7 @@ RSpec.describe Cogworker::BasicFetch do
     expect(JSON.parse(work.raw_job)['jid']).to eq('x')
   end
 
-  it "never pops from a paused queue, even though the job is still sitting there — pausing stops " \
+  it 'never pops from a paused queue, even though the job is still sitting there — pausing stops ' \
      "delivery, it doesn't touch what's already enqueued" do
     Cogworker.config.redis { |c| c.lpush('cogworker:queue:default', JSON.generate('jid' => 'paused-job')) }
     Cogworker::Queue.new('default').pause!

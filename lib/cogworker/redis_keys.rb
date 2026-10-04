@@ -26,6 +26,10 @@ module Cogworker
     # over by a process shutting down (JSON {set, score, payload} each) —
     # see ReliableFetch.park_unsettled / file_unsettled.
     UNSETTLED = 'cogworker:unsettled'
+    # queue => Redis time a live process last said it reads it (every
+    # heartbeat). Unlike QUEUES (the Web UI's listing, never pruned), this
+    # tells "nobody reads this queue any more" apart from "somebody does".
+    LIVE_QUEUES = 'cogworker:live_queues'
     QUEUES = 'cogworker:queues'
     SCHEDULE = 'cogworker:schedule'
     RETRY = 'cogworker:retry'

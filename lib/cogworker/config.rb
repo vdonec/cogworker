@@ -61,7 +61,10 @@ module Cogworker
     end
 
     def max_orphanings=(count)
-      raise ArgumentError, "max_orphanings must be a positive Integer, got #{count.inspect}" unless count.is_a?(Integer) && count.positive?
+      unless count.is_a?(Integer) && count.positive?
+        raise ArgumentError,
+              "max_orphanings must be a positive Integer, got #{count.inspect}"
+      end
 
       @max_orphanings = count
     end

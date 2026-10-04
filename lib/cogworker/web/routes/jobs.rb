@@ -288,13 +288,13 @@ module Cogworker
         def retry_now_button(bucket, script_name, row, params)
           action = Layout.path(script_name, "jobs/#{bucket}/retry_now")
           form_with_extra(action, 'raw', row[:raw], 'retry now', params, variant: :primary, icon: 'arrow-clockwise',
-                                                                          extra: {})
+                                                                         extra: {})
         end
 
         def retry_button(bucket, script_name, row, params)
           action = Layout.path(script_name, "jobs/#{bucket}/retry")
           form_with_extra(action, 'raw', row[:raw], 'retry', params, variant: :primary, icon: 'arrow-clockwise',
-                                                                      extra: {})
+                                                                     extra: {})
         end
 
         # `Layout.form_button` only carries one hidden field. Every action
@@ -304,9 +304,9 @@ module Cogworker
         # since it isn't in the URL a plain form submits to) plus, for an
         # enqueued-job delete, `queue` (`Queue#delete` isn't keyed off the
         # raw payload alone the way the ZSETs are).
-        def form_with_extra(action, hidden_name, hidden_value, label, params, variant:, icon: nil, extra:)
+        def form_with_extra(action, hidden_name, hidden_value, label, params, variant:, extra:, icon: nil)
           hidden = extra.merge('status' => params['status'].to_s, 'q' => params['q'].to_s,
-                                'selected' => params['selected'].to_s)
+                               'selected' => params['selected'].to_s)
           hidden_inputs = hidden.map { |k, v| %(<input type="hidden" name="#{k}" value="#{Layout.h(v)}">) }.join
           classes = "btn #{Layout::BUTTON_VARIANTS.fetch(variant)}"
           <<~HTML

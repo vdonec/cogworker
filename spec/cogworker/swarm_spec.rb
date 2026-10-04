@@ -75,7 +75,7 @@ RSpec.describe 'cogworkerswarm end-to-end', :swarm do
     # output is unbuffered too, with no change needed on their side.
     @pid = ::Process.spawn(env, RbConfig.ruby, '-I', lib, '-e', '$stdout.sync = true; load ARGV.shift',
                            exe, '-r', @init_path, '-c', concurrency.to_s,
-                           out: @log_path, err: [:child, :out], pgroup: true)
+                           out: @log_path, err: %i[child out], pgroup: true)
   end
 
   def child_pids

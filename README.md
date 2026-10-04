@@ -195,13 +195,25 @@ It isn't lost.
 Every worker checks this gem's Redis keys once a minute (and at boot). A
 key holding the wrong type of value — which only a manual write or data
 corruption produces, but which breaks every command on it — is renamed to
-`cogworker:quarantine:<key>:<time>:<random>` (kept 30 days) and logged as an error,
+`cogworker:quarantine:<key>:<time>:<random>` (kept 30 days, at most the 5
+newest copies per key) and logged as an error,
 and everything carries on with a fresh key. In between checks, work around
 such a key keeps going: a job that can't be put back on a broken queue
 waits behind the others rather than blocking them, a retry/schedule entry
 that can't be moved is postponed a minute, and a failed job that can't be
 filed when its process shuts down is handed over to
-`cogworker:unsettled` for another process to file — not run again.
+`cogworker:unsettled` for another process to file — not run again. (One
+corner isn't covered: a job that hit `config.max_orphanings` while the list
+used to park such jobs was itself damaged goes into Dead raw first and is
+completed with its error right after — retried until that succeeds, but
+only by the process that put it there: if that process dies first, the raw
+entry stays as it is.)
+
+A lock release (`until_executed`, unique jobs) that fails because Redis is
+briefly away when a job finishes is retried on every heartbeat (5 s) until
+it goes through, rather than leaving the lock to expire on its own — kept in
+the process's memory, so if the process stops first, the lock expires on its
+TTL instead.
 
 ### Multiple processes (swarm)
 
@@ -299,6 +311,13 @@ Cogworker.configure_client do |config|
 end
 ```
 
+Anything a server middleware raises counts as the job failing — including
+an error from its own bookkeeping after `yield` (writing to Redis during a
+failover, say), which would retry a job that actually ran fine. The
+built-in ones make every write around `yield` best-effort; do the same in
+yours: rescue (and log) errors from your own writes, and only let the job's
+own exception through.
+
 `chain.add(Klass, *args)` passes `args` to the constructor. A new middleware
 instance is created for every call, so keep any state shared between jobs at
 the class level.
@@ -323,12 +342,23 @@ slot's claim is retried from memory — lost if the process restarts first,
 in which case the slot is skipped and, for an `until_executed` entry, the
 entry stays locked until that lock's TTL, `config.unique_lock_ttl`.) An
 entry that keeps failing (its push, say) is retried with a growing pause,
-5 s up to 5 minutes, instead of on every 5 s tick. Processes claim a slot
+5 s up to 5 minutes, instead of on every 5 s tick — except while Redis
+itself is unreachable or failing over, which is retried every 5 s and
+resumes as soon as Redis is back. (Redis refusing writes for lack of memory,
+`OOM`, counts as the entry failing: it backs off like any other error.)
+Right after Redis comes back from an outage longer than a running
+`until_executed` job's lock, there's a window of up to 5 s before its
+process re-takes that lock, in which the next slot could start alongside
+it. Conversely, a slot found blocked by the previous run's lock is retried
+for 15 s before it counts as skipped — long enough for a release that the
+outage delayed to go through. Processes claim a slot
 atomically in Redis, with no leader. With
 `unique: :until_executed`, a new slot is skipped while the previous run is
-still in progress. If the process running it dies (OOM, `SIGKILL`), the entry
-frees itself within a minute, since that lock is kept alive by the running
-process's heartbeat.
+still in progress. If the process running it dies (OOM, `SIGKILL`), the
+interrupted run is recovered and put back on its queue — still holding the
+entry's lock — once `config.orphan_threshold` has passed (5 minutes by
+default); the lock itself lapses on its own `config.orphan_threshold` plus
+about two minutes after the process's last heartbeat (7 minutes by default).
 
 On first start against an empty Redis, each entry's most recent due slot
 fires right away. To turn that off, set `config.periodic_catch_up = false`.
@@ -534,8 +564,12 @@ and a `config.ru` that mounts the Web UI. See
 ```sh
 bundle install
 bundle exec rspec     # needs a local Redis at redis://localhost:6379/15 (the db is flushed!)
-bundle exec rubocop
+bundle exec rubocop   # must pass — CI runs it too
 ```
+
+`.rubocop.yml` sets the limits for new code; files that already exceed
+them are listed in `.rubocop_todo.yml`. Fix and remove entries there rather
+than adding new ones.
 
 To use a different test Redis, set `COGWORKER_TEST_REDIS_URL`. The browser
 tests (`spec/cogworker/web_system_spec.rb`) need Chrome or Chromium

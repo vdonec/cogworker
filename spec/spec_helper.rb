@@ -35,6 +35,8 @@ RSpec.configure do |config|
     Cogworker.config.redis(&:flushdb)
     Cogworker::Testing.disable!
     Cogworker::Testing.clear_jobs!
+    Cogworker::RedisErrors.reset!
+    Cogworker::DeferredReleases.reset!
   end
 
   # `:reliable_fetch` examples need LMOVE (Redis >= 6.2); `:old_redis` ones

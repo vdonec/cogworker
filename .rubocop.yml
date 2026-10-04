@@ -1,0 +1,42 @@
+inherit_from: .rubocop_todo.yml
+
+AllCops:
+  TargetRubyVersion: 3.1
+  NewCops: disable
+  SuggestExtensions: false
+  Exclude:
+    - 'gemfiles/**/*'
+    - 'vendor/**/*'
+    - 'tmp/**/*'
+
+# Thresholds for new code. Files that already exceed them are listed in
+# .rubocop_todo.yml (generated: `bundle exec rubocop --auto-gen-config
+# --auto-gen-only-exclude --exclude-limit 10000`) — shrink that list over
+# time rather than growing it.
+Metrics/AbcSize:
+  Max: 35
+Metrics/MethodLength:
+  Max: 30
+Metrics/ClassLength:
+  Max: 300
+Metrics/ModuleLength:
+  Max: 300
+Metrics/CyclomaticComplexity:
+  Max: 12
+Metrics/PerceivedComplexity:
+  Max: 12
+Metrics/ParameterLists:
+  Max: 8
+Metrics/BlockLength:
+  Exclude:
+    - 'spec/**/*'
+    - '*.gemspec'
+
+Layout/LineLength:
+  Max: 120
+  Exclude:
+    # Server-rendered HTML/CSS/JS markup inline, and the specs asserting on it.
+    - 'lib/cogworker/web/layout.rb'
+    - 'lib/cogworker/web/routes/**/*'
+    - 'spec/cogworker/web_spec.rb'
+    - 'spec/cogworker/web_system_spec.rb'

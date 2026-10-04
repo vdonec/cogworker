@@ -3,6 +3,9 @@
 require 'json'
 
 module Cogworker
+  # Every job running right now, across all live processes: yields
+  # `[identity, thread id, Cogworker::Work]` from each process's
+  # `cogworker:workers:<identity>` Hash (only for processes ProcessSet knows).
   class WorkSet
     include Enumerable
 

@@ -28,6 +28,9 @@ module Cogworker
     # on an idle process — the trade-off against how often idle processors
     # poll Redis (at 0.25s flat, 4 calls/s per thread).
     EMPTY_POLL_INTERVAL = 0.25
+    # A queue counts as read if a live process stamped it (every heartbeat)
+    # this recently.
+    LIVE_QUEUE_WINDOW = 2 * Heartbeat::TTL
     ORPHANINGS_TTL = 7 * 24 * 60 * 60
     MIN_REDIS_VERSION = Gem::Version.new('6.2')
 
@@ -67,6 +70,7 @@ module Cogworker
           end
         end
         redis.call("RPUSH", queue_prefix .. queue, job)
+        return queue
       end
     LUA
 
@@ -78,8 +82,9 @@ module Cogworker
     # refused; ARGV[8] = orphan-counter key prefix, ARGV[9] = its TTL,
     # ARGV[10] = config.max_orphanings, ARGV[11..] = jobs to drop or keep
     # (see below); KEYS[4] = REPEAT_ORPHANS, KEYS[5] = cogworker:dead.
-    # Returns {moved, <jobs filed straight into dead, raw>...}, or {-1} if
-    # the owner turned out to be alive.
+    # Returns {moved, failed, n, <n unlisted queue names>..., <jobs filed
+    # straight into dead, raw>...}, or {-1, 0, 0} if the owner turned out to
+    # be alive. KEYS[6] = cogworker:queues, KEYS[7] = LIVE_QUEUES.
     # Oldest first, so recovered jobs keep their order. The "is the owner
     # really dead?" check is made here, atomically with the requeue:
     # checked separately, an owner that
@@ -89,7 +94,7 @@ module Cogworker
     REQUEUE_SCRIPT = REQUEUE_JOB_FUNCTION + <<~LUA
       if ARGV[6] ~= "" then
         if redis.call("EXISTS", KEYS[2]) == 1 then
-          return {-1}
+          return {-1, 0, 0}
         end
         -- A stamp that isn't a number counts as no stamp (the presence key
         -- alone then decides); TIME refused (ACL, proxy) falls back to the
@@ -101,7 +106,7 @@ module Cogworker
           local ok, time = pcall(redis.call, "TIME")
           if ok then now = tonumber(time[1]) end
           if now - last <= tonumber(ARGV[6]) then
-            return {-1}
+            return {-1, 0, 0}
           end
         end
       end
@@ -114,9 +119,15 @@ module Cogworker
         local mark, payload = string.sub(ARGV[i], 1, 2), string.sub(ARGV[i], 3)
         if mark == "d:" then finished[payload] = true else keep[payload] = true end
       end
+      if redis.replicate_commands then redis.replicate_commands() end
+      local clock = tonumber(ARGV[7])
+      local clock_ok, clock_reply = pcall(redis.call, "TIME")
+      if clock_ok then clock = tonumber(clock_reply[1]) end
       local moved = 0
       local kept = {}
       local buried = {} -- filed straight into dead, raw: the caller completes them
+      local failed = 0  -- couldn't be requeued (kept, at the back): the caller logs them
+      local unlisted = {} -- queues requeued onto that no live process reads
       -- One pass over the list as it stands. Each job is peeked, written
       -- where it goes, and only then taken off: a script stopped by an
       -- error keeps the writes it made before it (Redis doesn't roll them
@@ -170,7 +181,20 @@ module Cogworker
               end
             end
           end
-          local written = parked or pcall(requeue_job, job, ARGV[1], ARGV[2], ARGV[3], ARGV[4])
+          local written, queue = parked, nil
+          if not parked then
+            written, queue = pcall(requeue_job, job, ARGV[1], ARGV[2], ARGV[3], ARGV[4])
+          end
+          -- A queue no live process has said it reads lately (KEYS[7]): tell
+          -- the caller, since nothing may be reading it — and list it
+          -- (KEYS[6]) so the Web UI shows it.
+          if written and queue then
+            local seen = tonumber(redis.pcall("ZSCORE", KEYS[7], queue) or "")
+            if not seen or seen < clock - #{LIVE_QUEUE_WINDOW} then
+              redis.pcall("SADD", KEYS[6], queue)
+              unlisted[queue] = true
+            end
+          end
           redis.call("LPOP", KEYS[1])
           if written then
             if counter then
@@ -180,13 +204,17 @@ module Cogworker
             moved = moved + 1
           else
             redis.call("RPUSH", KEYS[1], job)
+            failed = failed + 1
           end
         end
       end
       for _, job in ipairs(kept) do
         redis.call("RPUSH", KEYS[1], job)
       end
-      local reply = {moved}
+      local names = {}
+      for name in pairs(unlisted) do table.insert(names, name) end
+      local reply = {moved, failed, #names}
+      for _, name in ipairs(names) do table.insert(reply, name) end
       for _, job in ipairs(buried) do table.insert(reply, job) end
       return reply
     LUA
@@ -227,6 +255,7 @@ module Cogworker
       end
       redis.call("ZADD", KEYS[2], ARGV[2], ARGV[3])
       redis.call("LREM", KEYS[1], 1, ARGV[1])
+      if KEYS[3] then redis.pcall("DEL", KEYS[3]) end -- it ran to the end: its orphan count is moot
       return 1
     LUA
 
@@ -242,7 +271,8 @@ module Cogworker
       return 1
     LUA
 
-    # KEYS[1] = UNSETTLED; ARGV[1] = one record (its head), ARGV[2..4] =
+    # KEYS[1] = UNSETTLED, KEYS[2] = the job's orphan counter; ARGV[1] = one
+    # record (its head), ARGV[2..4] =
     # set, score, payload. Filed, then removed.
     FILE_UNSETTLED_SCRIPT = <<~LUA
       if redis.call("LINDEX", KEYS[1], 0) ~= ARGV[1] then
@@ -250,6 +280,19 @@ module Cogworker
       end
       redis.call("ZADD", ARGV[2], ARGV[3], ARGV[4])
       redis.call("LPOP", KEYS[1])
+      redis.pcall("DEL", KEYS[2]) -- it ran to the end: its orphan count is moot
+      return 1
+    LUA
+
+    # KEYS[1] = cogworker:dead; ARGV[1] = an entry, ARGV[2] = score,
+    # ARGV[3] = its replacement. Swapped in one step: two commands could
+    # leave both in dead (and Retry on each from the Web UI ran it twice).
+    SWAP_DEAD_ENTRY_SCRIPT = <<~LUA
+      if not redis.call("ZSCORE", KEYS[1], ARGV[1]) then
+        return 0
+      end
+      redis.call("ZADD", KEYS[1], ARGV[2], ARGV[3])
+      redis.call("ZREM", KEYS[1], ARGV[1])
       return 1
     LUA
 
@@ -260,6 +303,9 @@ module Cogworker
       return 1
     LUA
 
+    @pending_raw_burials = []
+    @raw_burials_mutex = Mutex.new
+
     class << self
       # A connection error propagates: can't tell yet, so the caller
       # (Manager#fetch_class) resolves again on its next use, instead of
@@ -269,9 +315,9 @@ module Cogworker
       def supported?
         version = Cogworker.config.redis { |c| c.info('server')['redis_version'] }
         Gem::Version.new(version) >= MIN_REDIS_VERSION
-      rescue Redis::BaseConnectionError
-        raise
-      rescue StandardError
+      rescue StandardError => e
+        raise if RedisErrors.unavailable?(e)
+
         true
       end
 
@@ -285,15 +331,28 @@ module Cogworker
       # failed: dropped from it (which is their ack) rather than requeued,
       # in the same atomic step. `keep:` — jobs left on the list untouched.
       def requeue_in_progress(identity, if_dead_for: nil, except: [], keep: [])
-        moved, *buried = Cogworker.config.redis do |c|
+        moved, failed, unlisted_count, *rest = Cogworker.config.redis do |c|
           LuaScript.run(c, REQUEUE_SCRIPT,
                         keys: [RedisKeys.in_progress(identity), RedisKeys.process(identity), RedisKeys::LAST_BEAT,
-                               RedisKeys::REPEAT_ORPHANS, RedisKeys::DEAD],
+                               RedisKeys::REPEAT_ORPHANS, RedisKeys::DEAD, RedisKeys::QUEUES, RedisKeys::LIVE_QUEUES],
                         argv: [*requeue_args, identity, if_dead_for.to_s, Time.now.to_i,
                                RedisKeys::ORPHANINGS_PREFIX, ORPHANINGS_TTL, Cogworker.config.max_orphanings,
                                *except.map { |raw| "d:#{raw}" }, *keep.map { |raw| "k:#{raw}" }])
         end
-        complete_raw_burials(buried)
+        unlisted = rest.shift(unlisted_count)
+        complete_raw_burials(rest)
+        unless unlisted.empty?
+          Cogworker.logger.warn do
+            "requeued job(s) from #{identity} onto queue(s) no live process reads: #{unlisted.join(', ')} " \
+              '— make sure some worker reads them'
+          end
+        end
+        if failed.positive?
+          Cogworker.logger.error do
+            "#{failed} job(s) left in progress by #{identity} couldn't be put back on their queue " \
+              '(a key of the wrong type?) — kept, retried on the next pass'
+          end
+        end
         moved
       end
 
@@ -330,12 +389,14 @@ module Cogworker
 
           recover_identity(identity)
         rescue StandardError => e
-          report[:connection_lost] = true if e.is_a?(Redis::BaseConnectionError)
-          Cogworker.logger.error { "orphan recovery skipped #{identity}: #{e.class}: #{e.message}" }
+          report[:connection_lost] = true if RedisErrors.unavailable?(e)
+          RedisErrors.report('Orphan recovery', e) { "skipped #{identity}" }
           0
         end
-        isolated('burying repeat orphans', nil) { bury_repeat_orphans }
-        isolated('filing unsettled jobs', nil) { file_unsettled }
+        isolated('burying repeat orphans', nil, report) { bury_repeat_orphans }
+        isolated('completing dead entries', nil, report) { retry_raw_burials }
+        isolated('filing unsettled jobs', nil, report) { file_unsettled }
+        RedisErrors.recovered('Orphan recovery') unless report[:connection_lost]
         moved
       end
 
@@ -364,7 +425,11 @@ module Cogworker
         return 0 if moved.negative? # alive after all: keep its registration and last beat
 
         isolated("forgetting #{identity}", nil) { forget_if_empty(identity) } # its jobs are already back
-        Cogworker.logger.warn { "requeued #{moved} job(s) left in progress by dead process #{identity}" } if moved.positive?
+        if moved.positive?
+          Cogworker.logger.warn do
+            "requeued #{moved} job(s) left in progress by dead process #{identity}"
+          end
+        end
         moved
       end
 
@@ -413,12 +478,16 @@ module Cogworker
               LuaScript.run(c, ACK_SCRIPT, keys: [key, RedisKeys::ORPHANINGS_PREFIX + jid.to_s], argv: [raw])
             else
               set, score, payload = how
-              LuaScript.run(c, INTERRUPT_SCRIPT, keys: [key, set], argv: [raw, score, payload])
+              filed = LuaScript.run(c, INTERRUPT_SCRIPT, keys: [key, set, orphanings_key(raw)],
+                                                         argv: [raw, score, payload])
+              released_if_dead(c, set, payload) if filed == 1
             end
           end
           yield raw if block_given?
         rescue StandardError => e
-          Cogworker.logger.error { "still couldn't settle jid=#{parse_hash(raw)&.fetch('jid', nil)}: #{e.class}: #{e.message}" }
+          Cogworker.logger.error do
+            "still couldn't settle jid=#{parse_hash(raw)&.fetch('jid', nil)}: #{e.class}: #{e.message}"
+          end
         end
       end
 
@@ -437,7 +506,9 @@ module Cogworker
           end
           true
         rescue StandardError => e
-          Cogworker.logger.error { "couldn't hand over unsettled jid=#{parse_hash(raw)&.fetch('jid', nil)}: #{e.class}: #{e.message}" }
+          Cogworker.logger.error do
+            "couldn't hand over unsettled jid=#{parse_hash(raw)&.fetch('jid', nil)}: #{e.class}: #{e.message}"
+          end
           false
         end.keys
       end
@@ -449,10 +520,12 @@ module Cogworker
         Cogworker.config.redis do |c|
           c.lrange(RedisKeys::UNSETTLED, 0, -1).each do |record|
             entry = parse_hash(record)
-            next c.lrem(RedisKeys::UNSETTLED, 1, record) unless entry # unreadable: nothing to file
+            next quarantine_record(c, record) unless valid_unsettled?(entry)
 
-            LuaScript.run(c, FILE_UNSETTLED_SCRIPT, keys: [RedisKeys::UNSETTLED],
-                                                    argv: [record, entry['set'], entry['score'], entry['payload']])
+            filed = LuaScript.run(c, FILE_UNSETTLED_SCRIPT,
+                                  keys: [RedisKeys::UNSETTLED, orphanings_key(entry['payload'])],
+                                  argv: [record, entry['set'], entry['score'], entry['payload']])
+            released_if_dead(c, entry['set'], entry['payload']) if filed == 1
           end
         end
       end
@@ -460,17 +533,26 @@ module Cogworker
       # Jobs REQUEUE_SCRIPT had to file in dead raw (its parking list
       # unusable): swapped for a proper dead entry, and given the usual
       # terminal-failure side effects. Best-effort, per job.
+      # A swap that fails (Redis away) is kept and retried on the next pass
+      # (`recover_orphans`) — left alone, the raw entry stayed in dead without
+      # its error, its job's locks held and its failure uncounted.
       def complete_raw_burials(raws)
         raws.each do |raw|
           job = (parse_hash(raw) || {}).merge(repeat_orphan_error)
           Cogworker.config.redis do |c|
-            c.zadd(RedisKeys::DEAD, Time.now.to_f, JSON.generate(job))
-            c.zrem(RedisKeys::DEAD, raw)
-            buried_as_dead(c, job)
+            swapped = LuaScript.run(c, SWAP_DEAD_ENTRY_SCRIPT, keys: [RedisKeys::DEAD],
+                                                               argv: [raw, Time.now.to_f, JSON.generate(job)])
+            buried_as_dead(c, job) if swapped == 1
           end
+          @raw_burials_mutex.synchronize { @pending_raw_burials.delete(raw) }
         rescue StandardError => e
-          Cogworker.logger.error { "completing the dead entry of a repeat orphan failed: #{e.class}: #{e.message}" }
+          @raw_burials_mutex.synchronize { @pending_raw_burials << raw unless @pending_raw_burials.include?(raw) }
+          RedisErrors.report('Orphan recovery', e) { "a repeat orphan's dead entry not completed (will retry)" }
         end
+      end
+
+      def retry_raw_burials
+        complete_raw_burials(@raw_burials_mutex.synchronize { @pending_raw_burials.dup })
       end
 
       def repeat_orphan_error
@@ -479,16 +561,48 @@ module Cogworker
                              '(killed for memory? SIGKILL?) — not retried again' }
       end
 
+      FILEABLE_SETS = [RedisKeys::RETRY, RedisKeys::DEAD, RedisKeys::SCHEDULE].freeze
+
+      # `set` must be one of ours to file into — not any key a damaged record
+      # names (another type's, which would fail every pass at that record).
+      # Filing a failure in dead outside the middleware chain: release its
+      # locks, as the chain would for a terminal failure.
+      def released_if_dead(conn, set, payload)
+        job = parse_hash(payload)
+        JobUtil.release_terminal_locks(conn, job) if set == RedisKeys::DEAD && job
+      end
+
+      def valid_unsettled?(entry)
+        entry.is_a?(Hash) && FILEABLE_SETS.include?(entry['set']) && entry['score'].is_a?(Numeric) &&
+          entry['payload'].is_a?(String)
+      end
+
+      # A record that can't be filed (unreadable, fields missing) is moved
+      # out of the way — kept for a human, like KeyGuard's quarantine —
+      # instead of stopping every pass at it, and everything behind it.
+      def quarantine_record(conn, record)
+        target = "#{KeyGuard::QUARANTINE_PREFIX}#{RedisKeys::UNSETTLED}:records"
+        conn.rpush(target, record)
+        conn.expire(target, KeyGuard::QUARANTINE_TTL)
+        conn.lrem(RedisKeys::UNSETTLED, 1, record)
+        Cogworker.logger.error { "unusable #{RedisKeys::UNSETTLED} record moved to #{target}: #{record.to_s[0, 200]}" }
+      end
+
       # What any other terminal failure does on its way to dead: counted as
       # failed, and its `until_executed` locks released (so the entry / the
       # unique key isn't blocked until the locks' TTL). Best-effort.
+      # Each step on its own, locks first: one failing (a key of the wrong
+      # type) must not leave the others undone.
       def buried_as_dead(conn, job)
-        conn.incr(RedisKeys::STATS_FAILED)
-        OwnedKey.delete(RedisKeys.unique_lock(UniqueJobs.digest(job)), job['jid'], conn) if UniqueJobs.until_executed?(job)
-        Periodic::RunningLock.release(job['periodic_pjid'], job['jid'], conn) if job['periodic_pjid']
-        conn.del(RedisKeys::ORPHANINGS_PREFIX + job['jid'].to_s)
-      rescue StandardError => e
-        Cogworker.logger.error { "after burying jid=#{job['jid']}: #{e.class}: #{e.message}" }
+        JobUtil.release_terminal_locks(conn, job)
+        BestEffort.call('Orphan counter') { conn.del(RedisKeys::ORPHANINGS_PREFIX + job['jid'].to_s) }
+        BestEffort.call('Stats') { conn.incr(RedisKeys::STATS_FAILED) }
+        BestEffort.call('Throughput') { Throughput.record('failed') }
+      end
+
+      def orphanings_key(raw)
+        jid = parse_hash(raw)&.fetch('jid', nil) # (nil for an unreadable payload: an unused key then)
+        "#{RedisKeys::ORPHANINGS_PREFIX}#{jid}"
       end
 
       def parse_hash(raw)
@@ -519,8 +633,8 @@ module Cogworker
       def isolated(what, fallback, report = nil)
         yield
       rescue StandardError => e
-        report[:connection_lost] = true if report && e.is_a?(Redis::BaseConnectionError)
-        Cogworker.logger.error { "orphan recovery: #{what} failed: #{e.class}: #{e.message}" }
+        report[:connection_lost] = true if report && RedisErrors.unavailable?(e)
+        RedisErrors.report('Orphan recovery', e) { "#{what} failed" }
         fallback
       end
 
@@ -561,14 +675,15 @@ module Cogworker
     def give_back(work)
       Cogworker.config.redis do |c|
         LuaScript.run(c, REQUEUE_ONE_SCRIPT, keys: [RedisKeys.in_progress(Cogworker.identity)],
-                                            argv: [work.raw_job, *self.class.requeue_args])
+                                             argv: [work.raw_job, *self.class.requeue_args])
       end
     end
 
     def interrupt(work, set, score, payload)
       Cogworker.config.redis do |c|
-        LuaScript.run(c, INTERRUPT_SCRIPT, keys: [RedisKeys.in_progress(Cogworker.identity), set],
-                                          argv: [work.raw_job, score, payload])
+        LuaScript.run(c, INTERRUPT_SCRIPT, keys: [RedisKeys.in_progress(Cogworker.identity), set,
+                                                  self.class.orphanings_key(work.raw_job)],
+                                           argv: [work.raw_job, score, payload])
       end
     end
 
@@ -578,7 +693,7 @@ module Cogworker
       jid = self.class.parse_hash(work.raw_job)&.fetch('jid', nil)
       Cogworker.config.redis do |c|
         LuaScript.run(c, ACK_SCRIPT, keys: [RedisKeys.in_progress(Cogworker.identity),
-                                           RedisKeys::ORPHANINGS_PREFIX + jid.to_s],
+                                            RedisKeys::ORPHANINGS_PREFIX + jid.to_s],
                                      argv: [work.raw_job])
       end
     end

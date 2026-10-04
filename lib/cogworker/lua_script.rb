@@ -9,8 +9,8 @@ module Cogworker
   # restarted or failed-over server, SCRIPT FLUSH). Every script in this
   # gem goes through here.
   module LuaScript
-    SHAS = {} # source => sha1; memoized, the source strings are frozen constants
-    SHAS_MUTEX = Mutex.new
+    @shas = {} # source => sha1; memoized, the sources are frozen constants
+    @shas_mutex = Mutex.new
 
     module_function
 
@@ -24,7 +24,7 @@ module Cogworker
     end
 
     def sha(source)
-      SHAS_MUTEX.synchronize { SHAS[source] ||= Digest::SHA1.hexdigest(source) }
+      @shas_mutex.synchronize { @shas[source] ||= Digest::SHA1.hexdigest(source) }
     end
   end
 end

@@ -380,7 +380,9 @@ module Cogworker
       # Redis cards), where the default wrapper would just nest one bordered
       # box inside another.
       def table(headers, rows, empty_message: 'Nothing here.', wrapped: true)
-        return %(<p class="text-muted" style="font-size: 13px; font-style: italic;">#{h(empty_message)}</p>) if rows.empty?
+        if rows.empty?
+          return %(<p class="text-muted" style="font-size: 13px; font-style: italic;">#{h(empty_message)}</p>)
+        end
 
         head = headers.map { |c| %(<th>#{h(c)}</th>) }.join
         body = rows.map do |row|

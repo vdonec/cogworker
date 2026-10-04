@@ -16,6 +16,7 @@ module Cogworker
       # be what's failing (or what lost its last writes in a failover).
       @jobs_mutex = Mutex.new
       @running_jobs = Hash.new(0)
+      @performing_jobs = Hash.new(0) # the subset still inside `perform`
       @pending_settlements = {}
       @processors = Array.new(config.concurrency) { Processor.new(self) }
       @quiet = false
@@ -74,7 +75,24 @@ module Cogworker
     end
 
     def job_started(raw)
-      @jobs_mutex.synchronize { @running_jobs[raw] += 1 }
+      @jobs_mutex.synchronize do
+        @running_jobs[raw] += 1
+        @performing_jobs[raw] += 1
+      end
+    end
+
+    # `perform` (with its middleware) has returned: the job is still this
+    # process's until settled, but its locks are no longer its to keep
+    # alive — Heartbeat stops refreshing them (see `performing_jobs`).
+    def job_performed(raw)
+      @jobs_mutex.synchronize do
+        @performing_jobs[raw] -= 1
+        @performing_jobs.delete(raw) unless @performing_jobs[raw].positive?
+      end
+    end
+
+    def performing_jobs
+      @jobs_mutex.synchronize { @performing_jobs.keys }
     end
 
     def job_finished(raw)

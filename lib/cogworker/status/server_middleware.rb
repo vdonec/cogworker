@@ -9,14 +9,20 @@ module Cogworker
         @expiration = expiration
       end
 
+      # Every status write is best-effort (BestEffort) — before `perform`
+      # as much as after: one failing used to count as the job failing.
       def call(_worker, job, queue)
-        write(job, queue, 'working')
-        yield
-        write(job, queue, 'complete')
-      rescue Exception => e # rubocop:disable Lint/RescueException
-        write(job, queue, JobUtil.terminal_failure?(job) ? 'failed' : 'retrying',
-              error_class: e.class.name, error_message: JobUtil.error_message(e))
-        raise e
+        BestEffort.call('Status') { write(job, queue, 'working') }
+        begin
+          yield
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          BestEffort.call('Status') do
+            write(job, queue, JobUtil.terminal_failure?(job) ? 'failed' : 'retrying',
+                  error_class: e.class.name, error_message: JobUtil.error_message(e))
+          end
+          raise e
+        end
+        BestEffort.call('Status') { write(job, queue, 'complete') }
       end
 
       private
