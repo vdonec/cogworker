@@ -9,7 +9,7 @@ module Cogworker
     FETCH_MODES = %i[reliable basic].freeze
 
     attr_reader :server_chain, :client_chain, :periodic_manager, :redis_options, :fetch, :fetch_idle_max_interval,
-                :orphan_threshold, :max_orphanings
+                :orphan_threshold, :max_orphanings, :periodic_replace
     attr_accessor :concurrency, :queues, :periodic_catch_up, :unique_lock_ttl
 
     def initialize
@@ -133,7 +133,18 @@ module Cogworker
     # registers cron entries synchronously as it runs. No-op-safe: an app
     # that never calls this simply has an empty periodic_manager, and the
     # Ticker (started later, per process) has nothing to do.
-    def periodic(&block)
+    #
+    # `replace: true` clears what earlier calls registered first, and makes
+    # the Ticker replace the whole published `periodic:schedule` rather than
+    # adding to it — so an entry deleted from (or changed in) the schedule
+    # file disappears from the Web UI instead of lingering there forever.
+    # Opt-in: with processes that register *different* schedules against one
+    # Redis, each would wipe the others' entries off the Schedules tab.
+    def periodic(replace: false, &block)
+      if replace
+        periodic_manager.clear!
+        @periodic_replace = true
+      end
       block&.call(periodic_manager)
       periodic_manager
     end

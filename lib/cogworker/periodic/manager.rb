@@ -23,6 +23,11 @@ module Cogworker
         @entries << entry
         entry
       end
+
+      # In place: Launcher hands this same `entries` array to the Ticker.
+      def clear!
+        @entries.clear
+      end
     end
   end
 end

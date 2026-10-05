@@ -46,10 +46,11 @@ module Cogworker
         return 1
       LUA
 
-      def initialize(manager, entries, catch_up: true, ready: -> { true })
+      def initialize(manager, entries, catch_up: true, replace: false, ready: -> { true })
         @manager = manager
         @entries = entries
         @catch_up = catch_up
+        @replace = replace
         @ready = ready
         @last_checked_slot = {}
         @cron_cache = {}
@@ -84,8 +85,12 @@ module Cogworker
       # here (not at DSL-registration time in Config#periodic) so it never
       # depends on `config.redis =` having already run — every process that
       # boots re-writes the same idempotent entries regardless of ordering.
+      # With `replace` (Config#periodic(replace: true)) the hash is swapped
+      # out wholesale in one MULTI, dropping entries no longer registered
+      # (their `last_slot`/`disabled` state is left alone: an old process
+      # still ticking them mid-deploy must not re-fire an already-run slot).
       def publish_schedule!
-        return if @entries.empty?
+        return if @entries.empty? && !@replace
 
         payloads = @entries.each_with_object({}) do |entry, h|
           h[entry.pjid] = JSON.generate(
@@ -93,7 +98,14 @@ module Cogworker
             'unique' => entry.unique, 'args' => entry.args
           )
         end
-        Cogworker.config.redis { |c| c.hset(RedisKeys::PERIODIC_SCHEDULE, *payloads.to_a.flatten) }
+        Cogworker.config.redis do |c|
+          next c.hset(RedisKeys::PERIODIC_SCHEDULE, *payloads.to_a.flatten) unless @replace
+
+          c.multi do |tx|
+            tx.del(RedisKeys::PERIODIC_SCHEDULE)
+            tx.hset(RedisKeys::PERIODIC_SCHEDULE, *payloads.to_a.flatten) unless payloads.empty?
+          end
+        end
       end
 
       # A failed tick is logged and retried next interval rather than ending

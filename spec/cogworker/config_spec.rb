@@ -13,6 +13,17 @@ RSpec.describe Cogworker::Config do
     Cogworker.config.redis = { url: TEST_REDIS_URL }
   end
 
+  it 'periodic(replace: true) drops entries earlier calls registered and turns on schedule replacement' do
+    config = described_class.new
+    config.periodic { |mgr| mgr.register('0 * * * *', 'OldJob') }
+    expect(config.periodic_replace).to be_falsey
+
+    config.periodic(replace: true) { |mgr| mgr.register('*/5 * * * *', 'NewJob') }
+
+    expect(config.periodic_manager.entries.map(&:class_name)).to eq(['NewJob'])
+    expect(config.periodic_replace).to be(true)
+  end
+
   it 'defaults fetch to :reliable and rejects an unknown mode' do
     expect(Cogworker.config.fetch).to eq(:reliable)
     Cogworker.config.fetch = 'basic'

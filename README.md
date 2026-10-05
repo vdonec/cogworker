@@ -363,6 +363,18 @@ about two minutes after the process's last heartbeat (7 minutes by default).
 On first start against an empty Redis, each entry's most recent due slot
 fires right away. To turn that off, set `config.periodic_catch_up = false`.
 
+Entries are only ever added to the published schedule (what the Schedules
+tab shows), so one removed from your code stays listed there. Pass
+`replace: true` to clear what was registered before and replace the
+published schedule with exactly this set on every boot:
+
+```ruby
+config.periodic(replace: true, &PERIODIC_JOBS)
+```
+
+Don't use it if different processes register different schedules against
+the same Redis — each would erase the others' entries from the tab.
+
 ## Job status
 
 ```ruby

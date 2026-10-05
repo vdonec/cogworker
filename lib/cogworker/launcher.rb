@@ -21,6 +21,7 @@ module Cogworker
       # two runs at once.
       @ticker = Periodic::Ticker.new(
         @manager, config.periodic_manager.entries, catch_up: config.periodic_catch_up,
+                                                   replace: config.periodic_replace,
                                                    ready: -> { @scheduled.ready_for_ticker? }
       )
       @signal_queue = ::Queue.new

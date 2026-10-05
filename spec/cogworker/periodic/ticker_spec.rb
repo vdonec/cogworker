@@ -258,6 +258,30 @@ RSpec.describe Cogworker::Periodic::Ticker do
     expect(parsed['unique']).to eq('until_executed')
   end
 
+  describe 'replace: true' do
+    let(:stale_pjid) { 'stale-pjid' }
+
+    before { Cogworker.config.redis { |c| c.hset('periodic:schedule', stale_pjid, '{}') } }
+
+    it 'drops published entries that are no longer registered, keeping the current ones' do
+      described_class.new(double(stopping?: true, quiet?: false), [entry], replace: true).start!
+
+      expect(Cogworker.config.redis { |c| c.hkeys('periodic:schedule') }).to eq([entry.pjid])
+    end
+
+    it 'clears the published schedule entirely when nothing is registered' do
+      described_class.new(double(stopping?: true, quiet?: false), [], replace: true).start!
+
+      expect(Cogworker.config.redis { |c| c.exists?('periodic:schedule') }).to be(false)
+    end
+
+    it 'keeps stale entries without it' do
+      described_class.new(double(stopping?: true, quiet?: false), [entry]).start!
+
+      expect(Cogworker.config.redis { |c| c.hkeys('periodic:schedule') }).to contain_exactly(entry.pjid, stale_pjid)
+    end
+  end
+
   describe 'catch_up: false' do
     it 'does not enqueue the most-recently-due slot on a cold start (no persisted last_slot yet)' do
       ticker = described_class.new(double(stopping?: false, quiet?: false), [entry], catch_up: false)
