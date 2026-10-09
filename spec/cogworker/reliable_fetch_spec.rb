@@ -832,3 +832,128 @@ RSpec.describe Cogworker::ReliableFetch, 'cogworker:unsettled and interrupt book
     described_class.instance_variable_get(:@pending_raw_burials).clear
   end
 end
+
+RSpec.describe Cogworker::ReliableFetch, 'death hooks on the reconcile paths' do
+  let(:deaths) { [] }
+
+  before do
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    deaths = self.deaths
+    stub_const('ReconciledJob', Class.new { include Cogworker::Worker })
+    ReconciledJob.cogworker_retries_exhausted { |job, e| deaths << [:class, job['jid'], e.class, e.message] }
+    Cogworker.config.death_handlers << ->(job, e) { deaths << [:handler, job['jid'], e.class, job['error_class']] }
+  end
+
+  let(:job) { { 'jid' => 'r1', 'class' => 'ReconciledJob', 'queue' => 'default', 'args' => [] } }
+
+  it 'runs them with a JobOrphanedError for a repeat orphan — once, even with two processes burying at once' do
+    Cogworker.config.redis { |c| c.rpush('cogworker:repeat_orphans', JSON.generate(job)) }
+
+    2.times.map { Thread.new { described_class.bury_repeat_orphans } }.each(&:join)
+    described_class.bury_repeat_orphans
+
+    expect(Cogworker.config.redis { |c| c.zcard('cogworker:dead') }).to eq(1)
+    expect(deaths.map { |d| d.first(3) }).to eq([[:class, 'r1', Cogworker::JobOrphanedError],
+                                                 [:handler, 'r1', Cogworker::JobOrphanedError]])
+    expect(deaths.first.last).to include("orphaned more than #{Cogworker.config.max_orphanings} times")
+  end
+
+  it 'runs them for a repeat orphan filed straight into dead (the parking list unusable)' do
+    Cogworker.config.redis do |c|
+      c.lpush('cogworker:inprogress:dead-host:7:q', JSON.generate(job))
+      c.sadd?('cogworker:inprogress_identities', 'dead-host:7:q')
+      c.set('cogworker:orphanings:r1', Cogworker.config.max_orphanings)
+      c.set('cogworker:repeat_orphans', 'not a list')
+    end
+
+    described_class.recover_orphans
+
+    expect(deaths.map { |d| d.first(3) }).to eq([[:class, 'r1', Cogworker::JobOrphanedError],
+                                                 [:handler, 'r1', Cogworker::JobOrphanedError]])
+  end
+
+  it 'runs them with a JobFailedError when file_unsettled files a death, keeping the original error_class' do
+    payload = JSON.generate(job.merge('error_class' => 'KeyError', 'error_message' => 'key not found'))
+    Cogworker.config.redis do |c|
+      c.rpush('cogworker:unsettled', JSON.generate('set' => 'cogworker:dead', 'score' => 1.0, 'payload' => payload))
+      c.rpush('cogworker:unsettled', JSON.generate('set' => 'cogworker:retry', 'score' => 1.0,
+                                                   'payload' => JSON.generate(job.merge('jid' => 'r2'))))
+    end
+
+    2.times { described_class.file_unsettled }
+
+    expect(deaths).to eq([[:class, 'r1', Cogworker::JobFailedError, 'key not found'],
+                          [:handler, 'r1', Cogworker::JobFailedError, 'KeyError']])
+  end
+
+  it 'runs only the death handlers there for a class that can no longer be loaded' do
+    payload = JSON.generate(job.merge('class' => 'RemovedLongAgoJob', 'error_class' => 'RuntimeError'))
+    Cogworker.config.redis do |c|
+      c.rpush('cogworker:unsettled', JSON.generate('set' => 'cogworker:dead', 'score' => 1.0, 'payload' => payload))
+    end
+
+    described_class.file_unsettled
+
+    expect(deaths).to eq([[:handler, 'r1', Cogworker::JobFailedError, 'RuntimeError']])
+  end
+
+  it "runs them when this process's own reconcile files a pending death", :reliable_fetch do
+    raw = JSON.generate(job)
+    entry = JSON.generate(job.merge('error_class' => 'RuntimeError', 'error_message' => 'boom'))
+    Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw) }
+
+    described_class.reconcile(Cogworker.identity, [], pending: { raw => ['cogworker:dead', 1.0, entry] })
+    described_class.reconcile(Cogworker.identity, [], pending: { raw => ['cogworker:dead', 1.0, entry] })
+
+    expect(deaths.map { |d| d.first(3) }).to eq([[:class, 'r1', Cogworker::JobFailedError],
+                                                 [:handler, 'r1', Cogworker::JobFailedError]])
+  end
+
+  context 'when releasing the locks fails after the job is already in dead' do
+    before do
+      allow(Cogworker::JobUtil).to receive(:release_terminal_locks).and_raise(RuntimeError, 'lock bookkeeping broke')
+    end
+
+    it 'still runs them for a repeat orphan' do
+      Cogworker.config.redis { |c| c.rpush('cogworker:repeat_orphans', JSON.generate(job)) }
+
+      expect { described_class.bury_repeat_orphans }.to raise_error(RuntimeError, 'lock bookkeeping broke')
+
+      expect(deaths.map(&:first)).to eq(%i[class handler])
+    end
+
+    it 'still runs them, once, for a repeat orphan filed straight into dead' do
+      Cogworker.config.redis { |c| c.zadd('cogworker:dead', 1, JSON.generate(job)) }
+
+      2.times { described_class.complete_raw_burials([JSON.generate(job)]) }
+      described_class.retry_raw_burials
+
+      expect(deaths.map(&:first)).to eq(%i[class handler])
+    end
+
+    it 'still runs them, once, for file_unsettled' do
+      payload = JSON.generate(job.merge('error_class' => 'KeyError', 'error_message' => 'x'))
+      Cogworker.config.redis do |c|
+        c.rpush('cogworker:unsettled', JSON.generate('set' => 'cogworker:dead', 'score' => 1.0, 'payload' => payload))
+      end
+
+      2.times { described_class.file_unsettled }
+
+      expect(deaths.map(&:first)).to eq(%i[class handler])
+    end
+
+    it "still runs them for this process's own pending death, and counts it as settled", :reliable_fetch do
+      raw = JSON.generate(job)
+      entry = JSON.generate(job.merge('error_class' => 'RuntimeError', 'error_message' => 'boom'))
+      Cogworker.config.redis { |c| c.lpush("cogworker:inprogress:#{Cogworker.identity}", raw) }
+      settled = []
+
+      described_class.reconcile(Cogworker.identity, [], pending: { raw => ['cogworker:dead', 1.0, entry] }) do |r|
+        settled << r
+      end
+
+      expect(settled).to eq([raw])
+      expect(deaths.map(&:first)).to eq(%i[class handler])
+    end
+  end
+end

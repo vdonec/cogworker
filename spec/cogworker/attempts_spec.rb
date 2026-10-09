@@ -46,4 +46,11 @@ RSpec.describe Cogworker::Attempts do
 
     expect(described_class.for('jid4')).to eq([])
   end
+
+  it 'keeps the killed / discarded outcomes a retry_in hook decides' do
+    described_class.record('jid5', attempt: 1, error: RuntimeError.new('a'), outcome: 'killed')
+    described_class.record('jid5', attempt: 2, error: RuntimeError.new('b'), outcome: 'discarded')
+
+    expect(described_class.for('jid5').map { |a| a['outcome'] }).to eq(%w[killed discarded])
+  end
 end

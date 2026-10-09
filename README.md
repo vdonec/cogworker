@@ -266,8 +266,99 @@ real worker would receive Strings instead of Symbols.
 ### Retries and Dead
 
 A failed job moves to the Retry set with a growing delay
-(`count**4 + 15 + jitter` seconds). When it runs out of attempts, it moves to
-Dead. You can put it back on its queue by hand from the Web UI.
+(`count**4 + 15 + jitter` seconds, `count` being the retry about to happen,
+1 for the first). `retry:` sets the budget: `true` or unset gives 25
+retries, an integer that many, `false` or `0` none. When it runs out of
+retries, it moves to Dead. You can put it back on its queue by hand from the
+Web UI.
+
+#### Custom delay: `cogworker_retry_in`
+
+```ruby
+class SendEventJob
+  include Cogworker::Worker
+  cogworker_options retry: 10
+
+  cogworker_retry_in do |count, exception, job|
+    next :kill if exception.is_a?(PermanentError)
+
+    60 * (2**count)
+  end
+end
+```
+
+`count` is the number of retries made before this failure (0 on the first
+one), `exception` what the attempt raised, `job` a copy of the job hash (the
+block may take fewer parameters). It returns:
+
+| Value | Effect |
+|---|---|
+| Integer / Float ≥ 0 | retry after that many seconds, no jitter added; 0 means on the next poll |
+| `nil` | the default delay |
+| `:kill` | straight to Dead, retries left or not; the death hooks run |
+| `:discard` | dropped: neither Retry nor Dead, no death hooks; counted as failed, its unique locks released |
+| anything else | the default delay, with a warning in the log |
+
+If the block raises, the default delay is used and the error is logged. It
+isn't called for a failure that is the last one anyway (no retry left, or
+`retry: false`), nor for a job whose class can't be loaded. It's asked as
+soon as `perform` raises, before any server middleware sees the error — so
+it also runs when a middleware then swallows that error; keep it free of
+side effects. A delay is never capped (one over a year is logged as a
+likely mistake), and the job's `until_executed` lock is extended by it, so
+the lock never runs out before the retry — however long that is. If
+recording the failure itself fails (Redis trouble), the job is retried
+after a fixed `30 s × n` instead, whatever the hook said. The hook is
+inherited, so a base class of your own (`class ApplicationJob`) is the place
+for an app-wide policy. The Web UI's retry timeline shows `:kill` and
+`:discard` as such.
+
+#### Death hooks: `cogworker_retries_exhausted` and `death_handlers`
+
+```ruby
+class SendEventJob
+  include Cogworker::Worker
+
+  cogworker_retries_exhausted do |job, exception|
+    Metrics.increment('events.lost')
+  end
+end
+
+Cogworker.configure_server do |config|
+  config.death_handlers << ->(job, exception) { ErrorTracker.notify(exception, job) }
+end
+```
+
+When a job lands in Dead for good, its class's `cogworker_retries_exhausted`
+runs first, then every `death_handlers` entry in order. `job` is the entry
+as stored in Dead (with `error_class`, `error_message`, `retry_count`,
+`failed_at`); each hook gets its own copy, so changing it changes nothing.
+
+| How the job died | Class hook | `death_handlers` |
+|---|---|---|
+| out of retries, or `retry: false` / `0` | yes | yes |
+| `cogworker_retry_in` returned `:kill` | yes | yes |
+| its process kept dying while running it (`config.max_orphanings`) | yes, with a `Cogworker::JobOrphanedError` | yes |
+| its failure was filed later, by a reconcile pass | yes, with a `Cogworker::JobFailedError` carrying the original message (the original class is in `job['error_class']`) | yes |
+| its class can't be loaded (renamed, removed) | no | yes |
+| `cogworker_retry_in` returned `:discard` | no | no |
+| an unparseable payload | no | no |
+| deleted or retried from the Web UI | no | no |
+
+The hooks run only after the job is safely in Dead, at most once per death:
+on the reconcile paths, only the process that actually filed it runs them.
+They run synchronously, on the processor thread (once the job is
+acknowledged, before the thread takes the next one) or on the reconcile
+thread, with no timeout of their own — **keep them quick**. One that raises
+is logged and doesn't stop the others, nor the job's ack or lock release.
+
+A hook can be skipped or cut short, never repeated: a process that crashes
+right after the write never runs it, and on shutdown a hook still running
+when the drain timeout (25 s) is up may be cut off as the process exits.
+The job itself is safe either way — already in Dead and acknowledged, so it
+won't run again. `Testing.inline!` raises the job's error to the caller as before
+and runs no hooks; test a hook directly through
+`SomeJob.cogworker_retry_in_block` / `SomeJob.cogworker_retries_exhausted_block`.
 
 ### Unique jobs
 

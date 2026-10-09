@@ -34,6 +34,12 @@ module Cogworker
         # (still capped at 25, but the same 25 either way) is one click
         # away via the History link below, not lost.
         ATTEMPTS_DISPLAY_LIMIT = 5
+        # How the retry timeline reads each `Attempts` outcome; `killed`/
+        # `discarded` are the job class's `cogworker_retry_in` ending it early.
+        ATTEMPT_OUTCOME_LABELS = {
+          'dead' => 'moved to dead set', 'killed' => 'killed by retry_in, moved to dead set',
+          'discarded' => 'discarded by retry_in'
+        }.freeze
         TAG_CLASS = { 'Enqueued' => 'tag-neutral', 'Running' => 'tag-accent', 'Scheduled' => 'tag-accent-2',
                       'Retrying' => 'tag-warning', 'Dead' => 'tag-danger' }.freeze
 
@@ -378,14 +384,14 @@ module Cogworker
 
           shown = attempts.first(ATTEMPTS_DISPLAY_LIMIT)
           items = shown.map do |a|
-            dot = a['outcome'] == 'dead' ? 'var(--color-danger)' : 'var(--color-warning)'
+            dot = a['outcome'] == 'retrying' ? 'var(--color-warning)' : 'var(--color-danger)'
             <<~HTML
               <div style="display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 10px;">
                 <div style="display: flex; flex-direction: column; align-items: center;">
                   <span style="width: 9px; height: 9px; border-radius: 50%; background: #{dot}; margin-top: 5px;"></span>
                 </div>
                 <div style="padding-bottom: 12px;">
-                  <div style="font-size: 13px;">Attempt #{a['attempt']} · #{a['outcome'] == 'dead' ? 'moved to dead set' : 'failed'}</div>
+                  <div style="font-size: 13px;">Attempt #{a['attempt']} · #{ATTEMPT_OUTCOME_LABELS.fetch(a['outcome'], 'failed')}</div>
                   <div style="font-size: 12px; color: var(--color-neutral-500);">#{Layout.h(Time.at(a['failed_at']).utc.strftime(Web.time_format))} · #{Layout.h(a['error_class'])}: #{Layout.h(a['error_message'])}</div>
                 </div>
               </div>

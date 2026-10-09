@@ -9,7 +9,7 @@ module Cogworker
     FETCH_MODES = %i[reliable basic].freeze
 
     attr_reader :server_chain, :client_chain, :periodic_manager, :redis_options, :fetch, :fetch_idle_max_interval,
-                :orphan_threshold, :max_orphanings, :periodic_replace
+                :orphan_threshold, :max_orphanings, :periodic_replace, :death_handlers
     attr_accessor :concurrency, :queues, :periodic_catch_up, :unique_lock_ttl
 
     def initialize
@@ -57,6 +57,10 @@ module Cogworker
       # that crashed is counted, so keep this above the number of crashes an
       # innocent job might plausibly sit through.
       @max_orphanings = 3
+      # Callables `(job, exception)` run, after the job class's own
+      # `cogworker_retries_exhausted`, whenever a job lands in dead for good
+      # (DeathNotifier). `config.death_handlers << ->(job, e) { ... }`.
+      @death_handlers = []
       register_default_middleware
     end
 

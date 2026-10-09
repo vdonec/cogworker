@@ -40,5 +40,17 @@ module Cogworker
     def get(jid)
       Storage.read(jid)
     end
+
+    # Corrects a status already written as 'retrying' to 'failed' — for a
+    # job whose `cogworker_retry_in` ended it (`:kill`/`:discard`) only
+    # after the middleware had seen the failure (a middleware raised, not
+    # `perform`). A no-op for a job nothing tracks the status of.
+    def mark_failed(job, error)
+      return unless Storage.read(job['jid'])
+
+      Storage.write(job['jid'], default_expiration || DEFAULT_EXPIRATION,
+                    'status' => 'failed', 'update_time' => Time.now.to_f,
+                    'error_class' => error.class.name, 'error_message' => JobUtil.error_message(error))
+    end
   end
 end

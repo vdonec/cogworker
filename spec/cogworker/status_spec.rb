@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'stringio'
 
 RSpec.describe 'Cogworker::Status' do
   before do
@@ -101,5 +102,23 @@ RSpec.describe 'Cogworker::Status' do
       job.store('custom' => 'value')
       expect(Cogworker::Status.get('manual-jid')['custom']).to eq('value')
     end
+  end
+
+  it 'marks a job its cogworker_retry_in kills as failed, not retrying, though it had retries left' do
+    stub_const('KilledStatusJob', Class.new do
+      include Cogworker::Worker
+      cogworker_options retry: 10
+      cogworker_retry_in { |*| :kill }
+
+      def perform(*)
+        raise 'permanent'
+      end
+    end)
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    jid = KilledStatusJob.perform_async
+
+    Cogworker::Processor.new(Cogworker::Manager.new).send(:process_one)
+
+    expect(Cogworker::Status.status(jid)).to eq(:failed)
   end
 end

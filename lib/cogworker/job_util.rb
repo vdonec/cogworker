@@ -61,8 +61,44 @@ module Cogworker
     # `Periodic::ReleaseMiddleware` (releases the running-lock only on the
     # terminal attempt) — previously three separate, subtly different copies
     # of this same check, two of which had the `max_retries` bug above.
+    #
+    # A job class's `cogworker_retry_in` can end a job early (`:kill`,
+    # `:discard`): `Processor` stamps that decision on the job as
+    # `failure_outcome` (FailureDecision) before the middleware sees the
+    # failure, and it wins here when present.
     def terminal_failure?(job)
+      outcome = job['failure_outcome']
+      return outcome != 'retry' if FailureDecision::OUTCOMES.include?(outcome)
+
       job['retry_count'].to_i >= max_retries(job)
+    end
+
+    # A copy of a job hash to hand to user code, so changes it makes can't
+    # leak back. Never raises: unlike a JSON round trip, it copes with
+    # whatever middleware may have put in the hash (the job being on its
+    # way to `interrupt` precisely because that doesn't serialize).
+    def deep_copy(value)
+      case value
+      when Hash then value.to_h { |k, v| [deep_copy(k), deep_copy(v)] }
+      when Array then value.map { |v| deep_copy(v) }
+      when String then value.dup
+      else value
+      end
+    end
+
+    # Calls a user-supplied hook (a block, lambda, Method or any `#call`
+    # object) with as many of `args` as it takes: a block with fewer
+    # parameters ignores the rest anyway, a lambda or method would raise.
+    # Counted from `parameters` (required + optional), not `arity`, which
+    # is negative as soon as there's an optional one.
+    def call_hook(hook, *args)
+      callable = hook.is_a?(Proc) || hook.is_a?(Method) ? hook : hook.method(:call)
+      return hook.call(*args) if callable.is_a?(Proc) && !callable.lambda?
+
+      params = callable.parameters
+      return hook.call(*args) if params.any? { |type, _| type == :rest }
+
+      hook.call(*args.first(params.count { |type, _| %i[req opt].include?(type) }))
     end
 
     # The job Hash a raw `schedule`/`retry`/`dead` entry would requeue as —

@@ -32,6 +32,15 @@ RSpec.describe Cogworker::Config do
     expect { Cogworker.config.fetch = nil }.to raise_error(ArgumentError, /got nil/)
   end
 
+  it 'defaults death_handlers to an empty list of its own, per config' do
+    one = described_class.new
+    two = described_class.new
+    one.death_handlers << ->(_job, _e) {}
+
+    expect(one.death_handlers.size).to eq(1)
+    expect(two.death_handlers).to eq([])
+  end
+
   it 'defaults max_orphanings to 3 and accepts only a positive Integer' do
     expect(Cogworker.config.max_orphanings).to eq(3)
     Cogworker.config.max_orphanings = 5

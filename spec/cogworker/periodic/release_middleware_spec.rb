@@ -75,4 +75,23 @@ RSpec.describe Cogworker::Periodic::ReleaseMiddleware do
 
     expect(ran).to be(true)
   end
+
+  it "releases the running lock when the job's cogworker_retry_in kills it, though retries were left" do
+    stub_const('KilledPeriodicJob', Class.new do
+      include Cogworker::Worker
+      cogworker_retry_in { |*| :kill }
+
+      def perform(*)
+        raise 'permanent'
+      end
+    end)
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(StringIO.new))
+    jid = Cogworker::Client.push('class' => 'KilledPeriodicJob', 'args' => [], 'retry' => 10,
+                                 'periodic_pjid' => 'pk')
+    Cogworker.config.redis { |c| c.set(running_key('pk'), jid) }
+
+    Cogworker::Processor.new(Cogworker::Manager.new).send(:process_one)
+
+    expect(Cogworker.config.redis { |c| [c.get(running_key('pk')), c.zcard('cogworker:dead')] }).to eq([nil, 1])
+  end
 end

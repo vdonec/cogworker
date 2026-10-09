@@ -60,4 +60,49 @@ RSpec.describe Cogworker::Job do
       expect(score).to be_within(1).of(future)
     end
   end
+
+  describe 'cogworker_retry_in / cogworker_retries_exhausted' do
+    it 'keeps each block on the class, readable through *_block, nil when never set' do
+      retry_in = proc { |count| count }
+      exhausted = proc { |_job, _e| nil }
+      TestJob.cogworker_retry_in(&retry_in)
+      TestJob.cogworker_retries_exhausted(&exhausted)
+
+      expect(TestJob.cogworker_retry_in_block).to equal(retry_in)
+      expect(TestJob.cogworker_retries_exhausted_block).to equal(exhausted)
+      stub_const('BareJob', Class.new { include Cogworker::Worker })
+      expect(BareJob.cogworker_retry_in_block).to be_nil
+      expect(BareJob.cogworker_retries_exhausted_block).to be_nil
+    end
+
+    it 'is inherited, and a subclass overrides it without touching its parent' do
+      stub_const('BaseJob', Class.new { include Cogworker::Worker })
+      BaseJob.cogworker_retry_in { |count| count * 10 }
+      BaseJob.cogworker_retries_exhausted { |_job, _e| :base }
+      stub_const('ChildJob', Class.new(BaseJob))
+      stub_const('OwnJob', Class.new(BaseJob))
+      OwnJob.cogworker_retry_in { |_count| :kill }
+
+      expect(ChildJob.cogworker_retry_in_block.call(2)).to eq(20)
+      expect(ChildJob.cogworker_retries_exhausted_block.call({}, nil)).to eq(:base)
+      expect(OwnJob.cogworker_retry_in_block.call(2)).to eq(:kill)
+      expect(BaseJob.cogworker_retry_in_block.call(2)).to eq(20)
+    end
+
+    it 'keeps the blocks out of the pushed payload' do
+      TestJob.cogworker_retry_in { |_count| 5 }
+      TestJob.cogworker_retries_exhausted { |_job, _e| nil }
+
+      TestJob.perform_async(1)
+
+      raw = Cogworker.config.redis { |c| c.lrange('cogworker:queue:default', 0, -1) }.first
+      expect(raw).not_to include('retry_in', 'exhausted', 'Proc')
+      expect(TestJob.cogworker_options_hash.keys).to eq(%i[lock_run retry])
+    end
+
+    it 'raises ArgumentError without a block' do
+      expect { TestJob.cogworker_retry_in }.to raise_error(ArgumentError)
+      expect { TestJob.cogworker_retries_exhausted }.to raise_error(ArgumentError)
+    end
+  end
 end

@@ -30,6 +30,32 @@ module Cogworker
                                     end
       end
 
+      # `cogworker_retry_in { |count, exception, job| ... }` — the pause
+      # (seconds) before the next attempt, or `:kill` (straight to dead) /
+      # `:discard` (dropped), or `nil` for the default backoff. See
+      # `FailureDecision`. Kept on the class, never in the job payload.
+      def cogworker_retry_in(&block)
+        raise ArgumentError, 'cogworker_retry_in needs a block' unless block
+
+        @cogworker_retry_in_block = block
+      end
+
+      # `cogworker_retries_exhausted { |job, exception| ... }` — called once
+      # the job is in dead for good (see `DeathNotifier`).
+      def cogworker_retries_exhausted(&block)
+        raise ArgumentError, 'cogworker_retries_exhausted needs a block' unless block
+
+        @cogworker_retries_exhausted_block = block
+      end
+
+      def cogworker_retry_in_block
+        inherited_hook(:@cogworker_retry_in_block, :cogworker_retry_in_block)
+      end
+
+      def cogworker_retries_exhausted_block
+        inherited_hook(:@cogworker_retries_exhausted_block, :cogworker_retries_exhausted_block)
+      end
+
       def perform_async(*args)
         Client.push(job_payload('args' => args))
       end
@@ -60,6 +86,14 @@ module Cogworker
       end
 
       private
+
+      # Looked up at call time (not copied at definition), so a subclass
+      # sees a hook its parent defines later too.
+      def inherited_hook(ivar, reader)
+        return instance_variable_get(ivar) if instance_variable_defined?(ivar)
+
+        superclass.respond_to?(reader) ? superclass.public_send(reader) : nil
+      end
 
       def job_payload(extra)
         cogworker_options_hash.transform_keys(&:to_s).merge('class' => name).merge(extra)

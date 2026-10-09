@@ -90,6 +90,8 @@ module Cogworker
       @busy = true
       @ran = nil
       @performed = false
+      @decision = nil
+      @death = nil
       disposition = nil
       begin
         disposition = execute(work)
@@ -104,6 +106,10 @@ module Cogworker
         # can't re-queue a job that already ran.
         settle(work, disposition || @ran || :give_back)
         @manager.job_finished(work.raw_job)
+        # Only now, with the job acknowledged (or its ack remembered): a
+        # slow hook used to hold it on the in-progress list, where a
+        # shutdown or orphan recovery requeued it and ran it again.
+        DeathNotifier.notify(*@death) if @death
       end
     end
 
@@ -139,9 +145,10 @@ module Cogworker
       payload.merge!('interrupted_count' => count, 'retry_count' => attempt,
                      'error_class' => error.class.name, 'error_message' => JobUtil.error_message(error),
                      'failed_at' => Time.now.to_f)
-      # No retries left (`retry: false`/`0`, or the last one used up) means
-      # no extra attempt either — straight to dead, like any terminal failure.
-      out_of_retries = attempt > JobUtil.max_retries(payload)
+      # No retries left (`retry: false`/`0`, or the last one used up, or the
+      # job's `cogworker_retry_in` ended it) means no extra attempt either —
+      # straight to dead, like any terminal failure.
+      out_of_retries = attempt > JobUtil.max_retries(payload) || @decision&.cut_short?
       delay = INTERRUPT_DELAY * count
       set, score = if out_of_retries || count > MAX_INTERRUPTS
                      [RedisKeys::DEAD, Time.now.to_f]
@@ -150,25 +157,15 @@ module Cogworker
                    end
       encoded = JSON.generate(payload)
       begin
-        fetcher.interrupt(work, set, score, encoded)
+        written = fetcher.interrupt(work, set, score, encoded) != 0 # (0: no longer ours to file)
       rescue StandardError
         # Remembered with its payload: this process's reconcile (and its
         # shutdown) keep trying to file it — never re-run it as a stray.
         @manager.settle_later(work.raw_job, [set, score, encoded]) if fetcher.is_a?(ReliableFetch)
         raise
       end
-      if set == RedisKeys::RETRY
-        best_effort('lock extension') { extend_locks_for_retry(job, delay) }
-      else
-        best_effort('lock release') { release_locks(payload) }
-      end
-      reason = if set == RedisKeys::RETRY
-                 "retrying in #{delay}s (interruption #{count} of at most #{MAX_INTERRUPTS})"
-               elsif out_of_retries
-                 'moved to dead: no retries left'
-               else
-                 "moved to dead: interrupted more than #{MAX_INTERRUPTS} times"
-               end
+      after_interrupt(job, payload, error, set, delay, written)
+      reason = interrupt_reason(set, out_of_retries, count, delay)
       Cogworker.logger.error { "couldn't record the failure of jid=#{payload['jid']} (#{error.class}); #{reason}" }
     rescue StandardError => e
       # Whatever failed (even before anything was written), remember the job
@@ -179,6 +176,21 @@ module Cogworker
       Cogworker.logger.error do
         "couldn't record or interrupt jid=#{jid_of(work)} (left in progress): #{e.class}: #{e.message}"
       end
+    end
+
+    def after_interrupt(job, payload, error, set, delay, written)
+      if set == RedisKeys::RETRY
+        best_effort('lock extension') { extend_locks_for_retry(job, delay) }
+      else
+        best_effort('lock release') { release_locks(payload) }
+        @death = [payload, error] if written # run by `process_one`, once settled
+      end
+    end
+
+    def interrupt_reason(set, out_of_retries, count, delay)
+      return "retrying in #{delay}s (interruption #{count} of at most #{MAX_INTERRUPTS})" if set == RedisKeys::RETRY
+
+      out_of_retries ? 'moved to dead: no retries left' : "moved to dead: interrupted more than #{MAX_INTERRUPTS} times"
     end
 
     def remember_for_dead(work, error)
@@ -272,10 +284,18 @@ module Cogworker
         nil
       end
 
+      @job_class = worker&.class
       Cogworker.config.server_chain.invoke(worker, job, work.queue) do
         raise resolution_error if resolution_error
 
-        worker.perform(*job['args'])
+        begin
+          worker.perform(*job['args'])
+        rescue Exception => e # rubocop:disable Lint/RescueException
+          # Retry, dead or discard — decided here, while the middleware is
+          # still to see the failure (FailureDecision.decide!).
+          @decision = FailureDecision.decide!(job, e, @job_class)
+          raise
+        end
       end
       nil
     rescue Exception => e # rubocop:disable Lint/RescueException
@@ -349,22 +369,26 @@ module Cogworker
     # must happen; everything after it is best-effort. False if that write
     # failed (`finish_failure` then interrupts the job instead).
     def route_failure(job, error)
+      @decided_late = @decision.nil? # raised by middleware, not `perform`: decided after the chain
+      @decision ||= FailureDecision.decide!(job, error, @job_class)
+      decision = @decision || FailureDecision.new(JobUtil.terminal_failure?(job) ? 'dead' : 'retry')
+      job.delete('failure_outcome')
       job['error_class'] = error.class.name
       job['error_message'] = JobUtil.error_message(error)
       job['failed_at'] ||= Time.now.to_f
-
-      max_retries = JobUtil.max_retries(job)
       new_count = job['retry_count'].to_i + 1
       job['retry_count'] = new_count
-      retrying = new_count <= max_retries
-      delay = retry_delay(new_count) if retrying
+      if decision.discard? # neither retry nor dead, no death hooks: the job just ends, counted as failed
+        after_failure_recorded(job, error, decision, nil)
+        return true
+      end
 
+      delay = decision.delay || retry_delay(new_count) if decision.retry?
       begin
         payload = JSON.generate(job)
         Cogworker.config.redis do |c|
-          if retrying
-            c.zadd(RedisKeys::RETRY, Time.now.to_f + delay,
-                   payload)
+          if decision.retry?
+            c.zadd(RedisKeys::RETRY, Time.now.to_f + delay, payload)
           else
             c.zadd(RedisKeys::DEAD, Time.now.to_f, payload)
           end
@@ -374,11 +398,25 @@ module Cogworker
         return false
       end
 
-      best_effort('lock extension') { extend_locks_for_retry(job, delay) } if retrying
-      best_effort('attempts log') do
-        Attempts.record(job['jid'], attempt: new_count, error: error, outcome: retrying ? 'retrying' : 'dead')
-      end
+      after_failure_recorded(job, error, decision, delay)
+      @death = [JSON.parse(payload), error] if decision.dead? # run by `process_one`, once settled
       true
+    end
+
+    def after_failure_recorded(job, error, decision, delay)
+      if decision.retry?
+        best_effort('lock extension') { extend_locks_for_retry(job, delay) }
+      elsif decision.cut_short?
+        # Normally the release middleware's, on the terminal attempt — but
+        # a decision made after the chain (a middleware raised) never
+        # reached it. Owner-checked, so releasing twice is harmless. Same
+        # for the status the Status middleware wrote then: 'retrying'.
+        best_effort('lock release') { release_locks(job) }
+        best_effort('status') { Status.mark_failed(job, error) } if @decided_late
+      end
+      best_effort('attempts log') do
+        Attempts.record(job['jid'], attempt: job['retry_count'], error: error, outcome: decision.attempt_outcome)
+      end
     end
 
     # A job waiting out its retry backoff still holds its `until_executed`
@@ -404,10 +442,9 @@ module Cogworker
       Cogworker.config.redis { |c| JobUtil.release_terminal_locks(c, job) }
     end
 
-    # Grows with the retry count, with jitter to avoid a thundering herd of
-    # retries all landing on the same second.
+    # The default backoff, for a job whose class has no say in it.
     def retry_delay(count)
-      (count**4) + 15 + (rand(30) * (count + 1))
+      FailureDecision.default_delay(count)
     end
 
     def register_in_workers(queue, job)

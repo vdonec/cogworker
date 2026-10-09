@@ -404,20 +404,27 @@ module Cogworker
       # `config.max_orphanings` times) in `dead`, with an error saying why — whatever
       # its `retry` setting, since each of those runs ended with its process
       # gone rather than an error to retry on. Parked entries survive a
-      # failure here and are picked up on the next pass.
+      # failure here and are picked up on the next pass. Death hooks run
+      # only for the entries this call itself moved (the script's 1), so
+      # processes reconciling side by side don't run them twice.
       def bury_repeat_orphans
+        buried_jobs = []
         Cogworker.config.redis do |c|
           c.lrange(RedisKeys::REPEAT_ORPHANS, 0, -1).each do |raw|
-            job = parse_hash(raw) || JobUtil.unparseable_job(raw, queue: nil, error: JSON::ParserError.new('unreadable'))
+            readable = parse_hash(raw)
+            job = readable || JobUtil.unparseable_job(raw, queue: nil, error: JSON::ParserError.new('unreadable'))
             job.merge!(repeat_orphan_error)
             buried = LuaScript.run(c, BURY_ORPHAN_SCRIPT, keys: [RedisKeys::REPEAT_ORPHANS, RedisKeys::DEAD],
                                                           argv: [raw, Time.now.to_f, JSON.generate(job)])
             next unless buried == 1
 
+            buried_jobs << job if readable # it's in dead now, whatever the bookkeeping below does
             Cogworker.logger.error { "jid=#{job['jid']} orphaned too often, moved to dead" }
             buried_as_dead(c, job)
           end
         end
+      ensure
+        buried_jobs.each { |job| DeathNotifier.notify_orphaned(job) }
       end
 
       def recover_identity(identity)
@@ -472,18 +479,20 @@ module Cogworker
       def settle_pending(identity, pending)
         key = RedisKeys.in_progress(identity)
         pending.each do |raw, how|
-          Cogworker.config.redis do |c|
+          buried = Cogworker.config.redis do |c|
             if how == :ack
               jid = parse_hash(raw)&.fetch('jid', nil)
               LuaScript.run(c, ACK_SCRIPT, keys: [key, RedisKeys::ORPHANINGS_PREFIX + jid.to_s], argv: [raw])
+              nil
             else
               set, score, payload = how
               filed = LuaScript.run(c, INTERRUPT_SCRIPT, keys: [key, set, orphanings_key(raw)],
                                                          argv: [raw, score, payload])
-              released_if_dead(c, set, payload) if filed == 1
+              filed == 1 ? filed_in_dead(c, set, payload) : nil
             end
           end
           yield raw if block_given?
+          DeathNotifier.notify_failed(buried) if buried
         rescue StandardError => e
           Cogworker.logger.error do
             "still couldn't settle jid=#{parse_hash(raw)&.fetch('jid', nil)}: #{e.class}: #{e.message}"
@@ -516,7 +525,9 @@ module Cogworker
       # Files what shutting-down processes handed over in UNSETTLED, head
       # first, stopping at the first that still can't be filed (retried on
       # the next pass).
+      # Death hooks run for what this call filed in dead (the script's 1).
       def file_unsettled
+        buried = []
         Cogworker.config.redis do |c|
           c.lrange(RedisKeys::UNSETTLED, 0, -1).each do |record|
             entry = parse_hash(record)
@@ -525,9 +536,11 @@ module Cogworker
             filed = LuaScript.run(c, FILE_UNSETTLED_SCRIPT,
                                   keys: [RedisKeys::UNSETTLED, orphanings_key(entry['payload'])],
                                   argv: [record, entry['set'], entry['score'], entry['payload']])
-            released_if_dead(c, entry['set'], entry['payload']) if filed == 1
+            buried << filed_in_dead(c, entry['set'], entry['payload']) if filed == 1
           end
         end
+      ensure
+        buried.compact.each { |payload| DeathNotifier.notify_failed(payload) }
       end
 
       # Jobs REQUEUE_SCRIPT had to file in dead raw (its parking list
@@ -538,13 +551,19 @@ module Cogworker
       # its error, its job's locks held and its failure uncounted.
       def complete_raw_burials(raws)
         raws.each do |raw|
-          job = (parse_hash(raw) || {}).merge(repeat_orphan_error)
-          Cogworker.config.redis do |c|
-            swapped = LuaScript.run(c, SWAP_DEAD_ENTRY_SCRIPT, keys: [RedisKeys::DEAD],
-                                                               argv: [raw, Time.now.to_f, JSON.generate(job)])
-            buried_as_dead(c, job) if swapped == 1
+          readable = parse_hash(raw)
+          job = (readable || {}).merge(repeat_orphan_error)
+          swapped = Cogworker.config.redis do |c|
+            LuaScript.run(c, SWAP_DEAD_ENTRY_SCRIPT, keys: [RedisKeys::DEAD],
+                                                     argv: [raw, Time.now.to_f, JSON.generate(job)])
           end
           @raw_burials_mutex.synchronize { @pending_raw_burials.delete(raw) }
+          next unless swapped == 1
+
+          # The swap is done: the rest must not be retried (it would find
+          # nothing to swap and skip the hooks), so it's best-effort.
+          BestEffort.call('Orphan recovery') { Cogworker.config.redis { |c| buried_as_dead(c, job) } }
+          DeathNotifier.notify_orphaned(job) if readable
         rescue StandardError => e
           @raw_burials_mutex.synchronize { @pending_raw_burials << raw unless @pending_raw_burials.include?(raw) }
           RedisErrors.report('Orphan recovery', e) { "a repeat orphan's dead entry not completed (will retry)" }
@@ -565,11 +584,17 @@ module Cogworker
 
       # `set` must be one of ours to file into — not any key a damaged record
       # names (another type's, which would fail every pass at that record).
-      # Filing a failure in dead outside the middleware chain: release its
-      # locks, as the chain would for a terminal failure.
-      def released_if_dead(conn, set, payload)
+      # Just filed by this process: if that was a (readable) job into dead,
+      # release its locks, as the chain would for a terminal failure, and
+      # return the payload — its death hooks are due. The release is
+      # best-effort: the job is in dead either way, and a raise here used
+      # to cost it its hooks (the next pass's script finds nothing to file).
+      def filed_in_dead(conn, set, payload)
         job = parse_hash(payload)
-        JobUtil.release_terminal_locks(conn, job) if set == RedisKeys::DEAD && job
+        return nil unless set == RedisKeys::DEAD && job
+
+        BestEffort.call('Lock release') { JobUtil.release_terminal_locks(conn, job) }
+        payload
       end
 
       def valid_unsettled?(entry)

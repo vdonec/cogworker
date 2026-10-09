@@ -577,3 +577,371 @@ RSpec.describe 'Manager + Processor end-to-end execution' do
       .to eq([nil, nil])
   end
 end
+
+RSpec.describe 'Processor with cogworker_retry_in / cogworker_retries_exhausted / death_handlers' do
+  let(:processor) { Cogworker::Processor.new(Cogworker::Manager.new) }
+  let(:log) { StringIO.new }
+  let(:deaths) { [] }
+
+  before do
+    allow(Cogworker).to receive(:logger).and_return(Cogworker::Logging.default_logger(log))
+    deaths = self.deaths
+    Cogworker.config.death_handlers << ->(job, e) { deaths << [:handler, job['jid'], e.class, e.message] }
+  end
+
+  def define_job(name, options = {}, &perform)
+    stub_const(name, Class.new { include Cogworker::Worker })
+    klass = Object.const_get(name)
+    klass.cogworker_options(options)
+    klass.define_method(:perform, &perform)
+    klass
+  end
+
+  def entries(set)
+    Cogworker.config.redis { |c| c.zrange("cogworker:#{set}", 0, -1, withscores: true) }
+             .map { |raw, score| [JSON.parse(raw), score] }
+  end
+
+  def counts
+    Cogworker.config.redis do |c|
+      { retry: c.zcard('cogworker:retry'), dead: c.zcard('cogworker:dead'), queued: c.llen('cogworker:queue:default'),
+        in_progress: c.llen("cogworker:inprogress:#{Cogworker.identity}") }
+    end
+  end
+
+  def queued_digest
+    Cogworker::UniqueJobs.digest(JSON.parse(Cogworker.config.redis { |c| c.lindex('cogworker:queue:default', 0) }))
+  end
+
+  # Puts the job waiting in retry straight back on its queue, the way
+  # Scheduled does once it's due.
+  def graduate
+    Cogworker.config.redis do |c|
+      raw = c.zrange('cogworker:retry', 0, 0).first
+      Cogworker::JobUtil.claim_and_requeue(c, 'cogworker:retry', raw)
+    end
+  end
+
+  it "uses the hook's number as the delay, without jitter, passing count 0, 1, 2 on the first three failures" do
+    seen = []
+    define_job('TimedJob', retry: 5) { |*| raise 'boom' }
+    TimedJob.cogworker_retry_in do |count, exception, job|
+      seen << [count, exception.message, job['jid']]
+      600 * (2**count)
+    end
+    jid = TimedJob.perform_async
+
+    3.times do |i|
+      graduate unless i.zero?
+      processor.send(:process_one)
+      (job, score), = entries(:retry)
+      expect(score).to be_within(2).of(Time.now.to_f + (600 * (2**i)))
+      expect(job['retry_count']).to eq(i + 1)
+      expect(job).not_to have_key('failure_outcome')
+    end
+    expect(seen).to eq([[0, 'boom', jid], [1, 'boom', jid], [2, 'boom', jid]])
+    expect(Cogworker::Attempts.for(jid).map { |a| a['outcome'] }).to eq(%w[retrying retrying retrying])
+  end
+
+  it 'accepts 0 (due on the next poll) and a Float' do
+    define_job('ZeroJob') { |*| raise 'boom' }
+    ZeroJob.cogworker_retry_in { |count| count.zero? ? 0 : 1.5 }
+    ZeroJob.perform_async
+
+    processor.send(:process_one)
+    expect(entries(:retry).first.last).to be_within(1).of(Time.now.to_f)
+    graduate
+    processor.send(:process_one)
+    expect(entries(:retry).first.last).to be_within(1).of(Time.now.to_f + 1.5)
+  end
+
+  [nil, -5, 'soon', Float::NAN, Float::INFINITY, :later].each do |value|
+    it "falls back to the default backoff when the hook returns #{value.inspect}" do
+      define_job('OddJob') { |*| raise 'boom' }
+      OddJob.cogworker_retry_in { |*| value }
+      OddJob.perform_async
+
+      processor.send(:process_one)
+
+      expect(counts).to eq(retry: 1, dead: 0, queued: 0, in_progress: 0)
+      job, score = entries(:retry).first
+      expect(score - Time.now.to_f).to be_between(14, 75) # 1**4 + 15 + rand(30) * 2
+      expect(job).not_to have_key('interrupted_count')
+      expect(log.string).to include('cogworker_retry_in of OddJob returned') unless value.nil?
+    end
+  end
+
+  it 'falls back to the default backoff (logged, never an interrupt) when the hook raises' do
+    define_job('RaisingHookJob') { |*| raise 'boom' }
+    RaisingHookJob.cogworker_retry_in { |*| raise 'hook bug' }
+    RaisingHookJob.perform_async
+
+    processor.send(:process_one)
+
+    expect(counts).to eq(retry: 1, dead: 0, queued: 0, in_progress: 0)
+    expect(entries(:retry).first.first).not_to have_key('interrupted_count')
+    expect(log.string).to include('cogworker_retry_in of RaisingHookJob raised', 'hook bug')
+  end
+
+  it 'kills a job with retries left on :kill — straight to dead, with the death hooks' do
+    define_job('KilledJob', retry: 10) { |*| raise ArgumentError, 'permanent' }
+    deaths = self.deaths
+    KilledJob.cogworker_retry_in { |_count, e| :kill if e.is_a?(ArgumentError) }
+    KilledJob.cogworker_retries_exhausted { |job, e| deaths << [:class, job['jid'], e.class, e.message] }
+    jid = KilledJob.perform_async
+
+    processor.send(:process_one)
+
+    expect(counts).to eq(retry: 0, dead: 1, queued: 0, in_progress: 0)
+    expect(entries(:dead).first.first).to include('retry_count' => 1, 'error_class' => 'ArgumentError')
+    expect(entries(:dead).first.first).not_to have_key('failure_outcome')
+    expect(deaths).to eq([[:class, jid, ArgumentError, 'permanent'], [:handler, jid, ArgumentError, 'permanent']])
+    expect(Cogworker::Attempts.for(jid).map { |a| a['outcome'] }).to eq(%w[killed])
+  end
+
+  it 'discards on :discard — neither retry nor dead, no death hooks, locks released, counted as failed' do
+    define_job('DiscardedJob', retry: 10, unique: :until_executed) { |*| raise 'stale' }
+    DiscardedJob.cogworker_retry_in { |*| :discard }
+    DiscardedJob.cogworker_retries_exhausted { |*| deaths << :class }
+    jid = DiscardedJob.perform_async
+    digest = queued_digest
+    expect(Cogworker.config.redis { |c| c.get("cogworker:unique:#{digest}") }).to eq(jid)
+
+    processor.send(:process_one)
+
+    expect(counts).to eq(retry: 0, dead: 0, queued: 0, in_progress: 0)
+    expect(deaths).to be_empty
+    expect(Cogworker.config.redis { |c| c.get("cogworker:unique:#{digest}") }).to be_nil
+    expect(Cogworker::Stats.new.failed).to eq(1)
+    expect(Cogworker::Attempts.for(jid).map { |a| a['outcome'] }).to eq(%w[discarded])
+  end
+
+  it 'runs the class hook, then the death handlers, exactly once, with the entry already in dead — retries used up' do
+    define_job('ExhaustedJob', retry: 1) { |*| raise 'boom' }
+    seen_dead = []
+    ExhaustedJob.cogworker_retries_exhausted do |job, e|
+      seen_dead << Cogworker.config.redis { |c| c.zcard('cogworker:dead') }
+      deaths << [:class, job['jid'], e.class, e.message]
+      job['retry_count']
+    end
+    retry_in_calls = 0
+    ExhaustedJob.cogworker_retry_in { |*| (retry_in_calls += 1) && 1 }
+    jid = ExhaustedJob.perform_async
+
+    processor.send(:process_one)
+    expect(deaths).to be_empty
+    graduate
+    processor.send(:process_one)
+
+    expect(counts).to eq(retry: 0, dead: 1, queued: 0, in_progress: 0)
+    expect(retry_in_calls).to eq(1) # not asked about the last failure: there's no retry to time
+    expect(seen_dead).to eq([1])
+    expect(deaths).to eq([[:class, jid, RuntimeError, 'boom'], [:handler, jid, RuntimeError, 'boom']])
+  end
+
+  it 'runs the death hooks for retry: false on the first failure, without asking retry_in' do
+    define_job('OneShotJob', retry: false) { |*| raise 'boom' }
+    OneShotJob.cogworker_retry_in { |*| raise 'must not be called' }
+    jid = OneShotJob.perform_async
+
+    processor.send(:process_one)
+
+    expect(counts).to include(dead: 1, retry: 0)
+    expect(deaths).to eq([[:handler, jid, RuntimeError, 'boom']])
+    expect(log.string).not_to include('must not be called')
+  end
+
+  it "hands the hooks the job as stored in dead, and a hook's changes don't reach that entry" do
+    define_job('StoredJob', retry: false) { |*| raise 'boom' }
+    received = nil
+    StoredJob.cogworker_retries_exhausted do |job, _e|
+      received = job.dup
+      job['error_message'] = 'tampered'
+    end
+    StoredJob.perform_async
+
+    processor.send(:process_one)
+
+    stored = entries(:dead).first.first
+    expect(received).to eq(stored)
+    expect(stored).to include('error_class' => 'RuntimeError', 'error_message' => 'boom', 'retry_count' => 1)
+    expect(stored['failed_at']).to be_a(Float)
+  end
+
+  it "doesn't let a raising death hook break the ack, the other handlers or the lock release" do
+    define_job('HookBreaksJob', retry: false, unique: :until_executed) { |*| raise 'boom' }
+    HookBreaksJob.cogworker_retries_exhausted { |*| raise 'hook broke' }
+    Cogworker.config.death_handlers.unshift(->(*) { raise 'handler broke' })
+    jid = HookBreaksJob.perform_async
+    digest = queued_digest
+
+    processor.send(:process_one)
+
+    expect(counts).to eq(retry: 0, dead: 1, queued: 0, in_progress: 0)
+    expect(deaths).to eq([[:handler, jid, RuntimeError, 'boom']])
+    expect(Cogworker.config.redis { |c| c.get("cogworker:unique:#{digest}") }).to be_nil
+    expect(log.string).to include('hook broke', 'handler broke')
+  end
+
+  describe 'when the retry/dead write itself fails' do
+    let(:poison) do
+      Class.new do
+        def call(_worker, job, _queue)
+          job['poisoned'] = Float::NAN # JSON.generate(job) raises, every time
+          yield
+        end
+      end
+    end
+
+    before { Cogworker.config.server_middleware { |chain| chain.add(poison) } }
+
+    it 'runs the death hooks once when the interrupt files the job in dead' do
+      define_job('InterruptedDeadJob', retry: false) { |*| raise 'boom' }
+      jid = InterruptedDeadJob.perform_async
+
+      processor.send(:process_one)
+
+      expect(counts).to include(dead: 1, retry: 0, in_progress: 0)
+      expect(deaths).to eq([[:handler, jid, RuntimeError, 'boom']])
+    end
+
+    it "runs none while the job couldn't be filed anywhere yet" do
+      define_job('UnfiledJob', retry: false) { |*| raise 'boom' }
+      UnfiledJob.perform_async
+      allow(processor.send(:fetcher)).to receive(:interrupt).and_raise(Redis::CannotConnectError, 'gone')
+
+      processor.send(:process_one)
+
+      expect(counts).to include(dead: 0, retry: 0)
+      expect(deaths).to be_empty
+    end
+
+    it 'still honors :kill, filing the job in dead rather than retrying it' do
+      define_job('KilledInterruptJob', retry: 10) { |*| raise 'boom' }
+      KilledInterruptJob.cogworker_retry_in { |*| :kill }
+      jid = KilledInterruptJob.perform_async
+
+      processor.send(:process_one)
+
+      expect(counts).to include(dead: 1, retry: 0)
+      expect(deaths).to eq([[:handler, jid, RuntimeError, 'boom']])
+    end
+  end
+
+  it 'runs only the death handlers, with the default backoff before that, for a class that no longer exists' do
+    Cogworker::Client.push('class' => 'NoSuchJobAnymore', 'args' => [], 'retry' => 1)
+
+    processor.send(:process_one)
+    expect(entries(:retry).first.last - Time.now.to_f).to be_between(14, 75)
+    graduate
+    processor.send(:process_one)
+
+    expect(counts).to include(dead: 1, retry: 0)
+    expect(deaths.map(&:first)).to eq([:handler])
+    expect(deaths.first[2]).to eq(NameError)
+  end
+
+  it 'runs no hooks for an unparseable payload' do
+    Cogworker.config.redis { |c| c.lpush('cogworker:queue:default', 'not json') }
+
+    processor.send(:process_one)
+
+    expect(counts).to include(dead: 1)
+    expect(deaths).to be_empty
+  end
+
+  it "extends the until_executed lock and the periodic running lock by the hook's delay plus unique_lock_ttl" do
+    define_job('LockedJob', retry: 5, unique: :until_executed) { |*| raise 'boom' }
+    LockedJob.cogworker_retry_in { |*| 100_000 }
+    jid = Cogworker::Client.push('class' => 'LockedJob', 'args' => [], 'retry' => 5, 'unique' => 'until_executed',
+                                 'periodic_pjid' => 'pj-locked')
+    digest = queued_digest
+    Cogworker.config.redis { |c| c.set('periodic:running:pj-locked', jid, ex: 60) }
+
+    processor.send(:process_one)
+
+    expected = 100_000 + Cogworker.config.unique_lock_ttl
+    ttls = Cogworker.config.redis { |c| [c.ttl("cogworker:unique:#{digest}"), c.ttl('periodic:running:pj-locked')] }
+    expect(ttls).to all(be_within(5).of(expected))
+  end
+
+  it "runs the death hooks only once the job is acknowledged, so a slow one can't get it requeued" do
+    define_job('AckedFirstJob', retry: false) { |*| raise 'boom' }
+    in_progress_seen = nil
+    AckedFirstJob.cogworker_retries_exhausted do |*|
+      in_progress_seen = Cogworker.config.redis { |c| c.llen("cogworker:inprogress:#{Cogworker.identity}") }
+    end
+    AckedFirstJob.perform_async
+
+    processor.send(:process_one)
+
+    expect(in_progress_seen).to eq(0)
+  end
+
+  it 'survives a death hook that exits — no second dead entry, no second call' do
+    define_job('ExitingHookJob', retry: false) { |*| raise 'boom' }
+    calls = 0
+    ExitingHookJob.cogworker_retries_exhausted do |*|
+      calls += 1
+      exit 1
+    end
+    ExitingHookJob.perform_async
+
+    expect { processor.send(:process_one) }.not_to raise_error
+
+    expect(counts).to eq(retry: 0, dead: 1, queued: 0, in_progress: 0)
+    expect(calls).to eq(1)
+  end
+
+  it 'passes a lambda with an optional parameter, and a #call object, only what they take' do
+    define_job('OptionalArgJob', retry: 3) { |*| raise 'boom' }
+    OptionalArgJob.cogworker_retry_in(&->(count, _exception = nil) { 1000 + count })
+    callable = Class.new { def call(job, _exception) = job['jid'] }.new
+    OptionalArgJob.perform_async
+
+    processor.send(:process_one)
+
+    expect(entries(:retry).first.last).to be_within(2).of(Time.now.to_f + 1000)
+    expect(log.string).not_to include('raised')
+    expect(Cogworker::JobUtil.call_hook(callable, { 'jid' => 'c1' }, RuntimeError.new, :extra)).to eq('c1')
+  end
+
+  it 'warns about a delay over a year, but uses it' do
+    define_job('FarJob') { |*| raise 'boom' }
+    FarJob.cogworker_retry_in { |*| 400 * 24 * 3600 }
+    FarJob.perform_async
+
+    processor.send(:process_one)
+
+    expect(entries(:retry).first.last).to be_within(2).of(Time.now.to_f + (400 * 24 * 3600))
+    expect(log.string).to include('(over a year)')
+  end
+
+  it 'corrects the status to failed when a middleware raised and the hook killed the job' do
+    Cogworker::Status.configure_server_middleware(Cogworker.config, expiration: 60)
+    failing = Class.new { def call(*) = raise(ArgumentError, 'middleware broke') }
+    Cogworker.config.server_middleware { |chain| chain.add(failing) }
+    define_job('MiddlewareKilledJob', retry: 10) { |*| nil }
+    MiddlewareKilledJob.cogworker_retry_in { |*| :kill }
+    jid = MiddlewareKilledJob.perform_async
+
+    processor.send(:process_one)
+
+    expect(counts).to include(dead: 1, retry: 0)
+    expect(Cogworker::Status.status(jid)).to eq(:failed)
+  end
+
+  it 'writes, without any hooks, the same retry entry fields and default backoff as before' do
+    Cogworker.config.death_handlers.clear
+    define_job('PlainJob', retry: 3) { |*| raise 'boom' }
+    PlainJob.perform_async
+    pushed = JSON.parse(Cogworker.config.redis { |c| c.lindex('cogworker:queue:default', 0) })
+
+    processor.send(:process_one)
+
+    job, score = entries(:retry).first
+    expect(job.keys).to match_array(pushed.keys + %w[error_class error_message failed_at retry_count])
+    expect(job.except('error_class', 'error_message', 'failed_at', 'retry_count')).to eq(pushed)
+    expect(score - Time.now.to_f).to be_between(14, 75)
+  end
+end
