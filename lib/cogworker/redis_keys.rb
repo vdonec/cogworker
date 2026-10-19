@@ -47,6 +47,7 @@ module Cogworker
     def job_attempts(jid) = "cogworker:job_attempts:#{jid}"
     def process(identity) = "cogworker:process:#{identity}"
     def workers(identity) = "cogworker:workers:#{identity}"
+    def memory_history(identity) = "cogworker:memory:#{identity}"
     def in_progress(identity) = "#{IN_PROGRESS_PREFIX}#{identity}"
     def signal(identity) = "cogworker:signal:#{identity}"
     def periodic_running(pjid) = "periodic:running:#{pjid}"

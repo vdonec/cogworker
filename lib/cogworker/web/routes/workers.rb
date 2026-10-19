@@ -13,6 +13,7 @@ module Cogworker
       # honest place to look at what's actually running right now.
       module Workers
         CONTENT_ID = 'workers-content'
+        SPARKLINE_HEIGHT_PX = 32
 
         module_function
 
@@ -22,7 +23,8 @@ module Cogworker
             if hx_request?
               content
             else
-              Layout.wrap('Workers', Layout.poll_div(CONTENT_ID, request.script_name, 'workers', content),
+              Layout.wrap('Workers', Layout.poll_div(CONTENT_ID, request.script_name, 'workers', content) +
+                                     Workers.sparkline_script,
                           script_name: request.script_name)
             end
           end
@@ -90,7 +92,9 @@ module Cogworker
           work_set = Cogworker::WorkSet.new.to_a
           busy_counts = work_set.each_with_object(Hash.new(0)) { |(identity, *), h| h[identity] += 1 }
 
-          cards = process_cards(processes, busy_counts, quiet_path, resume_path, stop_path)
+          memory = Cogworker::MemoryHistory.series(processes.map(&:identity))
+
+          cards = process_cards(processes, busy_counts, memory, quiet_path, resume_path, stop_path)
 
           work_rows = work_set.map do |identity, tid, work|
             [Layout.h(identity), Layout.h(tid), Layout.h(work.job['jid']), Layout.h(work.queue),
@@ -134,19 +138,19 @@ module Cogworker
           HTML
         end
 
-        def process_cards(processes, busy_counts, quiet_path, resume_path, stop_path)
+        def process_cards(processes, busy_counts, memory, quiet_path, resume_path, stop_path)
           if processes.empty?
             return %(<p class="text-muted" style="font-size: 13px; font-style: italic;">No worker processes ) +
                    'are reporting in right now.</p>'
           end
 
           items = processes.map do |p|
-            process_card(p, busy_counts[p.identity], quiet_path, resume_path, stop_path)
+            process_card(p, busy_counts[p.identity], memory[p.identity], quiet_path, resume_path, stop_path)
           end.join
           %(<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px;">#{items}</div>)
         end
 
-        def process_card(process, busy, quiet_path, resume_path, stop_path)
+        def process_card(process, busy, memory_samples, quiet_path, resume_path, stop_path)
           concurrency = process['concurrency'].to_i
           pct = concurrency.positive? ? ((busy.to_f / concurrency) * 100).round : 0
           quiet = [true, 'true'].include?(process['quiet'])
@@ -177,6 +181,7 @@ module Cogworker
                 <span>#{memory_cell(process['rss_kb'])}</span>
                 <span>#{beat_label(process.identity)}</span>
               </div>
+              #{memory_sparkline(process.identity, memory_samples)}
               <div style="height: 4px; border-radius: 2px; background: var(--color-neutral-800); overflow: hidden;">
                 <div style="height: 100%; border-radius: 2px; background: var(--color-accent); width: #{pct}%;"></div>
               </div>
@@ -197,6 +202,152 @@ module Cogworker
           else
             Layout.badge('Active', variant: :success)
           end
+        end
+
+        # The last 24h of this process's RSS (MemoryHistory), always the
+        # full 24h wide — one MemoryHistory slot per x position, broken
+        # wherever a slot has no sample (before the process started, or
+        # while Redis was away). An inline SVG rather than a Chart.js chart:
+        # these cards are re-rendered by every htmx poll, and a Chart.js
+        # instance per swap leaks (see CLAUDE.md's Overview charts).
+        # Stretched to the card's width with `preserveAspectRatio="none"`,
+        # so it draws only lines and fills (`non-scaling-stroke` keeps the
+        # line's width) — no point markers, which that stretch would
+        # distort; the hover marker and tooltip are HTML, positioned by
+        # `sparkline_script` from the data attributes.
+        def memory_sparkline(identity, slots)
+          slots ||= Cogworker::MemoryHistory.series([identity])[identity]
+          values = slots.map(&:last)
+          low, high = sparkline_range(values.compact)
+          <<~HTML
+            <div class="cw-spark" data-cw-spark-id="#{Layout.h(identity)}" data-cw-spark="#{Layout.h(JSON.generate(values))}"
+                 data-cw-spark-start="#{slots.first.first}" data-cw-spark-step="#{Cogworker::MemoryHistory::SAMPLE_SECONDS}"
+                 data-cw-spark-min="#{low}" data-cw-spark-max="#{high}"
+                 style="position: relative; height: #{SPARKLINE_HEIGHT_PX}px; cursor: crosshair; background: var(--color-bg); border-radius: 3px;">
+              <span class="cw-spark-label" style="position: absolute; top: 3px; left: 6px; font-size: 10px; line-height: 1; color: var(--color-neutral-500); pointer-events: none;">Memory · 24h</span>
+              <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="Memory, last 24 hours"
+                   style="display: block; width: 100%; height: 100%; overflow: visible;">
+                #{sparkline_segments(values, low, high)}
+              </svg>
+            </div>
+          HTML
+        end
+
+        # One line + fill per run of consecutive slots that have a sample,
+        # each point at its slot's center; a lone sample gets a short
+        # horizontal stroke across its own slot, so it's still visible.
+        def sparkline_segments(values, low, high)
+          width = 100.0 / values.size
+          runs = values.each_with_index.chunk_while { |(a, _), (b, _)| a.nil? == b.nil? }.reject { |run| run[0][0].nil? }
+          runs.map do |run|
+            points = run.map { |kb, i| [(i + 0.5) * width, (1 - ((kb - low) / (high - low))) * 100] }
+            sparkline_segment(points, width)
+          end.join
+        end
+
+        def sparkline_segment(points, width)
+          if points.one?
+            x, y = points.first
+            points = [[x - (width / 2), y], [x + (width / 2), y]]
+          end
+          coords = points.map { |x, y| format('%<x>.2f,%<y>.2f', x: x, y: y) }.join(' ')
+          area = format('%<x0>.2f,100 %<coords>s %<x1>.2f,100', x0: points.first[0], coords: coords, x1: points.last[0])
+          <<~HTML
+            <polygon points="#{area}" style="fill: var(--color-accent); opacity: 0.15;"></polygon>
+            <polyline points="#{coords}" vector-effect="non-scaling-stroke" style="fill: none; stroke: var(--color-accent); stroke-width: 1.5;"></polyline>
+          HTML
+        end
+
+        # A little headroom above and below, so the line never hugs the
+        # card's edges; a flat series gets a range around its one value.
+        def sparkline_range(values)
+          return [0.0, 1.0] if values.empty?
+
+          low = values.min.to_f
+          high = values.max.to_f
+          pad = [(high - low) * 0.1, 1024].max
+          [(low - pad).clamp(0, nil), high + pad]
+        end
+
+        # Hover readout for every `.cw-spark` on the page: the sample
+        # nearest the pointer, as a marker line + dot and a tooltip with
+        # its value and (local) time, hiding the "Memory" label meanwhile.
+        # Delegated from `document`, so it keeps working on cards htmx
+        # swaps in; a poll that replaces the card under the pointer
+        # re-shows the readout on the new one.
+        def sparkline_script
+          <<~HTML
+            <script>
+              (function () {
+                var hover = null;
+                function part(el, cls, css) {
+                  var node = el.querySelector('.' + cls);
+                  if (!node) {
+                    node = document.createElement('div');
+                    node.className = cls;
+                    node.style.cssText = 'position: absolute; pointer-events: none; ' + css;
+                    el.appendChild(node);
+                  }
+                  return node;
+                }
+                function label(el, visible) {
+                  var node = el.querySelector('.cw-spark-label');
+                  if (node) node.style.visibility = visible ? '' : 'hidden';
+                }
+                function hide(el) {
+                  el.querySelectorAll('.cw-spark-line, .cw-spark-dot, .cw-spark-tip').forEach(function (n) { n.remove(); });
+                  label(el, true);
+                }
+                function show(el, clientX) {
+                  var values = JSON.parse(el.getAttribute('data-cw-spark'));
+                  var start = parseInt(el.getAttribute('data-cw-spark-start'), 10);
+                  var step = parseInt(el.getAttribute('data-cw-spark-step'), 10);
+                  var lo = parseFloat(el.getAttribute('data-cw-spark-min'));
+                  var hi = parseFloat(el.getAttribute('data-cw-spark-max'));
+                  var rect = el.getBoundingClientRect();
+                  label(el, false);
+                  var frac = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
+                  var i = Math.min(Math.floor(frac * values.length), values.length - 1);
+                  var x = (i + 0.5) / values.length * rect.width;
+                  var kb = values[i];
+                  part(el, 'cw-spark-line', 'top: 0; bottom: 0; width: 1px; background: var(--color-neutral-500);').style.left = x + 'px';
+                  var dot = part(el, 'cw-spark-dot', 'width: 6px; height: 6px; border-radius: 50%; margin: -3px 0 0 -3px; background: var(--color-accent);');
+                  dot.style.display = kb === null ? 'none' : '';
+                  dot.style.left = x + 'px';
+                  if (kb !== null) dot.style.top = (1 - (kb - lo) / (hi - lo)) * rect.height + 'px';
+                  var tip = part(el, 'cw-spark-tip', 'bottom: calc(100% + 4px); z-index: 10; white-space: nowrap; font-size: 11px; ' +
+                    'padding: 3px 6px; border-radius: 4px; background: var(--color-surface); color: var(--color-text); ' +
+                    'box-shadow: var(--shadow-md); border: 1px solid var(--color-neutral-800);');
+                  var at = new Date((start + i * step) * 1000);
+                  var when = window.cogworkerFormatTime ? window.cogworkerFormatTime(at) : at.toLocaleString();
+                  tip.textContent = (kb === null ? 'no data' : (kb / 1024).toFixed(1) + 'M') + ' · ' + when;
+                  tip.style.left = x + 'px';
+                  tip.style.transform = 'translateX(-' + (frac * 100) + '%)';
+                }
+                function find(id) {
+                  var all = document.querySelectorAll('.cw-spark');
+                  for (var i = 0; i < all.length; i++) if (all[i].getAttribute('data-cw-spark-id') === id) return all[i];
+                  return null;
+                }
+                document.addEventListener('mousemove', function (evt) {
+                  var el = evt.target.closest && evt.target.closest('.cw-spark');
+                  if (hover && (!el || el.getAttribute('data-cw-spark-id') !== hover.id)) {
+                    var old = find(hover.id);
+                    if (old) hide(old);
+                    hover = null;
+                  }
+                  if (!el) return;
+                  hover = { id: el.getAttribute('data-cw-spark-id'), x: evt.clientX };
+                  show(el, evt.clientX);
+                });
+                document.addEventListener('htmx:afterSwap', function () {
+                  if (!hover) return;
+                  var el = find(hover.id);
+                  if (el) show(el, hover.x);
+                });
+              })();
+            </script>
+          HTML
         end
 
         # `rss_kb` is absent on any process whose heartbeat predates this

@@ -334,6 +334,14 @@ RSpec.describe Cogworker::Web do
       expect(runs_start).to be < redis_content_start
     end
 
+    it 'Overview ends with a Cogworker info section (gem version, Ruby, dependency versions) below the Redis grid' do
+      body = mock.get('/overview').body
+      redis_content_start = body.index("id=\"#{Cogworker::Web::Routes::Overview::REDIS_CONTENT_ID}\"")
+      gem_info_start = body.index('>Cogworker</h4>')
+      expect(gem_info_start).to be > redis_content_start
+      expect(body[gem_info_start..]).to include(Cogworker::VERSION, RUBY_VERSION, Gem.loaded_specs['redis'].version.to_s)
+    end
+
     it 'GET /overview/redis returns just the Redis fragment (no page chrome), polled independently of ' \
        "CONTENT_ID's own poll_div" do
       resp = mock.get('/overview/redis')
@@ -714,6 +722,33 @@ RSpec.describe Cogworker::Web do
       expect(body).to match(%r{\d+\.\dM|n/a})
 
       heartbeat.stop!
+    end
+
+    it "Workers draws each process's memory over the full last 24h above its load bar, broken where " \
+       'there is no data' do
+      manager = Cogworker::Manager.new
+      heartbeat = Cogworker::Heartbeat.new(manager)
+      heartbeat.send(:beat)
+      step = Cogworker::MemoryHistory::SAMPLE_SECONDS
+      now = Time.now.to_i
+      Cogworker.config.redis do |c|
+        Cogworker::MemoryHistory.record(c, Cogworker.identity, 51_200, at: now - (10 * step))
+        Cogworker::MemoryHistory.record(c, Cogworker.identity, 61_440, at: now - (9 * step))
+      end
+
+      body = mock.get('/workers').body
+      expect(body.index('class="cw-spark"')).to be < body.index('background: var(--color-accent); width:')
+      values = JSON.parse(CGI.unescapeHTML(body[/data-cw-spark="([^"]*)"/, 1]))
+      expect(values.size).to eq(Cogworker::MemoryHistory::SLOTS)
+      expect(values.compact).to include(51_200, 61_440) # plus whatever the real beat measured just now
+      expect(values[-5]).to be_nil
+      expect(body.scan('<polyline').size).to eq(2) # the old pair, then the current beat on its own
+      expect(body).to include('Memory · 24h')
+      expect(body).to include('cw-spark-tip') # the hover script
+
+      heartbeat.stop!
+      expect(Cogworker.config.redis { |c| c.exists?(Cogworker::RedisKeys.memory_history(Cogworker.identity)) })
+        .to be(false)
     end
 
     it 'Workers renders a page header with real process/thread counts and the real heartbeat interval ' \

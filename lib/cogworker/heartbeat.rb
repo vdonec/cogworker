@@ -75,7 +75,8 @@ module Cogworker
 
     def cleanup_presence!
       Cogworker.config.redis do |c|
-        c.del(RedisKeys.process(Cogworker.identity), RedisKeys.workers(Cogworker.identity))
+        c.del(RedisKeys.process(Cogworker.identity), RedisKeys.workers(Cogworker.identity),
+              RedisKeys.memory_history(Cogworker.identity))
         c.srem?(RedisKeys::PROCESSES, Cogworker.identity)
         # Clean shutdown: Manager#stop! already requeued this process's
         # in-progress list, so there's nothing left for recovery to find.
@@ -132,6 +133,7 @@ module Cogworker
                'quiet', @manager.quiet?.to_s)
         c.expire(RedisKeys.process(identity), TTL)
         write_registries(c, identity, reliable)
+        secondary('memory history') { MemoryHistory.record(c, identity, info['rss_kb']) }
         touch_running_periodic_locks(c, identity)
         # Not via #secondary: Redis failing here, after the presence key went
         # through, doesn't make this beat a failed one.

@@ -65,6 +65,7 @@ module Cogworker
       readable_members(RedisKeys::PROCESSES).each do |id|
         types[RedisKeys.process(id)] = 'hash'
         types[RedisKeys.workers(id)] = 'hash'
+        types[RedisKeys.memory_history(id)] = 'zset'
       end
       readable_fields(RedisKeys::PERIODIC_SCHEDULE).each do |pjid|
         types[RedisKeys.periodic_running(pjid)] = 'string'

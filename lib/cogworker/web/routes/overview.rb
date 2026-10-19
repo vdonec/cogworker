@@ -53,6 +53,13 @@ module Cogworker
           'connected_clients' => 'Connections', 'used_memory_human' => 'Memory Usage',
           'used_memory_peak_human' => 'Peak Memory Usage'
         }.freeze
+        # Runtime dependency gem name => card label, for the "Cogworker"
+        # section — read from `Gem.loaded_specs`, so it shows what this
+        # process actually loaded, not the gemspec's version constraint.
+        GEM_INFO_DEPENDENCIES = {
+          'redis' => 'redis gem', 'connection_pool' => 'connection_pool', 'rack' => 'Rack',
+          'zeitwerk' => 'Zeitwerk', 'fugit' => 'Fugit'
+        }.freeze
         # Period switcher options for the "Runs per day" chart —
         # `params['period']` (a plain query string, read fresh on every
         # request) selects one of these by key. Ordered as displayed,
@@ -95,6 +102,9 @@ module Cogworker
                 # part of CONTENT_ID's own poll_div.
                 page_body += Layout.poll_div(REDIS_CONTENT_ID, request.script_name, 'overview/redis',
                                              Overview.redis_section)
+                # Static (versions don't change while the process runs), so
+                # it needs no poll of its own.
+                page_body += Overview.gem_info_section
               end
               extra_head = layout == 'a' ? Overview.chart_head(request.script_name) : ''
               Layout.wrap('Overview', page_body, script_name: request.script_name, extra_head: extra_head)
@@ -261,17 +271,32 @@ module Cogworker
         # it pinned below the charts rather than above them.
         def redis_section
           info = Cogworker::Stats.new.redis_info
-          cards = REDIS_INFO_FIELDS.map do |field, label|
+          info_section('Redis', REDIS_INFO_FIELDS.to_h { |field, label| [label, info[field]] })
+        end
+
+        # The basics about the gem itself and what it's running on — the
+        # last block on the page, below the Redis grid.
+        def gem_info_section
+          spec = Gem.loaded_specs['cogworker']
+          values = { 'Version' => Cogworker::VERSION, 'Ruby' => "#{RUBY_VERSION} (#{RUBY_PLATFORM})" }
+          GEM_INFO_DEPENDENCIES.each { |name, label| values[label] = Gem.loaded_specs[name]&.version&.to_s }
+          values['License'] = spec&.license
+          info_section('Cogworker', values)
+        end
+
+        # A titled grid of label/value cards; a nil value renders as "n/a".
+        def info_section(title, values)
+          cards = values.map do |label, value|
             <<~HTML
               <div class="card elev-sm" style="gap: 4px;">
                 <span class="card-kicker">#{Layout.h(label)}</span>
-                <span style="font-size: 22px; font-family: var(--font-heading);">#{Layout.h(info[field] || 'n/a')}</span>
+                <span style="font-size: 15px; font-family: var(--font-heading);">#{Layout.h(value || 'n/a')}</span>
               </div>
             HTML
           end.join
           <<~HTML
             <section style="background: var(--color-surface); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); padding: 16px 18px; display: flex; flex-direction: column; gap: 12px;">
-              <h4 style="margin: 0; font-family: var(--font-heading); font-weight: var(--font-heading-weight); font-size: 17px;">Redis</h4>
+              <h4 style="margin: 0; font-family: var(--font-heading); font-weight: var(--font-heading-weight); font-size: 17px;">#{Layout.h(title)}</h4>
               <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px;">#{cards}</div>
             </section>
           HTML
